@@ -147,13 +147,28 @@ else()
     message(STATUS "CUDA toolkit not found — skipping GPU CUDA platform")
 endif()
 
-find_package(OpenCL QUIET)
-if(OpenCL_FOUND
-        OR EXISTS "${OPENMM_DIR}/lib/plugins/libOpenMMOpenCL.so"
-        OR EXISTS "${OPENMM_DIR}/lib/plugins/OpenMMOpenCL.lib")
-    add_subdirectory(platforms/opencl)
+# OpenCL: Apple deprecated OpenCL in 10.14 and Apple Silicon support is
+# unreliable (loading libOpenMMOpenCL.dylib crashes on macOS CI runners).
+# Skip OpenCL on Apple by default; users who want it can override with
+# -DGLUED_BUILD_OPENCL=ON.
+if(APPLE)
+    option(GLUED_BUILD_OPENCL "Build the OpenCL platform plugin" OFF)
 else()
-    message(STATUS "OpenCL not found — skipping GPU OpenCL platform")
+    option(GLUED_BUILD_OPENCL "Build the OpenCL platform plugin" ON)
+endif()
+
+if(GLUED_BUILD_OPENCL)
+    find_package(OpenCL QUIET)
+    if(OpenCL_FOUND
+            OR EXISTS "${OPENMM_DIR}/lib/plugins/libOpenMMOpenCL.so"
+            OR EXISTS "${OPENMM_DIR}/lib/plugins/libOpenMMOpenCL.dylib"
+            OR EXISTS "${OPENMM_DIR}/lib/plugins/OpenMMOpenCL.lib")
+        add_subdirectory(platforms/opencl)
+    else()
+        message(STATUS "OpenCL not found — skipping GPU OpenCL platform")
+    endif()
+else()
+    message(STATUS "GLUED_BUILD_OPENCL=OFF — skipping GPU OpenCL platform")
 endif()
 
 # ---- Python wrapper ----------------------------------------------------------
