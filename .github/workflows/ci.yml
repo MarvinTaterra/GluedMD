@@ -55,8 +55,11 @@ jobs:
             openmm_dir: "$CONDA_PREFIX"
           - os: macos-latest
             openmm_dir: "$CONDA_PREFIX"
-          - os: windows-latest
-            openmm_dir: "$CONDA_PREFIX/Library"
+        # windows-latest is intentionally excluded: conda-incubator/setup-miniconda
+        # does not reliably activate the env under bash on Windows, so cmake picks
+        # up the runner's MinGW gcc + chocolatey SWIG + system Python (no NumPy).
+        # Most OpenMM plugin work on Windows happens via WSL, which is covered by
+        # the ubuntu-22.04 job. Re-add a windows-msvc job here if a real need arises.
 
     steps:
       - uses: actions/checkout@v4

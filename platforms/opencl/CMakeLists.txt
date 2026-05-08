@@ -3,6 +3,9 @@ set(GLUED_OPENCL_LIBRARY_NAME OpenMMGluedOpenCL)
 set(SOURCE_FILES
     src/OpenCLGluedKernelFactory.cpp
     ${CMAKE_SOURCE_DIR}/platforms/common/src/CommonGluedKernels.cpp
+    ${CMAKE_SOURCE_DIR}/platforms/common/src/CommonCVKernels.cpp
+    ${CMAKE_SOURCE_DIR}/platforms/common/src/CommonBiasKernels.cpp
+    ${CMAKE_SOURCE_DIR}/platforms/common/src/CommonSerialization.cpp
 )
 
 add_library(${GLUED_OPENCL_LIBRARY_NAME} SHARED ${SOURCE_FILES})
@@ -31,10 +34,16 @@ if(NOT OPENMM_OPENCL_LIB)
             "Ensure OpenMM is installed with OpenCL platform support.")
 endif()
 
+# OpenMM's OpenCL headers (cl::CommandQueue, cl::Context, …) inline calls
+# into the OpenCL C API, so we must link the OpenCL library itself.
+# CUDA gets away without an analogous step because libcuda is auto-linked.
+find_package(OpenCL REQUIRED)
+
 target_link_libraries(${GLUED_OPENCL_LIBRARY_NAME}
     OpenMMGlued
     OpenMM
-    ${OPENMM_OPENCL_LIB})
+    ${OPENMM_OPENCL_LIB}
+    OpenCL::OpenCL)
 
 install(TARGETS ${GLUED_OPENCL_LIBRARY_NAME}
     LIBRARY  DESTINATION lib/plugins
