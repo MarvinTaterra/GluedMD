@@ -1,0 +1,280 @@
+GLUED ACADEMIC LICENSE
+Version 1.1
+
+Copyright (c) 2026 Marvin Taterra. All rights reserved.
+
+PREAMBLE
+
+GLUED is software intended for the open-research community. This license
+grants broad rights to use, modify, and integrate GLUED for academic and
+non-profit purposes — including incorporation into other academic or
+non-profit projects — and reserves all commercial use to the GLUED
+authors. Use of the Software constitutes acceptance of these terms; if
+You do not accept them, You must not use, copy, modify, or distribute
+the Software.
+
+1. DEFINITIONS
+
+1.1 "Software" means GLUED, including its source code, compiled
+    artefacts, documentation, configuration files, build scripts, and
+    any modifications, derivative works, or portions thereof made
+    available under this license.
+
+1.2 "You" (or "Licensee") means the individual or legal entity
+    exercising rights under this license.
+
+1.3 "Academic Use" means use of the Software:
+    (a) by a degree-granting university, college, or other recognised
+        institute of higher education;
+    (b) by a public or private non-profit research institute whose
+        primary mission is open scientific research;
+    (c) by an individual researcher, student, or instructor acting in
+        their capacity as a member of such an institution; or
+    (d) for the purpose of research, teaching, study, coursework,
+        thesis work, or scholarly publication whose results are
+        intended for open publication.
+
+1.4 "Non-Profit Use" means use of the Software by an organisation that
+    is formally registered as a non-profit, charitable, or public-
+    benefit entity under the laws of its jurisdiction, where such use
+    is conducted in pursuit of that organisation's non-commercial
+    mission.
+
+1.5 "Permitted Use" means Academic Use or Non-Profit Use.
+
+1.6 "Permitted Project" means any software project, dataset, library,
+    pipeline, or research workflow whose own use, distribution, and
+    licensing terms restrict it to Permitted Use.
+
+1.7 "Commercial Use" means any use of the Software that is not
+    Permitted Use, including, without limitation:
+    (a) use by, on behalf of, or in service of a for-profit entity in
+        the development, evaluation, operation, marketing, or sale of
+        any product, service, or pipeline;
+    (b) provision of simulation, analysis, or consulting services
+        using the Software to a third party in exchange for
+        compensation, whether monetary or in-kind;
+    (c) inclusion of the Software, in whole or in part, in any
+        product, library, or service that is offered for sale, lease,
+        licensing fee, or paid subscription;
+    (d) use in research that is funded by, or contractually owed to,
+        a for-profit entity where the results are not intended for
+        open publication;
+    (e) use in any pipeline that produces output sold or licensed to
+        a third party.
+
+1.8 "Publication" means any public dissemination of work, including
+    peer-reviewed articles, preprints, theses, dissertations,
+    conference proceedings, technical reports, presentations, and
+    publicly accessible datasets, code repositories, or web pages.
+
+2. GRANT OF LICENSE
+
+Subject to the conditions in Section 3 and the restrictions in
+Section 4, the GLUED authors grant You a worldwide, royalty-free,
+non-exclusive, non-transferable, perpetual license to:
+
+(a) use, run, and execute the Software for Permitted Use;
+(b) reproduce the Software in source or binary form, internally;
+(c) prepare modified versions and derivative works of the Software
+    for Permitted Use;
+(d) integrate, link, embed, or otherwise combine the Software, in
+    whole or in part, with other Permitted Projects, including
+    Permitted Projects that You yourself develop;
+(e) distribute the Software, including modified versions, in source
+    form, to other recipients who themselves engage exclusively in
+    Permitted Use.
+
+3. CONDITIONS
+
+3.1 Notices. You must include this license, in full and unchanged,
+    with every copy of the Software (whole or partial) that You
+    distribute, and You must preserve all copyright, attribution,
+    and license notices contained in the Software.
+
+3.2 Marking modifications. Any modification You distribute must be
+    clearly marked as such, with the date of modification and the
+    name of the modifier.
+
+3.3 Citation. If You produce a Publication whose results were
+    obtained, in whole or in part, using the Software, You must cite
+    the Software in that Publication using the canonical citation
+    provided on the project website. Citation of the upstream
+    algorithmic references for the bias methods and collective
+    variables You used is also encouraged.
+
+3.4 Downstream commitments. Recipients of any distribution from You
+    must accept this license before using the Software, and must
+    commit to using and redistributing the Software only for
+    Permitted Use. You are responsible for ensuring that recipients
+    are aware of, and bound by, these terms before You distribute.
+
+4. RESTRICTIONS
+
+4.1 No Commercial Use. Commercial Use of the Software, in whole or
+    in part, is not granted by this license. A separate written
+    commercial license must be obtained from the GLUED authors
+    before any Commercial Use.
+
+4.2 No re-licensing. You may not sub-license, re-license, or
+    distribute the Software under terms different from those of this
+    license.
+
+4.3 No removal of notices. You may not remove or obscure any
+    copyright, attribution, citation, or license notice present in
+    the Software or its documentation.
+
+4.4 No endorsement. You may not use the names of the GLUED authors,
+    their institutions, or contributors to endorse or promote
+    derivative works, products, or services without prior written
+    permission.
+
+4.5 No commercial distribution channels. You may not list, publish,
+    or upload the Software (in source or binary form) to any
+    commercial or semi-commercial software distribution channel —
+    including but not limited to PyPI, conda-forge, Docker Hub, npm,
+    Homebrew, app stores, or paid software marketplaces — without
+    prior written permission. Distribution is by source build only.
+
+4.6 No patent claim. You may not initiate, maintain, or join in any
+    patent claim against the GLUED authors or contributors arising
+    from Your use, modification, or distribution of the Software.
+    Initiating such a claim terminates Your rights under this
+    license immediately.
+
+5. CONTRIBUTIONS
+
+Contributions submitted to the Software (for example, via pull
+request, patch, or merge request) are licensed by the contributor to
+the GLUED authors and to all subsequent users under the terms of
+this license. By submitting a contribution, the contributor
+represents that they have the right to do so and that the
+contribution is their original work or has been properly attributed
+to its sources.
+
+6. NO WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND
+NON-INFRINGEMENT. THE AUTHORS MAKE NO REPRESENTATION THAT THE
+SOFTWARE WILL PRODUCE CORRECT, CONVERGED, OR SCIENTIFICALLY VALID
+RESULTS, AND IT IS YOUR RESPONSIBILITY TO VALIDATE ALL ENHANCED-
+SAMPLING OUTPUT BEFORE PUBLICATION.
+
+7. LIMITATION OF LIABILITY
+
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR
+ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN ACTION OF
+CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+8. TERMINATION
+
+8.1 This license terminates automatically upon any breach by You of
+    its terms. Upon termination, You must cease all use of the
+    Software and destroy all copies in Your possession, except for
+    archival copies retained as required by law or research-data
+    preservation policy.
+
+8.2 Sections 3.3 (citation), 4 (restrictions), 5 (contributions),
+    6 (no warranty), 7 (limitation of liability), and this Section
+    8 survive termination of this license.
+
+9. SEVERABILITY
+
+If any provision of this license is held to be unenforceable or
+invalid by a court of competent jurisdiction, that provision shall
+be modified to the minimum extent necessary to make it enforceable,
+and the remaining provisions shall continue in full force and
+effect.
+
+10. COMMERCIAL LICENSING
+
+For Commercial Use, please contact the GLUED authors. The authors
+are not currently offering commercial licenses, but will evaluate
+requests on a case-by-case basis.
+
+—— End of license ——
+
+Citing GLUED
+
+If you use GLUED in published work, please cite both the project and the original algorithm authors for whichever method you used:
+
+@software{taterra_glued_2026,
+  title  = {GLUED: GPU-accelerated Library for Unified Exploration Dynamics},
+  author = {Taterra, Marvin},
+  year   = {2026},
+  url    = {https://github.com/<org>/glued},
+  note   = {OpenMM plugin}
+}
+
+Algorithm citations
+
+Cite the paper for the bias / CV you used. The mapping below should cover most cases.
+
+MetaD
+
+Laio & Parrinello, 
+PNAS
+ 99, 12562 (2002); Barducci et al., 
+PRL
+ 100, 020603 (2008).
+
+OPES
+
+Invernizzi & Parrinello, 
+J. Phys. Chem. Lett.
+ 11, 2731 (2020).
+
+eRMSD
+
+Bottaro et al., 
+Nucleic Acids Res.
+ 42, 13306 (2014).
+
+EDS
+
+White & Voth, 
+JCTC
+ 10, 3023 (2014).
+
+MaxEnt
+
+Cesari et al., 
+JCTC
+ 12, 6143 (2016).
+
+ABMD
+
+Marchi & Ballone, 
+J. Chem. Phys.
+ 110, 3697 (1999).
+
+Puckering
+
+Cremer & Pople, 
+J. Am. Chem. Soc.
+ 97, 1354 (1975); Huang et al., 
+JCTC
+ 10, 1556 (2014).
+
+Secondary structure
+
+Kabsch & Sander, 
+Biopolymers
+ 22, 2577 (1983).
+
+OpenMM
+
+Eastman et al., 
+PLOS Comput. Biol.
+ 13, e1005659 (2017).
+
+Disclaimer
+
+      GLUED is provided "as is" without warranty of any kind, express or implied. The authors are
+      not liable for any claim, damages, or other liability arising from the use of this software.
+      Always validate enhanced-sampling results against converged unbiased simulations or analytic
+      benchmarks before publication.

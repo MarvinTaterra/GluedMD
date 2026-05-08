@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - 'benchmarks/RESULTS_*.md'
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+      - 'benchmarks/RESULTS_*.md'
+
+# Cancel redundant runs for the same ref
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Lint ────────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Python lint (ruff)
+        run: |
+          pip install ruff --quiet
+          # Only lint dirs that exist in the public repo
+          DIRS=""
+          for d in python tests tests_plumed_parity benchmarks; do
+            [ -d "$d" ] && DIRS="$DIRS $d"
+          done
+          [ -n "$DIRS" ] && ruff check $DIRS
+
+  # ── Build + smoke (Linux, macOS, Windows) ───────────────────────────────────
+  # Goal: verify the code compiles and the public API is intact on all platforms.
+  # No full test suite — real tests run locally via scripts/run_tests.sh.
+  build-and-smoke:
+    name: Build + Smoke · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            openmm_dir: "$CONDA_PREFIX"
+          - os: macos-latest
+            openmm_dir: "$CONDA_PREFIX"
+          - os: windows-latest
+            openmm_dir: "$CONDA_PREFIX/Library"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: conda-incubator/setup-miniconda@v3
+        with:
+          miniforge-version: latest
+          python-version: "3.11"
+          channels: conda-forge,defaults
+          channel-priority: strict
+          auto-activate-base: true
+
+      - name: Cache conda packages
+        uses: actions/cache@v4
+        with:
+          path: ~/conda_pkgs_dir
+          key: conda-${{ matrix.os }}-${{ hashFiles('**/CMakeLists.txt') }}
+          restore-keys: conda-${{ matrix.os }}-
+
+      - name: Install dependencies
+        shell: bash -l {0}
+        run: mamba install -y openmm cmake ninja swig numpy pytest
+
+      - name: Configure
+        shell: bash -l {0}
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DOPENMM_DIR="${{ matrix.openmm_dir }}" \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        shell: bash -l {0}
+        run: |
+          JOBS=$(nproc 2>/dev/null || sysctl -n hw.logicalcpu 2>/dev/null || echo 2)
+          cmake --build build -j"$JOBS"
+
+      - name: Install
+        shell: bash -l {0}
+        run: cmake --install build
+
+      - name: Smoke test
+        shell: bash -l {0}
+        run: python tests/test_api_smoke.py

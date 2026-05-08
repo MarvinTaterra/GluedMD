@@ -1,0 +1,25 @@
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+# E: pycodestyle errors, F: pyflakes, I: isort
+select = ["E", "F", "I"]
+ignore = [
+    "E501",   # line too long — handled by formatter, not linter
+    "E701",   # multiple statements on one line (colon) — used in compact fixtures
+    "E702",   # multiple statements on one line (semicolon) — used in compact fixtures
+    "E741",   # ambiguous variable name (l, O, I) — common in physics/math code
+    "E401",   # multiple imports on one line
+    "E402",   # module level import not at top — needed after sys.path manipulation
+    "F401",   # unused import — SWIG wrappers re-export symbols intentionally
+    "F403",   # wildcard import — SWIG generated modules use this
+    "F405",   # may be undefined from wildcard — SWIG generated modules use this
+    "I001",   # import block unsorted — enforce going forward via pre-commit, not retroactively
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["F811", "F841"]          # redefined fixtures and unused vars fine in pytest
+"tests_plumed_parity/*" = ["F811", "F841"]
+"python/glued.py" = ["F401"]          # re-exports from gluedplugin are intentional
+"benchmarks/*" = ["F841"]            # benchmark timing vars sometimes unused

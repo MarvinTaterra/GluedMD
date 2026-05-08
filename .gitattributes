@@ -1,0 +1,18 @@
+# Normalize all text files to LF in the repo; let Windows check out CRLF locally
+* text=auto eol=lf
+
+# Windows-only scripts keep CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary files — never mangle line endings
+*.so     binary
+*.dll    binary
+*.dylib  binary
+*.a      binary
+*.lib    binary
+*.pt     binary
+*.bin    binary
+*.png    binary
+*.jpg    binary
