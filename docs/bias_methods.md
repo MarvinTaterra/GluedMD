@@ -105,7 +105,7 @@ force.addBias(gp.GluedForce.BIAS_PBMETAD,
 On-the-fly Probability Enhanced Sampling (Invernizzi & Parrinello 2020). Builds a compressed non-parametric kernel density estimate of the CV probability distribution and uses it to construct a flat-histogram bias.
 
 | `parameters` | `[kT, gamma, sigma_0, sigmaMin_0, sigma_1, sigmaMin_1, ...]` — thermal energy, biasfactor, initial bandwidth and minimum bandwidth per CV |
-| `integerParameters` | `[variant, pace, maxKernels]` — variant: 0 = standard OPES; pace = deposition interval; maxKernels = kernel list capacity |
+| `integerParameters` | `[variant, pace, maxKernels]` — variant: `0` = standard OPES_METAD, `1` = uniform target + fixed σ, `2` = OPES_METAD_EXPLORE; pace = deposition interval; maxKernels = kernel list capacity |
 
 ```python
 force.add_opes(phi_idx, sigma=0.35, gamma=15.0, pace=500)
@@ -113,12 +113,44 @@ force.add_opes(phi_idx, sigma=0.35, gamma=15.0, pace=500)
 # sigma_min defaults to 5% of sigma; max_kernels defaults to 100 000
 ```
 
+### Modes
+
+OPES has three sub-variants selectable via the `mode` keyword on `add_opes`
+(or the `variant` integer in the low-level API):
+
+* **`mode='metad'`** *(variant=0, default)* — standard OPES_METAD. Targets the
+  well-tempered distribution `p^WT ∝ P(s)^(1/γ)` by reweighting the unbiased
+  distribution `P(s)`. Adaptive Silverman σ. Bias prefactor `(γ−1)/γ`.
+  Reference: Invernizzi & Parrinello, *JPCL* **11**:2731 (2020).
+
+* **`mode='explore'`** *(variant=2)* — OPES_METAD_EXPLORE. Targets the same
+  WT distribution but estimates it directly from biased samples (plain KDE)
+  rather than via reweighting. Bias prefactor `(γ−1)`. Use when CVs may be
+  degenerate or the barrier is unknown. Reference: Invernizzi, Piaggi &
+  Parrinello, *JCTC* **18**:3988 (2022).
+
+  The user-supplied σ is internally broadened by √γ to target the wider WT
+  distribution — pass the same σ you would use with METAD. PLUMED users
+  matching `SIGMA=0.05 BIASFACTOR=10` should pass `sigma=0.05` here too;
+  the broadening is applied automatically.
+
+* **`mode='fixed_uniform'`** *(variant=1)* — uniform target (γ→∞ equivalent)
+  with fixed σ. Specialized; rarely needed.
+
+```python
+# Standard OPES_METAD on alanine dipeptide
+force.add_opes([phi, psi], sigma=0.05, gamma=10.0, pace=500, mode='metad')
+
+# OPES_METAD_EXPLORE — same call, different mode
+force.add_opes([phi, psi], sigma=0.05, gamma=10.0, pace=500, mode='explore')
+```
+
 **Convergence diagnostics** (query at runtime):
 
 ```python
 zed, rct, nker, neff = force.getOPESMetrics(context, bias_idx)
-# zed:  exp(logZ) — normalization estimate (converges to constant)
-# rct:  kT * logZ — c(t) indicator (flattens when bias converges)
+# zed:  sum_uprob / (KDEnorm·nker)  — bounded near order 1 at convergence
+# rct:  kT · log(sum_weights / counter)  — c(t) reweighting indicator (kJ/mol)
 # nker: number of compressed kernels
 # neff: effective sample size
 ```

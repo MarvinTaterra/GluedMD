@@ -525,8 +525,42 @@ void CommonCalcGluedForceKernel::setupBiases(const GluedForce& force) {
 
  o.biasEnergyIdx = biasEnergyCounter++;
 
- double invGF = (o.variant == 1) ? 1.0
- : (o.gamma - 1.0) / o.gamma;
+ // Variant-dependent bias coefficients.
+ //   variant=0 METAD:    invGF=(γ-1)/γ,  cutoff²=2γ²/(γ-1),       eps=exp(-1/(invGF(1-invGF)))
+ //   variant=1 uniform:  invGF=1,        cutoff²=2γ,               eps=0
+ //   variant=2 EXPLORE:  invGF=γ-1,      cutoff²=2γ (=2·barrier/kT),
+ //                       eps=exp(-γ/(γ-1)) = exp(-barrier/((γ-1)kT))
+ // barrier_kJ = γ·kT for all variants (passed to eval kernel for the
+ // pre-deposit zero-kernel branch).
+ double invGF, cutoff2, eps, barrier_kJ;
+ if (o.variant == 1) {
+  invGF      = 1.0;
+  cutoff2    = 2.0 * o.gamma;
+  eps        = 0.0;
+  barrier_kJ = o.gamma * o.kT;
+ } else if (o.variant == 2) {
+  // OPES_METAD_EXPLORE — Invernizzi, Piaggi & Parrinello, JCTC 18:3988 (2022).
+  if (!std::isfinite(o.gamma) || o.gamma <= 1.0)
+   throw OpenMM::OpenMMException(
+       "OPES_METAD_EXPLORE (variant=2) requires finite gamma > 1");
+  invGF      = o.gamma - 1.0;
+  cutoff2    = 2.0 * o.gamma;
+  eps        = std::exp(-o.gamma / (o.gamma - 1.0));
+  barrier_kJ = o.gamma * o.kT;
+  // Broaden user-supplied σ₀ by √γ so kernels target the wider WT distribution.
+  // Skip when in fully-adaptive mode (sigma0 ≤ 0 sentinel).
+  if (!adaptiveMode) {
+   for (int d = 0; d < o.numCVsBias; d++)
+    o.sigma0[d] *= std::sqrt(o.gamma);
+   o.sigma0GPU.upload(o.sigma0);   // re-upload broadened sigma0
+  }
+ } else {
+  // variant=0 (default OPES_METAD)
+  invGF      = (o.gamma - 1.0) / o.gamma;
+  cutoff2    = 2.0 * o.gamma / invGF;
+  eps        = std::exp(-1.0 / (invGF * (1.0 - invGF)));
+  barrier_kJ = o.kT / (1.0 - invGF);   // == γ·kT
+ }
 
  ComputeProgram oProg = cc_.compileProgram(kOPESKernelSrc, {});
  o.evalKernel = oProg->createKernel("opesEvalBias");
@@ -538,9 +572,6 @@ void CommonCalcGluedForceKernel::setupBiases(const GluedForce& force) {
  // KDNorm initial value = exp(-gamma) sentinel (ensures no zero-division before first deposit).
  o.sumWeightsGPU.initialize<double>(cc_, 1, "opesBias_sumW_" + to_string(bIdx));
  o.sumWeightsGPU.upload(vector<double>{exp(-o.gamma)});
- // cutoff2 = 2*gamma/invGF = 2*gamma^2/(gamma-1)
- double cutoff2 = (invGF > 0.0) ? 2.0 * o.gamma / invGF : 2.0 * o.gamma;
-
  o.evalKernel->addArg(plan_.cvValues); // 0
  o.evalKernel->addArg(o.cvIdxGPU); // 1
  o.evalKernel->addArg(o.kernelCenters); // 2
@@ -550,12 +581,14 @@ void CommonCalcGluedForceKernel::setupBiases(const GluedForce& force) {
  o.evalKernel->addArg(D); // 6: numCVsBias
  o.evalKernel->addArg(invGF); // 7: invGammaFactor
  o.evalKernel->addArg(o.kT); // 8: kT
- o.evalKernel->addArg(o.logZGPU); // 9: logSumPairwiseGPU
+ o.evalKernel->addArg(o.logZGPU); // 9: sum_uprob (linear despite name)
  o.evalKernel->addArg(o.sumWeightsGPU); // 10: KDNorm (Σ h_k)
- o.evalKernel->addArg(cutoff2); // 11: 2*gamma/(gamma-1)
- o.evalKernel->addArg(plan_.cvBiasGradients); // 12
- o.evalKernel->addArg(plan_.biasEnergies); // 13
- o.evalKernel->addArg(o.biasEnergyIdx); // 14
+ o.evalKernel->addArg(cutoff2); // 11: 2γ²/(γ-1) for METAD, 2γ for EXPLORE/uniform
+ o.evalKernel->addArg(eps); // 12: variant-dependent ε
+ o.evalKernel->addArg(barrier_kJ); // 13: γ·kT (used in zero-kernel branch)
+ o.evalKernel->addArg(plan_.cvBiasGradients); // 14
+ o.evalKernel->addArg(plan_.biasEnergies); // 15
+ o.evalKernel->addArg(o.biasEnergyIdx); // 16
 
  o.gatherDepositKernel = oProg->createKernel("opesGatherDeposit");
  o.gatherDepositKernel->addArg(plan_.cvValues); // 0
@@ -582,6 +615,8 @@ void CommonCalcGluedForceKernel::setupBiases(const GluedForce& force) {
  o.gatherDepositKernel->addArg(o.stepCountGPU); // 21: step count for neff
  o.gatherDepositKernel->addArg(o.numAllocatedGPU); // 22: B2 multiwalker slot-claim counter
  o.gatherDepositKernel->addArg(o.maxKernels); // 23: buffer capacity limit
+ o.gatherDepositKernel->addArg(o.gamma); // 24: γ (adaptive-σ factor in EXPLORE/METAD)
+ o.gatherDepositKernel->addArg(barrier_kJ); // 25: γ·kT (kept for symmetry / future use)
 
  // In fully-adaptive mode, compile the every-step Welford accumulator kernel.
  // It runs in execute() (after CV kernels) and manages nSamples/runningMean/runningM2;

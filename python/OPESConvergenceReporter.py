@@ -1,16 +1,19 @@
-"""OPESConvergenceReporter — auto-stop an OPES simulation when rct converges.
+"""OPESConvergenceReporter — auto-stop OPES simulations on convergence.
 
-The convergence criterion is |Δrct| < tol (kJ/mol) over one check_interval.
-After convergence is detected the simulation continues for post_convergence_steps
-additional steps before stopping — providing extra sampling to confirm the result
-and collect post-convergence statistics.
+Supports multiple convergence criteria:
 
-Metric background
------------------
-rct = kT·log(Z) is the free-energy normalization estimate returned by OPES.
-It starts near zero and rises as new phase-space regions are explored.
-When the simulation has converged, rct becomes roughly flat — |Δrct| per
-check_interval falls below the thermal noise floor.
+* ``'rct_relative'`` (default) — flatness of rct in dimensionless units. Robust
+  across OPES variants. Converged when ``|Δrct| / max(|rct|, kT) < tol`` over
+  ``min_consecutive_passes`` consecutive checks.
+* ``'neff_rate'`` — stability of the effective-sample-size growth rate.
+  Variant-agnostic; recommended for OPES_METAD_EXPLORE where the bias is
+  intentionally non-stationary by design.
+* ``'rct_absolute'`` — original behavior: ``|Δrct| < tol`` in kJ/mol.
+
+Convergence is confirmed only after ``min_consecutive_passes`` consecutive
+passing checks, and the test does not start until at least ``min_kernels``
+kernels and ``min_steps`` steps have elapsed. After convergence is detected,
+the simulation runs ``post_convergence_steps`` more steps before stopping.
 
 Typical usage
 -------------
@@ -18,58 +21,99 @@ Typical usage
 
     from OPESConvergenceReporter import OPESConvergenceReporter
 
-    reporter = OPESConvergenceReporter(force, tol=0.05, check_interval=2000,
-                                       post_convergence_steps=100_000,
-                                       file='convergence.log')
+    reporter = OPESConvergenceReporter(
+        force, criterion='rct_relative', tol=0.01,
+        check_interval=2000, post_convergence_steps=100_000,
+        file='convergence.log')
     reporter.run(simulation, max_steps=10_000_000)
     print(f"Converged at step {reporter.converged_at_step}")
 
-Manual loop (if you need finer control)::
+For OPES_METAD_EXPLORE (``mode='explore'`` on ``add_opes``) prefer
+``criterion='neff_rate'`` — rct is non-stationary by design in EXPLORE::
 
-    simulation.reporters.append(reporter)
-    while not reporter.done and simulation.currentStep < max_steps:
-        simulation.step(check_interval)
+    reporter = OPESConvergenceReporter(
+        force, criterion='neff_rate', tol=0.02,
+        check_interval=2000, post_convergence_steps=100_000)
 """
 
 import sys
 
+# Boltzmann constant in kJ/mol/K (matches GluedForce.kTFromTemperature).
+_R_KJ = 8.314462618e-3
+
 
 class OPESConvergenceReporter:
-    """Reporter that stops an OPES simulation when rct has converged.
+    """Auto-stop reporter for OPES simulations.
 
     Parameters
     ----------
     force : GluedForce
         The force containing the OPES bias.
     bias_idx : int
-        Index of the OPES bias within the force (0 for the first/only bias).
+        Index of the OPES bias within the force (default 0).
+    criterion : {'rct_relative', 'neff_rate', 'rct_absolute'}
+        Convergence signal. See module docstring.
     tol : float
-        Convergence tolerance in kJ/mol.  The simulation is considered converged
-        when |rct_now − rct_prev| < tol over one check_interval.
-        Default 0.1 kJ/mol (~0.04 kBT at 300 K).
+        Tolerance. Units depend on criterion:
+
+          - ``'rct_relative'`` : dimensionless (~0.01)
+          - ``'neff_rate'``    : dimensionless (~0.02)
+          - ``'rct_absolute'`` : kJ/mol (~0.05)
     check_interval : int
-        Number of MD steps between successive rct checks.
+        MD steps between successive checks.
+    min_consecutive_passes : int
+        Number of consecutive checks below tol before declaring convergence
+        (default 3).
+    min_kernels : int
+        Don't start checking until at least this many kernels are deposited
+        (default 50).
+    min_steps : int
+        Don't start checking until at least this many MD steps (default 0).
     post_convergence_steps : int
-        Additional MD steps to run after convergence is first detected.
+        MD steps to run after convergence is detected.
     file : str, file-like, or None
-        Destination for log output.  Defaults to stdout.
+        Log destination (None = stdout).
     verbose : bool
-        If True, print rct at every check.  If False, only print convergence
-        and completion events.
+        Print one line per check.
     """
 
-    def __init__(self, force, bias_idx=0, tol=0.1, check_interval=1000,
-                 post_convergence_steps=50_000, file=None, verbose=True):
+    _VALID_CRITERIA = ('rct_relative', 'neff_rate', 'rct_absolute')
+
+    def __init__(self, force, bias_idx=0, *,
+                 criterion='rct_relative',
+                 tol=0.01,
+                 check_interval=1000,
+                 min_consecutive_passes=3,
+                 min_kernels=50,
+                 min_steps=0,
+                 post_convergence_steps=50_000,
+                 file=None, verbose=True):
+        if criterion not in self._VALID_CRITERIA:
+            raise ValueError(
+                f"criterion must be one of {self._VALID_CRITERIA}, got {criterion!r}")
+
         self._force = force
         self._bias_idx = bias_idx
+        self._criterion = criterion
         self._tol = tol
         self._interval = check_interval
+        self._min_passes = max(1, int(min_consecutive_passes))
+        self._min_kernels = max(0, int(min_kernels))
+        self._min_steps = max(0, int(min_steps))
         self._post_steps = post_convergence_steps
         self._verbose = verbose
         self._file = file
         self._out = None
 
-        self._prev_rct = None
+        # Cache kT for the relative-flatness denominator.
+        try:
+            T = force.getTemperature()
+            self._kT = _R_KJ * T if T > 0 else _R_KJ * 300.0
+        except Exception:
+            self._kT = _R_KJ * 300.0   # safe fallback
+
+        self._prev_signal = None
+        self._consecutive_passes = 0
         self._converged = False
         self._done = False
         self._converged_at_step = None
@@ -80,7 +124,7 @@ class OPESConvergenceReporter:
 
     @property
     def converged(self):
-        """True once the rct convergence criterion has been satisfied."""
+        """True once the chosen criterion has been satisfied N times in a row."""
         return self._converged
 
     @property
@@ -90,21 +134,26 @@ class OPESConvergenceReporter:
 
     @property
     def converged_at_step(self):
-        """Step index at which convergence was first detected, or None."""
+        """Step index at which convergence was first declared, or None."""
         return self._converged_at_step
 
-    def run(self, simulation, max_steps):
-        """Run until convergence + post-convergence steps, or max_steps.
+    def force_converge(self, simulation):
+        """Manually mark the run as converged.
 
-        Attaches this reporter to *simulation*, runs in check_interval-sized
-        batches, then detaches and returns.
-
-        Parameters
-        ----------
-        simulation : openmm.app.Simulation
-        max_steps : int
-            Hard upper limit on total MD steps regardless of convergence.
+        Useful for interactive sessions where the user has decided from
+        external evidence (e.g. visual inspection of the FES) that the run
+        is good enough. Triggers the post-convergence window normally.
         """
+        if not self._converged:
+            self._converged = True
+            self._converged_at_step = simulation.currentStep
+            self._open()
+            self._log(
+                f"[OPESConvergence] Manually marked converged at step "
+                f"{simulation.currentStep}; running {self._post_steps:,} more steps.")
+
+    def run(self, simulation, max_steps):
+        """Attach, run in check_interval batches, then detach."""
         was_attached = self in simulation.reporters
         if not was_attached:
             simulation.reporters.append(self)
@@ -123,55 +172,78 @@ class OPESConvergenceReporter:
     # ------------------------------------------------------------------
 
     def describeNextReport(self, simulation):
-        """Return (steps_until_next, needs_pos, needs_vel, needs_forces, needs_energy)."""
         steps = self._interval - simulation.currentStep % self._interval
         return (steps, False, False, False, False)
 
     def report(self, simulation, state):
-        """Check rct; update convergence state; write log line."""
         self._open()
         step = simulation.currentStep
         metrics = self._force.getOPESMetrics(simulation.context, self._bias_idx)
-        # getOPESMetrics returns [zed, rct, nker, neff]
-        rct  = metrics[1]
-        nker = metrics[2]
-        neff = metrics[3]
+        zed, rct, nker, neff = metrics
 
-        if self._prev_rct is None:
-            drct = None
-            drct_str = "      ---"
-        else:
-            drct = abs(rct - self._prev_rct)
-            drct_str = f"{drct:9.4f}"
-            if not self._converged and drct < self._tol:
-                self._converged = True
-                self._converged_at_step = step
-                self._log(
-                    f"[OPESConvergence] Converged at step {step}: "
-                    f"rct={rct:.4f} kJ/mol, |Δrct|={drct:.4f} < tol={self._tol:.4f}. "
-                    f"Running {self._post_steps:,} more steps."
-                )
+        signal = self._compute_signal(step, rct, neff)
+
+        # Don't evaluate convergence until warm-up gates pass.
+        warming_up = (nker < self._min_kernels) or (step < self._min_steps)
+
+        drift = None
+        if not warming_up and self._prev_signal is not None:
+            drift = abs(signal - self._prev_signal)
+            if drift < self._tol:
+                self._consecutive_passes += 1
+                if (not self._converged
+                        and self._consecutive_passes >= self._min_passes):
+                    self._converged = True
+                    self._converged_at_step = step
+                    self._log(
+                        f"[OPESConvergence] Converged at step {step} "
+                        f"({self._criterion}): signal={signal:.4f}, "
+                        f"|Δ|={drift:.5f} < tol={self._tol:.5f} "
+                        f"for {self._consecutive_passes} consecutive checks. "
+                        f"Running {self._post_steps:,} more steps.")
+            else:
+                self._consecutive_passes = 0
 
         if self._verbose:
-            tag = "  [converged]" if self._converged else ""
-            self._log(
-                f"step {step:>10d}  rct={rct:10.4f} kJ/mol"
-                f"  |Δrct|={drct_str} kJ/mol"
-                f"  nker={int(nker):6d}  neff={neff:8.1f}{tag}"
-            )
+            self._log_check(step, rct, nker, neff, signal, drift, warming_up)
 
         if self._converged and step >= self._converged_at_step + self._post_steps:
             self._done = True
             self._log(
                 f"[OPESConvergence] Post-convergence run complete at step {step}. "
-                f"Total post-convergence steps: {step - self._converged_at_step:,}."
-            )
+                f"Total post-convergence steps: "
+                f"{step - self._converged_at_step:,}.")
 
-        self._prev_rct = rct
+        self._prev_signal = signal
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Internal
     # ------------------------------------------------------------------
+
+    def _compute_signal(self, step, rct, neff):
+        """Return the dimensionless quantity to monitor."""
+        if self._criterion == 'rct_relative':
+            denom = max(abs(rct), self._kT)
+            return rct / denom              # bounded in [-1, 1] roughly
+        elif self._criterion == 'neff_rate':
+            return neff / max(step, 1)      # asymptotically constant at convergence
+        else:                               # 'rct_absolute'
+            return rct
+
+    def _log_check(self, step, rct, nker, neff, signal, drift, warming_up):
+        if self._converged:
+            tag = "  [converged]"
+        elif warming_up:
+            tag = "  [warmup]"
+        else:
+            tag = ""
+        drift_str = f"{drift:8.5f}" if drift is not None else "     ---"
+        passes_str = (f"  passes={self._consecutive_passes}/{self._min_passes}"
+                      if drift is not None and not warming_up else "")
+        self._log(
+            f"step {step:>10d}  rct={rct:9.4f}  nker={int(nker):5d}  "
+            f"neff={neff:8.1f}  signal={signal:9.4f}  |Δ|={drift_str}"
+            f"{passes_str}{tag}")
 
     def _open(self):
         if self._out is not None:
@@ -187,9 +259,9 @@ class OPESConvergenceReporter:
         print(msg, file=self._out, flush=True)
 
     def __del__(self):
-        if self._out is not None \
-                and self._out is not sys.stdout \
-                and isinstance(self._file, str):
+        if (self._out is not None
+                and self._out is not sys.stdout
+                and isinstance(self._file, str)):
             try:
                 self._out.close()
             except Exception:

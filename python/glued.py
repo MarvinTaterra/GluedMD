@@ -439,8 +439,8 @@ class Force(_gp.GluedForce):
         return self.addBias(_gp.GluedForce.BIAS_ABMD, cvs, params)
 
     def add_opes(self, cvs, sigma, *, gamma=10.0, pace=500, temperature=None,
-                 sigma_min=None, max_kernels=100000):
-        """Well-tempered OPES bias (Invernizzi & Parrinello 2020).
+                 sigma_min=None, max_kernels=100000, mode='metad'):
+        """OPES bias.
 
         Parameters
         ----------
@@ -451,13 +451,36 @@ class Force(_gp.GluedForce):
         temperature : float or None  Override Force-level temperature (K).
         sigma_min : float or None  Minimum sigma (default 5 % of sigma).
         max_kernels : int  Kernel table capacity (default 100 000).
+        mode : {'metad', 'explore', 'fixed_uniform'}, default 'metad'
+            * ``'metad'`` — standard OPES_METAD: well-tempered target,
+              adaptive Silverman σ. Bias prefactor (γ−1)/γ.
+              Reference: Invernizzi & Parrinello, JPCL 11:2731 (2020).
+            * ``'explore'`` — OPES_METAD_EXPLORE: well-tempered sampled
+              distribution, plain (unweighted) KDE on biased samples.
+              Bias prefactor (γ−1). Use when CVs may be degenerate or the
+              barrier height is unknown. The user-supplied σ is internally
+              broadened by √γ; pass the same σ you would use with METAD.
+              Reference: Invernizzi, Piaggi & Parrinello, JCTC 18:3988 (2022).
+            * ``'fixed_uniform'`` — uniform target (γ→∞ equivalent) with
+              fixed σ. Specialized; rarely needed.
         """
+        variant_map = {'metad': 0, 'fixed_uniform': 1, 'explore': 2}
+        if mode not in variant_map:
+            raise ValueError(
+                f"mode must be one of {list(variant_map)}, got {mode!r}")
+        if mode == 'explore':
+            import math as _math
+            if not (gamma > 1.0 and _math.isfinite(gamma)):
+                raise ValueError(
+                    "OPES EXPLORE requires finite gamma > 1 (no BIASFACTOR=inf)")
+        variant = variant_map[mode]
+
         cvs   = self._cv_list(cvs)
         kT    = self._resolve_kT(temperature)
         sigma = _scalar_or_list(sigma, len(cvs))
         s_min = sigma_min if sigma_min is not None else min(sigma) * 0.05
         params     = [kT, float(gamma)] + sigma + [float(s_min)]
-        int_params = [0, int(pace), int(max_kernels)]   # variant=0 (well-tempered)
+        int_params = [variant, int(pace), int(max_kernels)]
         return self.addBias(_gp.GluedForce.BIAS_OPES, cvs, params, int_params)
 
     def add_metad(self, cvs, sigma, height, pace, *, grid_min, grid_max,

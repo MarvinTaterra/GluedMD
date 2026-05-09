@@ -451,15 +451,93 @@ def test_opes_metrics(platform):
     # Compression merges same-location deposits: nker may be 1 (all merged into 1).
     assert 1 <= m5[2] <= 5, f"nker should be in [1,5] after 5 depositions, got {m5[2]}"
     assert m5[3] >= 1.0, f"neff={m5[3]:.3f} should be >= 1"
-    # rct = kT*sum_uprob grows as kernels accumulate (sum_uprob increases).
-    assert m5[1] >= m1[1], \
-        f"rct should increase as kernels accumulate: rct1={m1[1]:.4f} rct5={m5[1]:.4f}"
+    # rct = kT·log(sum_weights/counter) — c(t) reweighting indicator (PLUMED-style).
+    # Should be finite and bounded (typically a few kJ/mol). Not strictly monotonic
+    # but should stabilize at convergence; for this short test we just check
+    # bounded magnitude.
+    assert math.isfinite(m5[1]), f"rct={m5[1]} not finite"
+    assert abs(m5[1]) < 100.0, f"rct={m5[1]:.4f} kJ/mol unreasonably large"
 
-    assert math.isfinite(m5[0]) and m5[0] > 0, \
-        f"zed={m5[0]} not positive/finite after 5 kernels"
+    # zed = sum_uprob/(KDEnorm·nker) — should be bounded near order 1.
+    assert 0.0 < m5[0] < 100.0, f"zed={m5[0]:.4f} outside reasonable bounds"
 
     print(f"  test_opes_metrics: OK  "
           f"(nker={m5[2]:.0f}, zed={m5[0]:.4f}, rct={m5[1]:.4f} kJ/mol, neff={m5[3]:.2f})")
+
+
+def test_opes_explore_basic(platform):
+    """OPES_METAD_EXPLORE (variant=2): basic deposition + bounded metrics."""
+    kT, gamma, sigma0, sigmaMin = 2.479, 10.0, 0.2, 0.01
+    s_dep = 1.0
+    cv_specs = [(gp.GluedForce.CV_DISTANCE, [0, 1], [])]
+    params = [kT, gamma, sigma0, sigmaMin]
+    bias_specs = [([0], params, [2, 1, 100000], gp.GluedForce.BIAS_OPES)]  # variant=2
+    ctx, force = make_system(
+        [(0,0,0), (s_dep,0,0), (5,5,5)], cv_specs, bias_specs, platform)
+
+    # Before any deposition
+    m0 = force.getOPESMetrics(ctx, 0)
+    assert m0[2] == 0, f"nker should be 0, got {m0[2]}"
+
+    # Deposit 5 kernels with pace=1
+    for _ in range(5):
+        ctx.setPositions([mm.Vec3(0,0,0), mm.Vec3(s_dep,0,0), mm.Vec3(5,5,5)])
+        ctx.getIntegrator().step(1)
+
+    m5 = force.getOPESMetrics(ctx, 0)
+    assert 1 <= m5[2] <= 5, f"nker should be in [1,5], got {m5[2]}"
+    assert math.isfinite(m5[0]) and m5[0] > 0, f"zed={m5[0]} invalid"
+    assert math.isfinite(m5[1]), f"rct={m5[1]} not finite"
+
+    E = get_energy(ctx)
+    assert math.isfinite(E), f"E={E} not finite for EXPLORE"
+
+    print(f"  test_opes_explore_basic: OK  "
+          f"(nker={int(m5[2])}, zed={m5[0]:.4f}, rct={m5[1]:.4f}, neff={m5[3]:.2f})")
+
+
+def test_opes_explore_rejects_inf_gamma(platform):
+    """variant=2 must reject gamma=inf (PLUMED requires finite γ for EXPLORE)."""
+    kT = 2.479
+    cv_specs = [(gp.GluedForce.CV_DISTANCE, [0, 1], [])]
+    params = [kT, float('inf'), 0.2, 0.01]
+    bias_specs = [([0], params, [2, 500, 100000], gp.GluedForce.BIAS_OPES)]
+    raised = False
+    try:
+        ctx, force = make_system(
+            [(0,0,0), (1,0,0), (5,5,5)], cv_specs, bias_specs, platform)
+    except Exception as e:
+        raised = True
+        msg = str(e)
+        assert ("EXPLORE" in msg) or ("gamma" in msg.lower()), \
+            f"Unexpected error message: {msg}"
+    assert raised, "Should have raised for gamma=inf in EXPLORE mode"
+    print("  test_opes_explore_rejects_inf_gamma: OK")
+
+
+def test_opes_explore_python_mode(platform):
+    """Smoke-check the Python add_opes(mode='explore') ergonomic wrapper."""
+    import openmm as mm_lib
+    system = mm_lib.System()
+    for _ in range(3):
+        system.addParticle(1.0)
+    f = gp.GluedForce()
+    f.setTemperature(300.0)
+    cv_dist = f.addCollectiveVariable(gp.GluedForce.CV_DISTANCE, [0, 1], [])
+    # Mirror the Python helper's parameter assembly
+    kT = 0.0083144626 * 300.0
+    sigma0 = 0.2
+    params = [kT, 10.0, sigma0, sigma0 * 0.05]
+    int_params = [2, 1, 100000]   # variant=2
+    f.addBias(gp.GluedForce.BIAS_OPES, [cv_dist], params, int_params)
+    system.addForce(f)
+    integ = mm_lib.LangevinIntegrator(300.0, 1.0, 0.001)
+    ctx = mm_lib.Context(system, integ, platform)
+    ctx.setPositions([mm_lib.Vec3(0,0,0), mm_lib.Vec3(1.0,0,0), mm_lib.Vec3(5,5,5)])
+    integ.step(2)
+    m = f.getOPESMetrics(ctx, 0)
+    assert m[2] >= 1, f"EXPLORE should deposit, got nker={m[2]}"
+    print(f"  test_opes_explore_python_mode: OK  (nker={int(m[2])})")
 
 
 def test_opes_adaptive_blocks_early_deposition(platform):

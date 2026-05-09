@@ -311,32 +311,49 @@ Automatically stops an OPES simulation when the free-energy estimate has converg
 from OPESConvergenceReporter import OPESConvergenceReporter
 ```
 
-### Convergence metric
+### Convergence criteria
 
-The reporter monitors **rct = kT·log(Z)** — the free-energy normalization estimate that OPES accumulates as it explores phase space. When the simulation has converged, rct stops growing and becomes approximately flat. The criterion is:
+The reporter supports three convergence criteria, selectable via `criterion=`:
 
-```
-|rct(t) − rct(t − check_interval)| < tol
-```
+| `criterion` | Signal | Tol units | Notes |
+|---|---|---|---|
+| `'rct_relative'` *(default)* | `rct / max(|rct|, kT)` | dimensionless (~0.01) | Scale-invariant; robust across OPES variants |
+| `'neff_rate'`               | `neff / step`           | dimensionless (~0.02) | Variant-agnostic; **recommended for `mode='explore'`** where rct is non-stationary by design |
+| `'rct_absolute'`            | `rct`                   | kJ/mol (~0.05)        | Original behavior; absolute drift in kJ/mol |
 
-After convergence is detected the simulation runs for `post_convergence_steps` more steps before stopping, to confirm the result and collect post-convergence statistics.
+The reporter declares convergence only after `min_consecutive_passes` checks
+(default 3) consecutively pass `|Δsignal| < tol`. The test does not start
+until at least `min_kernels` kernels have been deposited and `min_steps` MD
+steps have elapsed (warm-up gates). After convergence is detected the
+simulation runs for `post_convergence_steps` more steps before stopping.
 
 ### Constructor
 
 ```python
-OPESConvergenceReporter(force, bias_idx=0, tol=0.1, check_interval=1000,
-                         post_convergence_steps=50_000, file=None, verbose=True)
+OPESConvergenceReporter(
+    force, bias_idx=0, *,
+    criterion='rct_relative', tol=0.01,
+    check_interval=1000,
+    min_consecutive_passes=3,
+    min_kernels=50, min_steps=0,
+    post_convergence_steps=50_000,
+    file=None, verbose=True,
+)
 ```
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `force` | GluedForce | — | The force containing the OPES bias |
 | `bias_idx` | int | 0 | Index of the OPES bias (0 for the first/only bias) |
-| `tol` | float | 0.1 | Convergence tolerance in kJ/mol (~0.04 kBT at 300 K) |
-| `check_interval` | int | 1000 | Steps between successive rct checks |
+| `criterion` | str | `'rct_relative'` | One of `'rct_relative'`, `'neff_rate'`, `'rct_absolute'` |
+| `tol` | float | 0.01 | Tolerance — units depend on `criterion` (see table above) |
+| `check_interval` | int | 1000 | Steps between successive checks |
+| `min_consecutive_passes` | int | 3 | Consecutive passing checks required before declaring convergence |
+| `min_kernels` | int | 50 | Don't start checking until at least this many kernels deposited |
+| `min_steps` | int | 0 | Don't start checking before this MD step count |
 | `post_convergence_steps` | int | 50 000 | Additional steps after convergence is detected |
 | `file` | str, file, or None | None | Log output destination; defaults to stdout |
-| `verbose` | bool | True | Print rct at every check; set False for convergence events only |
+| `verbose` | bool | True | Print one line per check; set False for events only |
 
 ### Properties
 
@@ -352,9 +369,21 @@ OPESConvergenceReporter(force, bias_idx=0, tol=0.1, check_interval=1000,
 
 Attach the reporter, run in `check_interval`-sized batches until `done` or `max_steps` is reached, then detach. This is the primary usage pattern.
 
+#### `force_converge(simulation)`
+
+Manually mark the run as converged — useful for interactive sessions where external evidence (e.g. visual inspection of the FES) shows the run is good enough. Triggers the `post_convergence_steps` window normally.
+
 #### `describeNextReport(simulation)` / `report(simulation, state)`
 
 Standard OpenMM reporter interface — attach manually if you need finer loop control.
+
+### Picking a criterion
+
+For most users **`'rct_relative'` (default)** with `tol=0.01` is the right answer — it's dimensionless, robust to noise, and works for all OPES variants.
+
+For **OPES_METAD_EXPLORE** (`force.add_opes(..., mode='explore')`) prefer **`'neff_rate'`**: the EXPLORE bias is non-stationary by design, so rct never plateaus the way it does in standard METAD. `neff/step` does stabilize once the bias has equilibrated.
+
+Use `'rct_absolute'` only when porting from existing scripts that depended on the old kJ/mol-based behavior.
 
 ### Usage
 

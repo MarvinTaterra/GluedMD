@@ -2546,21 +2546,18 @@ KERNEL void opesEvalBias(
  double kT,                                      // 8
  GLOBAL const double* RESTRICT sumUprobGPU,      // 9: Σ_{j,k} h_k*(G_jk-ε) (direct value)
  GLOBAL const double* RESTRICT sumWeightsGPU,    // 10: Σ h_k (KDNorm) — unused in formula but kept for API compat
- double cutoff2,                                 // 11: 2·γ/invGF = 2·γ²/(γ-1)
- GLOBAL double* RESTRICT cvBiasGradients,        // 12
- GLOBAL double* RESTRICT biasEnergies,           // 13
- int biasIdx                                     // 14
+ double cutoff2,                                 // 11: variant-dependent (2γ²/(γ-1) for METAD, 2γ for EXPLORE/uniform)
+ double eps,                                     // 12: variant-dependent ε
+ double barrier_kJ,                              // 13: γ·kT (zero-kernel branch)
+ GLOBAL double* RESTRICT cvBiasGradients,        // 14
+ GLOBAL double* RESTRICT biasEnergies,           // 15
+ int biasIdx                                     // 16
 ) {
  if (GLOBAL_ID != 0) return;
- double barrier = (invGammaFactor < 1.0) ? (kT / (1.0 - invGammaFactor)) : 0.0;
- // ε = exp(-γ/invGF) = exp(-1/(invGF·(1-invGF)))
- double eps = (invGammaFactor < 1.0)
-  ? exp(-1.0 / (invGammaFactor * (1.0 - invGammaFactor)))
-  : 0.0;
 
  int numKernels = numKernelsGPU[0];
  if (numKernels == 0) {
-  biasEnergies[biasIdx] = -barrier;
+  biasEnergies[biasIdx] = -barrier_kJ;
   return;
  }
 
@@ -2659,12 +2656,15 @@ KERNEL void opesGatherDeposit(
  GLOBAL double* RESTRICT sumWArr,              // 20: {sum_w, sum_w2} (LINEAR)
  GLOBAL int* RESTRICT stepCountArr,            // 21: deposit count (for diagnostics)
  GLOBAL int* RESTRICT numAllocatedGPU,         // 22: B2 multiwalker slot-claim counter
- int maxKernels                                 // 23: buffer capacity limit
+ int maxKernels,                                // 23: buffer capacity limit
+ double gammaArg,                               // 24: γ (for adaptive-σ factor in EXPLORE/METAD)
+ double barrier_kJ                              // 25: γ·kT (unused inside; kept for symmetry)
 ) {
  if (GLOBAL_ID != 0) return;
  if (adaptiveSigmaStride > 0 && nSamples[0] < adaptiveSigmaStride) return;
  int nBefore = numKernelsGPU[0];
- if (variant == 0 && adaptiveSigmaStride == 0) nSamples[0]++;
+ // METAD and EXPLORE both increment nSamples in non-adaptive mode; uniform doesn't.
+ if (variant != 1 && adaptiveSigmaStride == 0) nSamples[0]++;
  int n = nSamples[0];
 
  // Compute new kernel center from current CV values.
@@ -2672,9 +2672,19 @@ KERNEL void opesGatherDeposit(
  for (int d = 0; d < D; d++)
   c_new[d] = cvValues[cvIdxList[d]];
 
- // weight = exp(V/kT)
- double lw_raw = biasEnergies[biasEnergyIdx] * invKT;
- double h_raw  = exp(lw_raw);
+ // Variant-dependent kernel height.
+ //   variant=0 (METAD):   h_raw = exp(V/kT)  — reweighted KDE of P(s).
+ //   variant=1 (uniform): h_raw = exp(V/kT)  — same as METAD.
+ //   variant=2 (EXPLORE): h_raw = 1.0       — plain unweighted KDE on biased samples.
+ double V_kT = biasEnergies[biasEnergyIdx] * invKT;
+ double lw_raw, h_raw;
+ if (variant == 2) {
+  lw_raw = 0.0;
+  h_raw  = 1.0;
+ } else {
+  lw_raw = V_kT;
+  h_raw  = exp(V_kT);
+ }
 
  // Linear weight accumulators {sum_w, sum_w2}.
  // Initialized with sentinel {exp(-gamma), exp(-2*gamma)} before any deposits.
@@ -2688,6 +2698,9 @@ KERNEL void opesGatherDeposit(
  double sw2 = sumWArr[1];
  double neff_deposit = (1.0 + sw) * (1.0 + sw) / (1.0 + sw2);
 
+ // Size for Silverman rescaling: neff for METAD/uniform, counter for EXPLORE.
+ double size_for_silv = (variant == 2) ? (double) stepCountArr[0] : neff_deposit;
+
  // Compute new kernel sigma.
  double sig_new[MAX_OPES_CVS];
  for (int d = 0; d < D; d++) {
@@ -2696,25 +2709,27 @@ KERNEL void opesGatherDeposit(
    // FIXED_SIGMA: no Silverman adaptation.
    sig = sigma0[d];
   } else if (adaptiveSigmaStride > 0) {
-   double var = (n > 1) ? runningM2[d] / (n - 1) : 0.0;
+   // PLUMED divides M2 by γ for METAD (M2 came from unbiased sampling),
+   // by 1 for EXPLORE. variant=1 (fixed-σ) doesn't reach this branch.
+   double factor = (variant == 2) ? 1.0 : gammaArg;
+   double var = (n > 1) ? runningM2[d] / ((double)(n - 1) * factor) : 0.0;
    sig = (var > 0.0) ? sqrt(var) : 1.0;
    if (sig < sigmaMin) sig = sigmaMin;
   } else {
    // Default well-tempered: apply Silverman's rule (Scott 1992) — applied
    // even when sigma0 is provided, unless FIXED_SIGMA or adaptive stride is set.
-   double s_rescaling = pow(neff_deposit * (D + 2) / 4.0, -1.0 / (D + 4.0));
+   double s_rescaling = pow(size_for_silv * (D + 2) / 4.0, -1.0 / (D + 4.0));
    sig = sigma0[d] * s_rescaling;
    if (sig < sigmaMin) sig = sigmaMin;
   }
   sig_new[d] = sig;
  }
 
- // Height correction: stored_height = exp(V/kT) * Π(sigma0/sigma_dep).
- // Only applied for Silverman path (variant=0, no adaptive stride) where sigma0>0.
- // For adaptive sigma (sigma0=0 sentinel), skip to avoid log(0)=-inf.
- // For variant=1 (EXPLORE), sigma0/sig_new=1 so log=0 — correction is harmless but skip for clarity.
+ // Height correction: stored_height = exp(V/kT) · Π(sigma0/sigma_dep).
+ // Applies for Silverman path in variant 0 (METAD) and 2 (EXPLORE) when sigma0>0.
+ // Skipped for adaptive (sigma0=0 sentinel) and for variant=1 (fixed-σ; no rescaling).
  double lw_new = lw_raw;
- if (variant == 0 && adaptiveSigmaStride == 0) {
+ if (variant != 1 && adaptiveSigmaStride == 0) {
   for (int d = 0; d < D; d++)
    lw_new += log(sigma0[d] / sig_new[d]);
  }
@@ -2802,6 +2817,9 @@ KERNEL void opesGatherDeposit(
  // which affects all cross-pairs involving that index.  Merges are rare
  // (occur only when a new deposit lands inside an existing kernel), so full
  // recomputation is acceptable.
+ // eps_dep is the deposit-side cutoff floor; it equals exp(-cutoff2/2) for all
+ // variants. (The eval-side ε passed to opesEvalBias is in general different —
+ // 0 for variant=1, exp(-γ/(γ-1)) for variant=2 — so we keep this inline.)
  double eps_dep = exp(-0.5 * cutoff2);
  if (merge_k < 0 && nAfter > nBefore) {
   // Append: O(N) incremental update.
@@ -4741,28 +4759,51 @@ void CommonCalcGluedForceKernel::getCurrentCVs(ContextImpl& context,
 }
 
 vector<double> CommonCalcGluedForceKernel::getOPESMetrics(int biasIndex) {
- if (biasIndex < 0 || biasIndex >= (int)opesBiases_.size())
- throw OpenMM::OpenMMException("getOPESMetrics: biasIndex out of range");
- ContextSelector selector(cc_);
- OpesBias& o = opesBiases_[biasIndex];
- vector<double> logZVec(1, 0.0);
- if (o.numKernels > 0)
- o.logZGPU.download(logZVec);
- double logZ = logZVec[0];
- double zed = std::exp(logZ);
- double rct = o.kT * logZ;
- // Download the GPU-resident committed kernel count so that multiwalker B2
- // shared deposits from other walkers are reflected in the returned value.
- // (o.numKernels is only the CPU mirror for this walker's own deposits.)
- vector<int> nkVec(1, 0);
- o.numKernelsGPU.download(nkVec);
- double nker = (double)nkVec[0];
- // neff = (1+sum_w)^2/(1+sum_w2) — 1+ terms give neff≈1 for a single early sample.
- vector<double> swVec(2, 0.0);
- o.logSumWGPU.download(swVec);
- double sw = swVec[0], sw2 = swVec[1];
- double neff = (1.0 + sw) * (1.0 + sw) / (1.0 + sw2);
- return {zed, rct, nker, neff};
+    if (biasIndex < 0 || biasIndex >= (int)opesBiases_.size())
+        throw OpenMM::OpenMMException("getOPESMetrics: biasIndex out of range");
+    ContextSelector selector(cc_);
+    OpesBias& o = opesBiases_[biasIndex];
+
+    // Download all needed buffers.
+    vector<double> sumUprobVec(1, 0.0);
+    vector<double> sumWVec(1, 0.0);
+    vector<double> swArr(2, 0.0);
+    vector<int>    nkVec(1, 0);
+    vector<int>    stepVec(1, 0);
+    if (o.numKernels > 0)
+        o.logZGPU.download(sumUprobVec);   // misnamed: actually sum_uprob (linear)
+    o.sumWeightsGPU.download(sumWVec);     // KDNorm = Σ exp(V/kT)
+    o.logSumWGPU.download(swArr);          // {sum_w, sum_w2} for neff
+    o.numKernelsGPU.download(nkVec);
+    o.stepCountGPU.download(stepVec);
+
+    int    nker    = nkVec[0];
+    double sum_up  = sumUprobVec[0];
+    double counter = (double)stepVec[0];
+
+    // Variant-dependent KDEnorm:
+    //   METAD/uniform: KDEnorm = sum_weights = Σ exp(V/kT)
+    //   EXPLORE:       KDEnorm = counter (plain unweighted)
+    double KDEnorm = (o.variant == 2) ? counter : sumWVec[0];
+
+    // PLUMED-style Zed: bounded normalization, ~order 1.
+    double zed = (nker > 0 && KDEnorm > 0.0)
+                 ? sum_up / (KDEnorm * (double)nker)
+                 : 1.0;
+
+    // PLUMED-style rct: kT · log(<w>) — same definition for all variants.
+    // For EXPLORE this is computed identically; PLUMED still tracks sum_weights
+    // as a diagnostic even though the bias formula uses counter.
+    double rct = (counter > 0.0 && sumWVec[0] > 0.0)
+                 ? o.kT * std::log(sumWVec[0] / counter)
+                 : 0.0;
+
+    // neff = (1+sum_w)^2/(1+sum_w2) — same definition in all variants.
+    double sw  = swArr[0];
+    double sw2 = swArr[1];
+    double neff = (1.0 + sw) * (1.0 + sw) / (1.0 + sw2);
+
+    return {zed, rct, (double)nker, neff};
 }
 
 void CommonCalcGluedForceKernel::redirectToPrimaryBias(
