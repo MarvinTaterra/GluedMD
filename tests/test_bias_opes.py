@@ -540,6 +540,85 @@ def test_opes_explore_python_mode(platform):
     print(f"  test_opes_explore_python_mode: OK  (nker={int(m[2])})")
 
 
+def test_opes_python_adaptive_sigma_wrapper(platform):
+    """Python add_opes(sigma=None) → fully-adaptive σ; respects custom stride."""
+    import openmm as mm_lib
+    import glued as g
+
+    system = mm_lib.System()
+    for _ in range(3):
+        system.addParticle(1.0)
+    f = g.Force(temperature=300.0)
+    cv = f.add_distance([0, 1])
+
+    # sigma=None ⇒ adaptive; sigma_min defaults to 1e-3 in CV units.
+    bias_idx = f.add_opes(cv, sigma=None, gamma=10.0, pace=2,
+                          adaptive_sigma_stride=4)
+    system.addForce(f)
+    integ = mm_lib.LangevinIntegrator(300.0, 1.0, 0.001)
+    ctx   = mm_lib.Context(system, integ, platform)
+    ctx.setPositions([mm_lib.Vec3(0,0,0), mm_lib.Vec3(1.0,0,0), mm_lib.Vec3(5,5,5)])
+
+    # First 4 steps populate the running variance — no deposition allowed.
+    integ.step(4)
+    m4 = f.getOPESMetrics(ctx, bias_idx)
+    assert m4[2] == 0, f"adaptive warm-up: expected nker=0 at step 4, got {m4[2]}"
+
+    # After warm-up, deposition becomes allowed and σ is set from running M2.
+    integ.step(10)
+    m14 = f.getOPESMetrics(ctx, bias_idx)
+    assert m14[2] >= 1, f"after warm-up expected ≥1 deposit, got nker={m14[2]}"
+    print(f"  test_opes_python_adaptive_sigma_wrapper: OK  (nker={int(m14[2])})")
+
+
+def test_opes_python_adaptive_sigma_string_sentinel(platform):
+    """sigma='adaptive' (case-insensitive) is also accepted."""
+    import openmm as mm_lib
+    import glued as g
+
+    system = mm_lib.System()
+    for _ in range(3):
+        system.addParticle(1.0)
+    f = g.Force(temperature=300.0)
+    cv = f.add_distance([0, 1])
+    bias_idx = f.add_opes(cv, sigma='ADAPTIVE', gamma=10.0, pace=1,
+                          adaptive_sigma_stride=2)
+    system.addForce(f)
+    integ = mm_lib.LangevinIntegrator(300.0, 1.0, 0.001)
+    ctx   = mm_lib.Context(system, integ, platform)
+    ctx.setPositions([mm_lib.Vec3(0,0,0), mm_lib.Vec3(1.0,0,0), mm_lib.Vec3(5,5,5)])
+    integ.step(5)
+    m = f.getOPESMetrics(ctx, bias_idx)
+    assert m[2] >= 1, f"sigma='ADAPTIVE' should accept and deposit, got {m[2]}"
+    print(f"  test_opes_python_adaptive_sigma_string_sentinel: OK  (nker={int(m[2])})")
+
+
+def test_opes_python_adaptive_rejects_fixed_uniform():
+    """mode='fixed_uniform' must reject adaptive σ — incompatible combo."""
+    import glued as g
+    f = g.Force(temperature=300.0)
+    f.add_distance([0, 1])
+    try:
+        f.add_opes(0, sigma=None, mode='fixed_uniform')
+        assert False, "Should have raised for sigma=None + mode='fixed_uniform'"
+    except ValueError as e:
+        assert "fixed_uniform" in str(e) or "incompatible" in str(e).lower(), e
+    print("  test_opes_python_adaptive_rejects_fixed_uniform: OK")
+
+
+def test_opes_python_adaptive_rejects_stride_with_explicit_sigma():
+    """adaptive_sigma_stride is only meaningful when sigma is adaptive."""
+    import glued as g
+    f = g.Force(temperature=300.0)
+    f.add_distance([0, 1])
+    try:
+        f.add_opes(0, sigma=0.05, adaptive_sigma_stride=100)
+        assert False, "Should have raised for explicit sigma + stride"
+    except ValueError as e:
+        assert "adaptive_sigma_stride" in str(e), e
+    print("  test_opes_python_adaptive_rejects_stride_with_explicit_sigma: OK")
+
+
 def test_opes_adaptive_blocks_early_deposition(platform):
     """sigma0=0.0 (adaptive mode) with adaptiveSigmaStride=5 via bIntParams[3].
 

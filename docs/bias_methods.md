@@ -143,7 +143,21 @@ force.add_opes([phi, psi], sigma=0.05, gamma=10.0, pace=500, mode='metad')
 
 # OPES_METAD_EXPLORE — same call, different mode
 force.add_opes([phi, psi], sigma=0.05, gamma=10.0, pace=500, mode='explore')
+
+# Fully-adaptive σ (PLUMED's SIGMA=ADAPTIVE) — Welford running variance
+# updated every step; deposition is gated until adaptive_sigma_stride
+# steps have elapsed. Defaults to 10×pace if omitted.
+force.add_opes([phi, psi], sigma=None, gamma=10.0, pace=500,
+               adaptive_sigma_stride=5000)   # 'adaptive' is also accepted
 ```
+
+### When to use which σ mode
+
+| σ flavor | When | API |
+|---|---|---|
+| **Explicit fixed** | You know a sensible σ from prior pilots — e.g. σ ≈ 5 % of the CV range | `sigma=0.5` |
+| **Mixed-adaptive** *(default)* | Explicit σ rescaled per deposit by Silverman's rule. Robust default | `sigma=0.5` (any positive value) |
+| **Fully adaptive** | First exploration of a new CV; CV scale is unknown; want PLUMED-like ADAPTIVE behaviour | `sigma=None` or `sigma='adaptive'` |
 
 **Convergence diagnostics** (query at runtime):
 

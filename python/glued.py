@@ -438,22 +438,39 @@ class Force(_gp.GluedForce):
             params.extend([k, t])
         return self.addBias(_gp.GluedForce.BIAS_ABMD, cvs, params)
 
-    def add_opes(self, cvs, sigma, *, gamma=10.0, pace=500, temperature=None,
-                 sigma_min=None, max_kernels=100000, mode='metad'):
+    def add_opes(self, cvs, sigma=None, *, gamma=10.0, pace=500,
+                 temperature=None, sigma_min=None, max_kernels=100000,
+                 mode='metad', adaptive_sigma_stride=None):
         """OPES bias.
 
         Parameters
         ----------
-        cvs : int or list[int]  CV index/indices.
-        sigma : float or list  Initial kernel bandwidth per CV (same units as CV).
-        gamma : float  Biasfactor γ > 1 (default 10).
-        pace : int  Deposition stride in steps (default 500).
-        temperature : float or None  Override Force-level temperature (K).
-        sigma_min : float or None  Minimum sigma (default 5 % of sigma).
-        max_kernels : int  Kernel table capacity (default 100 000).
+        cvs : int or list[int]
+            CV index/indices.
+        sigma : float, list, ``None``, or ``'adaptive'``
+            Initial kernel bandwidth per CV (same units as the CV). Set to
+            ``None`` (default) or ``'adaptive'`` for **fully-adaptive σ**
+            — a per-step Welford running variance is used, so kernels are
+            broadened/narrowed automatically as the run explores new
+            regions (PLUMED's ``SIGMA=ADAPTIVE``). Passing an explicit
+            value gives the standard mixed-adaptive behaviour: σ is fixed
+            for the deposit centre but Silverman's rule still rescales it
+            on every deposit (PLUMED's default).
+        gamma : float
+            Biasfactor γ > 1 (default 10).
+        pace : int
+            Deposition stride in steps (default 500).
+        temperature : float or None
+            Override Force-level temperature (K).
+        sigma_min : float or None
+            Minimum sigma. With explicit ``sigma`` defaults to 5 % of σ;
+            with adaptive σ defaults to 1e-3 (CV units), which is the same
+            order PLUMED uses.
+        max_kernels : int
+            Kernel table capacity (default 100 000).
         mode : {'metad', 'explore', 'fixed_uniform'}, default 'metad'
             * ``'metad'`` — standard OPES_METAD: well-tempered target,
-              adaptive Silverman σ. Bias prefactor (γ−1)/γ.
+              Silverman σ-rescaling. Bias prefactor (γ−1)/γ.
               Reference: Invernizzi & Parrinello, JPCL 11:2731 (2020).
             * ``'explore'`` — OPES_METAD_EXPLORE: well-tempered sampled
               distribution, plain (unweighted) KDE on biased samples.
@@ -462,25 +479,54 @@ class Force(_gp.GluedForce):
               broadened by √γ; pass the same σ you would use with METAD.
               Reference: Invernizzi, Piaggi & Parrinello, JCTC 18:3988 (2022).
             * ``'fixed_uniform'`` — uniform target (γ→∞ equivalent) with
-              fixed σ. Specialized; rarely needed.
+              fixed σ. Specialized; rarely needed. Not compatible with
+              adaptive σ.
+        adaptive_sigma_stride : int or None
+            Only used in fully-adaptive mode. Number of MD steps before
+            kernel deposition is allowed (warm-up window over which the
+            running variance stabilises). Defaults to ``10 * pace`` —
+            matches PLUMED's behaviour.
         """
         variant_map = {'metad': 0, 'fixed_uniform': 1, 'explore': 2}
         if mode not in variant_map:
             raise ValueError(
                 f"mode must be one of {list(variant_map)}, got {mode!r}")
+        import math as _math
         if mode == 'explore':
-            import math as _math
             if not (gamma > 1.0 and _math.isfinite(gamma)):
                 raise ValueError(
                     "OPES EXPLORE requires finite gamma > 1 (no BIASFACTOR=inf)")
         variant = variant_map[mode]
 
-        cvs   = self._cv_list(cvs)
-        kT    = self._resolve_kT(temperature)
-        sigma = _scalar_or_list(sigma, len(cvs))
-        s_min = sigma_min if sigma_min is not None else min(sigma) * 0.05
-        params     = [kT, float(gamma)] + sigma + [float(s_min)]
+        # Detect fully-adaptive σ.  Sentinel passed to the kernel is sigma=0.0.
+        adaptive = (sigma is None
+                    or (isinstance(sigma, str) and sigma.lower() == 'adaptive'))
+        if adaptive and mode == 'fixed_uniform':
+            raise ValueError(
+                "mode='fixed_uniform' is incompatible with adaptive σ; "
+                "pass an explicit sigma value.")
+
+        cvs = self._cv_list(cvs)
+        kT  = self._resolve_kT(temperature)
+
+        if adaptive:
+            sigma_list = [0.0] * len(cvs)            # sentinel
+            s_min      = (sigma_min if sigma_min is not None else 1e-3)
+        else:
+            sigma_list = _scalar_or_list(sigma, len(cvs))
+            s_min      = (sigma_min if sigma_min is not None
+                          else min(sigma_list) * 0.05)
+
+        params     = [kT, float(gamma)] + sigma_list + [float(s_min)]
         int_params = [variant, int(pace), int(max_kernels)]
+        if adaptive:
+            int_params.append(int(adaptive_sigma_stride
+                                  if adaptive_sigma_stride is not None
+                                  else 10 * pace))
+        elif adaptive_sigma_stride is not None:
+            raise ValueError(
+                "adaptive_sigma_stride is only used when sigma is None or "
+                "'adaptive'; remove it or set sigma=None.")
         return self.addBias(_gp.GluedForce.BIAS_OPES, cvs, params, int_params)
 
     def add_metad(self, cvs, sigma, height, pace, *, grid_min, grid_max,
