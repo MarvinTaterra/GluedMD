@@ -88,6 +88,13 @@ class OPESConvergenceReporter:
                  min_steps=0,
                  post_convergence_steps=50_000,
                  file=None, verbose=True):
+        # Initialize attributes that __del__ inspects BEFORE any code that
+        # can raise. Otherwise a constructor failure (e.g. invalid criterion)
+        # leaves the object partially-built and __del__ raises AttributeError,
+        # which Python ignores but prints to stderr.
+        self._out = None
+        self._file = None
+
         if criterion not in self._VALID_CRITERIA:
             raise ValueError(
                 f"criterion must be one of {self._VALID_CRITERIA}, got {criterion!r}")

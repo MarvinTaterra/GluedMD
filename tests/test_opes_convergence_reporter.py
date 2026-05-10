@@ -422,3 +422,25 @@ def test_reporter_getOPESMetrics_runs_on_reference(platform):
     # rct value must be finite
     assert reporter._prev_signal is not None
     assert math.isfinite(reporter._prev_signal)
+
+
+def test_invalid_criterion_no_del_traceback(capsys):
+    """Constructor failure must not leak `__del__` AttributeError on stderr."""
+    import gc
+
+    class _F:
+        def getTemperature(self): return 300.0
+
+    try:
+        OPESConvergenceReporter(_F(), criterion='garbage')
+    except ValueError:
+        pass
+
+    # Force GC so __del__ runs synchronously.
+    gc.collect()
+
+    captured = capsys.readouterr()
+    assert "Exception ignored" not in captured.err, (
+        f"__del__ raised on partially-constructed object:\n{captured.err}")
+    assert "AttributeError" not in captured.err, (
+        f"Unexpected AttributeError on stderr:\n{captured.err}")
