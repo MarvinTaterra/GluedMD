@@ -272,6 +272,32 @@ def test_reporter_force_converge():
     assert reporter.done
 
 
+def test_reporter_rct_relative_no_false_positive_on_saturation():
+    """rct_relative must NOT declare convergence when |rct|≫kT and
+    rct is still drifting by ~kT per check — the saturating signal
+    would give |Δsignal|=0 trivially, but |Δrct|/max(|rct|,kT) stays well
+    above tol=0.01 so the criterion correctly waits.
+    """
+    buf = io.StringIO()
+    # rct moving steadily by ~1.0 kJ/mol per check while |rct|>>kT (=2.479).
+    # Signal would saturate at -1 and look 'flat' under naive diff.
+    rct_trace = [-5.0, -6.0, -7.0, -8.0, -9.0, -10.0]
+    force = _MockForce([(1.0, r, 100, 50.0) for r in rct_trace])
+    sim = _MockSimulation()
+    reporter = OPESConvergenceReporter(
+        force, criterion='rct_relative', tol=0.01,
+        check_interval=1, min_consecutive_passes=2,
+        min_kernels=0, post_convergence_steps=0,
+        file=buf, verbose=False)
+    reporter._open()
+    for step, _ in enumerate(rct_trace):
+        sim.currentStep = step
+        reporter.report(sim, None)
+    assert not reporter.converged, (
+        "rct_relative incorrectly declared convergence on a steadily-drifting "
+        "rct trace (saturation false positive)")
+
+
 def test_reporter_warmup_blocks_convergence():
     """min_kernels gate must prevent convergence even if drift is below tol."""
     buf = io.StringIO()

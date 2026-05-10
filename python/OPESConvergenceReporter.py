@@ -120,6 +120,7 @@ class OPESConvergenceReporter:
             self._kT = _R_KJ * 300.0   # safe fallback
 
         self._prev_signal = None
+        self._prev_rct    = None     # tracked for rct_relative drift
         self._consecutive_passes = 0
         self._converged = False
         self._done = False
@@ -195,7 +196,8 @@ class OPESConvergenceReporter:
 
         drift = None
         if not warming_up and self._prev_signal is not None:
-            drift = abs(signal - self._prev_signal)
+            drift = self._compute_drift(signal, rct,
+                                        self._prev_signal, self._prev_rct)
             if drift < self._tol:
                 self._consecutive_passes += 1
                 if (not self._converged
@@ -222,13 +224,20 @@ class OPESConvergenceReporter:
                 f"{step - self._converged_at_step:,}.")
 
         self._prev_signal = signal
+        self._prev_rct    = rct
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
     def _compute_signal(self, step, rct, neff):
-        """Return the dimensionless quantity to monitor."""
+        """Return the dimensionless quantity to monitor (for display).
+
+        For 'rct_relative' the signal saturates at ±1 once |rct| > kT —
+        intuitive for humans reading the log but useless for diff-based
+        convergence (|Δsignal| → 0 trivially). The actual drift used for
+        the convergence check lives in `_compute_drift`.
+        """
         if self._criterion == 'rct_relative':
             denom = max(abs(rct), self._kT)
             return rct / denom              # bounded in [-1, 1] roughly
@@ -236,6 +245,25 @@ class OPESConvergenceReporter:
             return neff / max(step, 1)      # asymptotically constant at convergence
         else:                               # 'rct_absolute'
             return rct
+
+    def _compute_drift(self, signal, rct, prev_signal, prev_rct):
+        """Criterion-aware drift used to evaluate convergence.
+
+        For 'rct_relative' we cannot just diff the signal — once |rct|>kT
+        the signal saturates at ±1 and |Δsignal| becomes identically 0,
+        triggering false convergence even while rct is still drifting by
+        ~kT per check. Use the unsaturated form
+            |Δrct| / max(|rct|, |prev_rct|, kT)
+        which gives a meaningful relative-change in both regimes:
+            * |rct| < kT  ⇒ |Δrct|/kT (matches rct_absolute up to scale)
+            * |rct| > kT  ⇒ |Δrct|/|rct| (true fractional drift)
+
+        The other criteria don't saturate; signal-diff is fine.
+        """
+        if self._criterion == 'rct_relative':
+            denom = max(abs(rct), abs(prev_rct), self._kT)
+            return abs(rct - prev_rct) / denom
+        return abs(signal - prev_signal)
 
     def _log_check(self, step, rct, nker, neff, signal, drift, warming_up):
         if self._converged:
