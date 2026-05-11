@@ -30,6 +30,7 @@ public:
     void setBiasStateBytes(const std::vector<char>& bytes) override;
 
     std::vector<double> getOPESMetrics(int biasIndex) override;
+    std::vector<float>  getKernelSigmas(int biasIndex) override;
 
 private:
     int numParticles_ = 0;

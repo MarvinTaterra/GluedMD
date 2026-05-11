@@ -150,6 +150,14 @@ public:
      */
     std::vector<double> getOPESMetrics(OpenMM::Context& context, int biasIndex) const;
 
+    /**
+     * Get the deposited per-kernel σ values for an OPES bias. Returns a flat
+     * float vector of length numKernels * numCVsBias in row-major order
+     * (kernel index outer, CV index inner). Empty if no kernels have been
+     * deposited or if biasIndex does not refer to an OPES bias.
+     */
+    std::vector<float> getKernelSigmas(OpenMM::Context& context, int biasIndex) const;
+
     // --- Stage 2 test-only API ---
     void setTestForce(int mode, double scale);
     int getTestForceMode() const;

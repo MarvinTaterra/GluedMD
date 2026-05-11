@@ -8,6 +8,7 @@
 namespace std {
   %template(vectori) vector<int>;
   %template(vectord) vector<double>;
+  %template(vectorf) vector<float>;
   %template(vectorc) vector<char>;
   %template(vectorll) vector<long long>;
 }
@@ -150,6 +151,13 @@ public:
         // zed=exp(logZ), rct=kT*logZ (convergence indicator), nker=kernel count, neff=effective samples.
         std::vector<double> getOPESMetrics(OpenMM::Context& context, int biasIndex) const {
             return self->getOPESMetrics(context, biasIndex);
+        }
+
+        // Flat per-kernel σ buffer for the biasIndex-th OPES bias
+        // (length = numKernels * numCVsBias, row-major: kernel outer, CV inner).
+        // Empty if no kernels have been deposited yet.
+        std::vector<float> getKernelSigmas(OpenMM::Context& context, int biasIndex) const {
+            return self->getKernelSigmas(context, biasIndex);
         }
     }
 

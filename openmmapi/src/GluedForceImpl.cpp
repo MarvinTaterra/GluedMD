@@ -75,6 +75,10 @@ vector<double> GluedForceImpl::getOPESMetrics(int biasIndex) {
     return kernel_.getAs<CalcGluedForceKernel>().getOPESMetrics(biasIndex);
 }
 
+vector<float> GluedForceImpl::getKernelSigmas(int biasIndex) {
+    return kernel_.getAs<CalcGluedForceKernel>().getKernelSigmas(biasIndex);
+}
+
 vector<long long> GluedForceImpl::getMultiWalkerPtrs(int biasType, int localIdx) {
     return kernel_.getAs<CalcGluedForceKernel>().getMultiWalkerPtrs(biasType, localIdx);
 }

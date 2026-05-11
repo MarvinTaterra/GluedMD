@@ -61,6 +61,15 @@ public:
     virtual std::vector<double> getOPESMetrics(int biasIndex) = 0;
 
     /**
+     * Download the per-CV σ values of all deposited OPES kernels for a bias.
+     * Returns a flat float vector of length numKernels * numCVsBias in row-
+     * major order (kernel index outer, CV index inner). Returns an empty
+     * vector if biasIndex is invalid, the bias is not OPES, or no kernels
+     * have been deposited yet.
+     */
+    virtual std::vector<float> getKernelSigmas(int biasIndex) = 0;
+
+    /**
      * Multiwalker B2: get raw device pointers for the specified bias's shared arrays.
      * biasType=BIAS_METAD: returns [grid_ptr]
      * biasType=BIAS_OPES:  returns [centers, sigmas, logweights, numKernels, numAllocated]

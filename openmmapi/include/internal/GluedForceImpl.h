@@ -56,6 +56,10 @@ public:
     // Returns [zed, rct, nker, neff] for the biasIndex-th OPES bias.
     std::vector<double> getOPESMetrics(int biasIndex);
 
+    // Per-kernel σ for the biasIndex-th OPES bias (flat float vector
+    // of length numKernels * numCVsBias, row-major: kernel index outer).
+    std::vector<float> getKernelSigmas(int biasIndex);
+
     // Multiwalker B2: get shared GPU array pointers from primary, or redirect to primary's arrays.
     std::vector<long long> getMultiWalkerPtrs(int biasType, int localIdx);
     void redirectToPrimaryBias(int biasType, int localIdx, const std::vector<long long>& ptrs);

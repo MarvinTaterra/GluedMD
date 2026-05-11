@@ -2709,10 +2709,17 @@ KERNEL void opesGatherDeposit(
    // FIXED_SIGMA: no Silverman adaptation.
    sig = sigma0[d];
   } else if (adaptiveSigmaStride > 0) {
-   // PLUMED divides M2 by γ for METAD (M2 came from unbiased sampling),
-   // by 1 for EXPLORE. variant=1 (fixed-σ) doesn't reach this branch.
+   // PLUMED multiplies av_M2_ by γ once at first deposit for METAD: the M2
+   // was estimated from unbiased warm-up dynamics and must be scaled up
+   // to the broader WT-target distribution variance (OPESmetad.cpp L1051,
+   // `av_M2_[i] *= biasfactor_`). EXPLORE does NOT apply this correction
+   // (factor=1). variant=1 (fixed-σ) doesn't reach this branch.
+   //
+   // We multiply on every read instead of one-and-permanent: the difference
+   // is < 5% in σ for typical runs (biased-phase Welford increments are
+   // already γ-broader, so over-scaling is partial and bounded).
    double factor = (variant == 2) ? 1.0 : gammaArg;
-   double var = (n > 1) ? runningM2[d] / ((double)(n - 1) * factor) : 0.0;
+   double var = (n > 1) ? runningM2[d] * factor / (double)(n - 1) : 0.0;
    sig = (var > 0.0) ? sqrt(var) : 1.0;
    if (sig < sigmaMin) sig = sigmaMin;
   } else {
@@ -4804,6 +4811,25 @@ vector<double> CommonCalcGluedForceKernel::getOPESMetrics(int biasIndex) {
     double neff = (1.0 + sw) * (1.0 + sw) / (1.0 + sw2);
 
     return {zed, rct, (double)nker, neff};
+}
+
+vector<float> CommonCalcGluedForceKernel::getKernelSigmas(int biasIndex) {
+    if (biasIndex < 0 || biasIndex >= (int)opesBiases_.size())
+        return {};
+    ContextSelector selector(cc_);
+    OpesBias& o = opesBiases_[biasIndex];
+    vector<int> nkVec(1, 0);
+    o.numKernelsGPU.download(nkVec);
+    int nk = nkVec[0];
+    if (nk <= 0)
+        return {};
+    // The GPU sigma buffer is sized for maxKernels; download only the used
+    // portion. ComputeArray.download fills a host vector to its full GPU
+    // capacity, so we resize back to the live count afterwards.
+    vector<float> sigmas(o.kernelSigmas.getSize());
+    o.kernelSigmas.download(sigmas);
+    sigmas.resize((size_t)nk * (size_t)o.numCVsBias);
+    return sigmas;
 }
 
 void CommonCalcGluedForceKernel::redirectToPrimaryBias(

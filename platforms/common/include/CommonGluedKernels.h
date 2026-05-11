@@ -38,6 +38,9 @@ public:
     // Returns [zed, rct, nker, neff] for the biasIndex-th OPES bias.
     std::vector<double> getOPESMetrics(int biasIndex) override;
 
+    // Flat per-kernel σ buffer (numKernels * numCVsBias floats).
+    std::vector<float> getKernelSigmas(int biasIndex) override;
+
     // Multiwalker B2: redirect this walker's bias kernels to use primary's shared GPU arrays.
     // ptrs are raw device pointers cast to long long, bias-type-specific.
     void redirectToPrimaryBias(int biasType, int localIdx, const std::vector<long long>& ptrs) override;

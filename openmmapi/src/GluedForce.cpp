@@ -170,6 +170,11 @@ vector<double> GluedForce::getOPESMetrics(OpenMM::Context& context, int biasInde
         getImplInContext(context)).getOPESMetrics(biasIndex);
 }
 
+vector<float> GluedForce::getKernelSigmas(OpenMM::Context& context, int biasIndex) const {
+    return dynamic_cast<GluedForceImpl&>(
+        getImplInContext(context)).getKernelSigmas(biasIndex);
+}
+
 ForceImpl* GluedForce::createImpl() const {
     return new GluedForceImpl(*this);
 }

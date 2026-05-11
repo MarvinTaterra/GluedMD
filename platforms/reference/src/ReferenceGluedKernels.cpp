@@ -46,3 +46,7 @@ void ReferenceCalcGluedForceKernel::setBiasStateBytes(
 vector<double> ReferenceCalcGluedForceKernel::getOPESMetrics(int biasIndex) {
     return {1.0, 0.0, 0.0, 1.0}; // zed=1, rct=0, nker=0, neff=1 (no OPES on Reference)
 }
+
+vector<float> ReferenceCalcGluedForceKernel::getKernelSigmas(int biasIndex) {
+    return {};   // Reference doesn't implement OPES — no kernels to report.
+}
