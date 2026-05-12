@@ -1,0 +1,46 @@
+{
+  "timestamp": "2026-05-07T09:43:49.712267+00:00",
+  "system": "solvated_adp_2250atoms",
+  "gpu": [
+    {
+      "name": "NVIDIA GeForce RTX 2070 SUPER",
+      "memory_mb": 8192
+    }
+  ],
+  "platform": "CUDA",
+  "warmup_steps": 1000,
+  "timed_steps": 10000,
+  "dt_fs": 2.0,
+  "variants": {
+    "pure_openmm": {
+      "steps_per_second": 4384.641963876268,
+      "ns_per_day": 757.666131357819,
+      "status": "ok"
+    },
+    "gsp_harmonic": {
+      "steps_per_second": 4168.174724441023,
+      "ns_per_day": 720.2605923834086,
+      "status": "ok"
+    },
+    "gsp_metad_2d": {
+      "steps_per_second": 3836.9957975584316,
+      "ns_per_day": 663.032873818097,
+      "status": "ok"
+    },
+    "plumed_metad_2d": {
+      "steps_per_second": 691.7058340120811,
+      "ns_per_day": 119.52676811728762,
+      "status": "ok"
+    },
+    "gsp_opes_1d": {
+      "steps_per_second": 4017.5472143779125,
+      "ns_per_day": 694.2321586445032,
+      "status": "ok"
+    },
+    "plumed_opes_1d": {
+      "steps_per_second": 701.4468684090315,
+      "ns_per_day": 121.21001886108063,
+      "status": "ok"
+    }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "warmup_steps": 2000,
+  "timed_steps": 20000,
+  "elapsed_s": 3.8030879180005286,
+  "steps_per_sec": 5258.884472624811,
+  "ns_per_day": 908.7352368695673,
+  "dt_ps": 0.002,
+  "n_atoms": 722,
+  "cv_kind": "CV_DIHEDRAL",
+  "bias_kind": "OPES_METAD",
+  "benchmark": "ad_water",
+  "gpu": {
+    "name": "NVIDIA GeForce RTX 2070 SUPER",
+    "memory_mb": 8192
+  }
+}

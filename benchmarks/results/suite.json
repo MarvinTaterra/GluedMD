@@ -1,0 +1,37 @@
+{
+  "timestamp": "2026-05-12T11:14:40.248828",
+  "records": [
+    {
+      "warmup_steps": 2000,
+      "timed_steps": 50000,
+      "elapsed_s": 3.951201707001019,
+      "steps_per_sec": 12654.378011481029,
+      "ns_per_day": 2186.676520383922,
+      "dt_ps": 0.002,
+      "n_atoms": 23,
+      "cv_kind": "CV_DIHEDRAL",
+      "bias_kind": "OPES_METAD",
+      "benchmark": "ad_vacuum",
+      "gpu": {
+        "name": "NVIDIA GeForce RTX 2070 SUPER",
+        "memory_mb": 8192
+      }
+    },
+    {
+      "warmup_steps": 2000,
+      "timed_steps": 20000,
+      "elapsed_s": 3.8030879180005286,
+      "steps_per_sec": 5258.884472624811,
+      "ns_per_day": 908.7352368695673,
+      "dt_ps": 0.002,
+      "n_atoms": 722,
+      "cv_kind": "CV_DIHEDRAL",
+      "bias_kind": "OPES_METAD",
+      "benchmark": "ad_water",
+      "gpu": {
+        "name": "NVIDIA GeForce RTX 2070 SUPER",
+        "memory_mb": 8192
+      }
+    }
+  ]
+}

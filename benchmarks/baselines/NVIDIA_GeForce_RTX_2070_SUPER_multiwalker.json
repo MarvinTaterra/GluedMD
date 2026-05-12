@@ -1,0 +1,323 @@
+{
+  "timestamp": "2026-05-07T10:20:03.282478+00:00",
+  "gpu": [
+    {
+      "name": "NVIDIA GeForce RTX 2070 SUPER",
+      "memory_mb": 8192
+    }
+  ],
+  "platform": "CUDA",
+  "warmup_steps": 1000,
+  "timed_steps": 5000,
+  "n_walkers": [
+    1,
+    2,
+    4,
+    6,
+    8
+  ],
+  "plumed_available": true,
+  "plumed_opes_available": true,
+  "results": {
+    "vacuum": {
+      "gsp_metad_2d": [
+        {
+          "n": 1,
+          "per_walker_sps": 9683.566382796114,
+          "aggregate_sps": 9683.566382796114,
+          "efficiency_pct": 100.0,
+          "ns_per_day_per_walker": 1673.3202709471684
+        },
+        {
+          "n": 2,
+          "per_walker_sps": 10599.209509890885,
+          "aggregate_sps": 21198.41901978177,
+          "efficiency_pct": 109.45563949168053,
+          "ns_per_day_per_walker": 1831.5434033091449
+        },
+        {
+          "n": 4,
+          "per_walker_sps": 11843.34318704636,
+          "aggregate_sps": 47373.37274818544,
+          "efficiency_pct": 122.30352660242323,
+          "ns_per_day_per_walker": 2046.5297027216106
+        },
+        {
+          "n": 6,
+          "per_walker_sps": 11894.049123508054,
+          "aggregate_sps": 71364.29474104832,
+          "efficiency_pct": 122.82715534060982,
+          "ns_per_day_per_walker": 2055.2916885421914
+        },
+        {
+          "n": 8,
+          "per_walker_sps": 11245.824318949864,
+          "aggregate_sps": 89966.59455159892,
+          "efficiency_pct": 116.13308438644327,
+          "ns_per_day_per_walker": 1943.2784423145365
+        }
+      ],
+      "gsp_opes_1d": [
+        {
+          "n": 1,
+          "per_walker_sps": 13397.826217160728,
+          "aggregate_sps": 13397.826217160728,
+          "efficiency_pct": 100.0,
+          "ns_per_day_per_walker": 2315.1443703253735
+        },
+        {
+          "n": 2,
+          "per_walker_sps": 12796.34195784421,
+          "aggregate_sps": 25592.68391568842,
+          "efficiency_pct": 95.51058321277446,
+          "ns_per_day_per_walker": 2211.2078903154793
+        },
+        {
+          "n": 4,
+          "per_walker_sps": 12804.78685137867,
+          "aggregate_sps": 51219.14740551468,
+          "efficiency_pct": 95.57361503150072,
+          "ns_per_day_per_walker": 2212.667167918234
+        },
+        {
+          "n": 6,
+          "per_walker_sps": 12095.324407974302,
+          "aggregate_sps": 72571.94644784581,
+          "efficiency_pct": 90.2782601589644,
+          "ns_per_day_per_walker": 2090.0720576979593
+        },
+        {
+          "n": 8,
+          "per_walker_sps": 12199.737082006744,
+          "aggregate_sps": 97597.89665605396,
+          "efficiency_pct": 91.05758564311427,
+          "ns_per_day_per_walker": 2108.1145677707655
+        }
+      ],
+      "plumed_metad_2d": [
+        {
+          "n": 1,
+          "per_walker_sps": 904.9937049278517,
+          "aggregate_sps": 904.9937049278517,
+          "efficiency_pct": 100.0,
+          "ns_per_day_per_walker": 156.38291221153276
+        },
+        {
+          "n": 2,
+          "per_walker_sps": 914.3896199626132,
+          "aggregate_sps": 1828.7792399252264,
+          "efficiency_pct": 101.03822987757805,
+          "ns_per_day_per_walker": 158.00652632953955
+        },
+        {
+          "n": 4,
+          "per_walker_sps": 856.1189376459182,
+          "aggregate_sps": 3424.475750583673,
+          "efficiency_pct": 94.59943566283371,
+          "ns_per_day_per_walker": 147.93735242521467
+        },
+        {
+          "n": 6,
+          "per_walker_sps": 781.6460726242382,
+          "aggregate_sps": 4689.876435745429,
+          "efficiency_pct": 86.37033256342407,
+          "ns_per_day_per_walker": 135.06844134946834
+        },
+        {
+          "n": 8,
+          "per_walker_sps": 747.2811671816604,
+          "aggregate_sps": 5978.249337453283,
+          "efficiency_pct": 82.57307902945419,
+          "ns_per_day_per_walker": 129.1301856889909
+        }
+      ],
+      "plumed_opes_1d": [
+        {
+          "n": 1,
+          "per_walker_sps": 870.2235021213056,
+          "aggregate_sps": 870.2235021213056,
+          "efficiency_pct": 100.0,
+          "ns_per_day_per_walker": 150.3746211665616
+        },
+        {
+          "n": 2,
+          "per_walker_sps": 797.7416706157777,
+          "aggregate_sps": 1595.4833412315554,
+          "efficiency_pct": 91.67089473809405,
+          "ns_per_day_per_walker": 137.84976068240638
+        },
+        {
+          "n": 4,
+          "per_walker_sps": 754.2323960960557,
+          "aggregate_sps": 3016.929584384223,
+          "efficiency_pct": 86.67111314018715,
+          "ns_per_day_per_walker": 130.33135804539842
+        },
+        {
+          "n": 6,
+          "per_walker_sps": 665.2680076804023,
+          "aggregate_sps": 3991.608046082414,
+          "efficiency_pct": 76.447947689152,
+          "ns_per_day_per_walker": 114.95831172717352
+        },
+        {
+          "n": 8,
+          "per_walker_sps": 720.0117816694213,
+          "aggregate_sps": 5760.094253355371,
+          "efficiency_pct": 82.73871941108006,
+          "ns_per_day_per_walker": 124.41803587247601
+        }
+      ]
+    },
+    "solvated": {
+      "gsp_metad_2d": [
+        {
+          "n": 1,
+          "per_walker_sps": 3551.7826291531287,
+          "aggregate_sps": 3551.7826291531287,
+          "efficiency_pct": 100.0,
+          "ns_per_day_per_walker": 613.7480383176606
+        },
+        {
+          "n": 2,
+          "per_walker_sps": 3571.474144714012,
+          "aggregate_sps": 7142.948289428024,
+          "efficiency_pct": 100.55441218162548,
+          "ns_per_day_per_walker": 617.1507322065812
+        },
+        {
+          "n": 4,
+          "per_walker_sps": 3980.9570568872928,
+          "aggregate_sps": 15923.828227549171,
+          "efficiency_pct": 112.08335285530957,
+          "ns_per_day_per_walker": 687.9093794301242
+        },
+        {
+          "n": 6,
+          "per_walker_sps": 3854.1175712445656,
+          "aggregate_sps": 23124.705427467394,
+          "efficiency_pct": 108.51220284737764,
+          "ns_per_day_per_walker": 665.9915163110609
+        },
+        {
+          "n": 8,
+          "per_walker_sps": 3597.71738758505,
+          "aggregate_sps": 28781.7391006804,
+          "efficiency_pct": 101.29328743417143,
+          "ns_per_day_per_walker": 621.6855645746966
+        }
+      ],
+      "gsp_opes_1d": [
+        {
+          "n": 1,
+          "per_walker_sps": 3866.5443862243437,
+          "aggregate_sps": 3866.5443862243437,
+          "efficiency_pct": 100.0,
+          "ns_per_day_per_walker": 668.1388699395666
+        },
+        {
+          "n": 2,
+          "per_walker_sps": 3887.262660977796,
+          "aggregate_sps": 7774.525321955592,
+          "efficiency_pct": 100.53583439588245,
+          "ns_per_day_per_walker": 671.7189878169631
+        },
+        {
+          "n": 4,
+          "per_walker_sps": 3876.3597450852135,
+          "aggregate_sps": 15505.438980340854,
+          "efficiency_pct": 100.25385351570874,
+          "ns_per_day_per_walker": 669.8349639507248
+        },
+        {
+          "n": 6,
+          "per_walker_sps": 3733.9405062457054,
+          "aggregate_sps": 22403.643037474234,
+          "efficiency_pct": 96.57048085491849,
+          "ns_per_day_per_walker": 645.2249194792579
+        },
+        {
+          "n": 8,
+          "per_walker_sps": 3822.286538945888,
+          "aggregate_sps": 30578.292311567104,
+          "efficiency_pct": 98.85536430317116,
+          "ns_per_day_per_walker": 660.4911139298493
+        }
+      ],
+      "plumed_metad_2d": [
+        {
+          "n": 1,
+          "per_walker_sps": 718.5034626373301,
+          "aggregate_sps": 718.5034626373301,
+          "efficiency_pct": 100.0,
+          "ns_per_day_per_walker": 124.15739834373065
+        },
+        {
+          "n": 2,
+          "per_walker_sps": 536.8521125527244,
+          "aggregate_sps": 1073.7042251054488,
+          "efficiency_pct": 74.71809677606306,
+          "ns_per_day_per_walker": 92.76804504911078
+        },
+        {
+          "n": 4,
+          "per_walker_sps": 546.355426805244,
+          "aggregate_sps": 2185.421707220976,
+          "efficiency_pct": 76.04075070143689,
+          "ns_per_day_per_walker": 94.41021775194615
+        },
+        {
+          "n": 6,
+          "per_walker_sps": 520.1710927324608,
+          "aggregate_sps": 3121.026556394765,
+          "efficiency_pct": 72.39646289568698,
+          "ns_per_day_per_walker": 89.88556482416922
+        },
+        {
+          "n": 8,
+          "per_walker_sps": 584.2558968742758,
+          "aggregate_sps": 4674.047174994206,
+          "efficiency_pct": 81.31566892241732,
+          "ns_per_day_per_walker": 100.95941897987485
+        }
+      ],
+      "plumed_opes_1d": [
+        {
+          "n": 1,
+          "per_walker_sps": 724.6833493388316,
+          "aggregate_sps": 724.6833493388316,
+          "efficiency_pct": 100.0,
+          "ns_per_day_per_walker": 125.2252827657501
+        },
+        {
+          "n": 2,
+          "per_walker_sps": 632.4259926470334,
+          "aggregate_sps": 1264.8519852940667,
+          "efficiency_pct": 87.26928709263574,
+          "ns_per_day_per_walker": 109.28321152940735
+        },
+        {
+          "n": 4,
+          "per_walker_sps": 593.5839778567256,
+          "aggregate_sps": 2374.3359114269024,
+          "efficiency_pct": 81.9094268411555,
+          "ns_per_day_per_walker": 102.57131137364217
+        },
+        {
+          "n": 6,
+          "per_walker_sps": 581.9381965872858,
+          "aggregate_sps": 3491.629179523715,
+          "efficiency_pct": 80.3024103035098,
+          "ns_per_day_per_walker": 100.55892037028298
+        },
+        {
+          "n": 8,
+          "per_walker_sps": 579.8988477020844,
+          "aggregate_sps": 4639.190781616675,
+          "efficiency_pct": 80.02099789254962,
+          "ns_per_day_per_walker": 100.20652088292017
+        }
+      ]
+    }
+  }
+}
