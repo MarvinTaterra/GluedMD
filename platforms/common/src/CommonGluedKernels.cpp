@@ -25,10 +25,52 @@ using namespace OpenMM;
 using namespace std;
 
 // ---------------------------------------------------------------------------
+// atomicAdd portability shim
+//
+// CUDA exposes atomicAdd() as a built-in for int / long long / float and (on
+// sm_60+) double. OpenCL doesn't expose any function called atomicAdd. The
+// kernel source below uses the CUDA spelling everywhere; this shim makes the
+// same source compile under OpenCL by mapping atomicAdd onto atom_add (for
+// int / unsigned long) and a CAS loop on the bit pattern (for double).
+//
+// Prepended to every kernel that performs atomic accumulation:
+//   - kGeometryFunctions (covers test/distance/angle/dihedral/COM/Rg/path/RMSD/...
+//     coordination/DRMSD/contact map/plane/projection — all geometry-CV kernels)
+//   - kScatterKernelSrc  (chain-rule force scatter)
+//   - kOPESKernelSrc     (OPES kernel-table slot counters)
+//   - kMetaDKernelSrc    (well-tempered METAD grid deposition — uses double)
+//
+// Requires cl_khr_int64_extended_atomics for the double overload's
+// atom_cmpxchg on unsigned long. Supported by NVIDIA OpenCL on every sm_50+
+// GPU; check device capabilities if porting to a non-NVIDIA OpenCL runtime.
+// ---------------------------------------------------------------------------
+extern const string kAtomicAddShim = R"(
+#ifdef __OPENCL_VERSION__
+inline int __attribute__((overloadable))
+atomicAdd(volatile __global int* p, int val) {
+    return atomic_add(p, val);
+}
+inline unsigned long __attribute__((overloadable))
+atomicAdd(volatile __global unsigned long* p, unsigned long val) {
+    return atom_add(p, val);
+}
+inline void __attribute__((overloadable))
+atomicAdd(volatile __global double* p, double val) {
+    volatile __global unsigned long* pi = (volatile __global unsigned long*)p;
+    union { double f; unsigned long i; } oldv, newv;
+    do {
+        oldv.i = *pi;
+        newv.f = oldv.f + val;
+    } while (atom_cmpxchg(pi, oldv.i, newv.i) != oldv.i);
+}
+#endif
+)";
+
+// ---------------------------------------------------------------------------
 // Geometry device functions prepended to every kernel that needs PBC.
 // Triclinic minimum-image order is strict: Z first, then Y, then X.
 // ---------------------------------------------------------------------------
-extern const string kGeometryFunctions = R"(
+extern const string kGeometryFunctions = kAtomicAddShim + R"(
 DEVICE inline real3 deltaPBC(
  real3 dr,
  real4 invBoxSize,
@@ -2374,7 +2416,7 @@ KERNEL void cvSecondaryStructure(
 }
 )";
 
-extern const string kScatterKernelSrc = R"(
+extern const string kScatterKernelSrc = kAtomicAddShim + R"(
 KERNEL void chainRuleScatter(
  GLOBAL const double* RESTRICT cvBiasGradients,
  GLOBAL const int* RESTRICT jacobianAtomIdx,
@@ -2529,7 +2571,7 @@ KERNEL void wallEvalBias(
 //   invGF    = (γ-1)/γ  = bias_prefactor
 //   sum_uprob = Σ_{j,k} h_k*(G_jk - ε)   (maintained by gatherDepositKernel)
 // ---------------------------------------------------------------------------
-extern const string kOPESKernelSrc = R"(
+extern const string kOPESKernelSrc = kAtomicAddShim + R"(
 #define MAX_OPES_CVS 16
 // ---------------------------------------------------------------------------
 // opesEvalBias — OPES bias potential (Invernizzi & Parrinello 2020)
@@ -3369,7 +3411,7 @@ KERNEL void maxentEvalBias(
 // Grid layout: column-major, strides[0]=1, strides[d]=strides[d-1]*actualPoints[d-1].
 // actualPoints[d] = numBins[d] + (periodic[d] ? 0 : 1).
 // ---------------------------------------------------------------------------
-extern const string kMetaDKernelSrc = R"(
+extern const string kMetaDKernelSrc = kAtomicAddShim + R"(
 KERNEL void metaDEvalBias(
  GLOBAL const double* RESTRICT cvValues,
  GLOBAL const int* RESTRICT cvIdxList,
