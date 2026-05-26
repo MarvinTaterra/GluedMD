@@ -26,21 +26,26 @@ CUDA on macOS is not supported by Apple (dropped in 2019). OpenCL on Apple Silic
 | CMake | ≥ 3.17 | |
 | Ninja | any | Faster than Make for incremental builds |
 | SWIG | ≥ 4.0 | Python wrapper generation |
-| Python | ≥ 3.9 | |
+| Python | 3.10 – 3.12 | The conda-forge `openmm` py3.14 build currently segfaults on import — pin the version |
 | OpenMM | 8.x | From conda-forge |
-| CUDA toolkit | ≥ 11.0 | Only needed for the CUDA platform |
+| pytest | any | Required by the verification step |
+| CUDA toolkit | matched to the OpenMM build (currently `cuda-version=12.9`) | Only needed for the CUDA platform; works against any modern NVIDIA driver (the 12.x runtime is forward-compatible with 13.x drivers) |
+| NVIDIA driver | ≥ 525 | Container hosts must mount the driver (`--gpus all` or NVIDIA Container Toolkit) |
 | libtorch | ≥ 2.0 | **Optional** — only needed for `CV_PYTORCH` |
 
 ### One-time environment setup
 
+If you're using Miniforge, conda-forge is already the only channel and the command below works as-is. If you're on plain Miniconda, the `--override-channels` flag below avoids the Anaconda Terms-of-Service prompt for the default channels.
+
 ```bash
-conda create -n openmm_env -c conda-forge \
-    openmm cmake ninja swig \
+conda create -n openmm_env --override-channels -c conda-forge \
+    "python=3.12" "cuda-version=12.9" \
+    openmm cmake ninja swig pytest \
     cuda-nvcc cuda-cudart-dev cuda-libraries-dev cxx-compiler
 conda activate openmm_env
 ```
 
-To build without CUDA (Reference + OpenCL only), omit the `cuda-*` packages.
+To build without CUDA (Reference + OpenCL only), omit the four `cuda-*` packages *and* the `cuda-version` pin.
 
 ### Build
 
@@ -82,8 +87,9 @@ Install [Miniforge](https://github.com/conda-forge/miniforge/releases/latest) (o
 Open an **Anaconda Prompt** (or any terminal where `conda` is available):
 
 ```bat
-conda create -n openmm_env -c conda-forge ^
-    openmm cmake ninja swig ^
+conda create -n openmm_env --override-channels -c conda-forge ^
+    "python=3.12" "cuda-version=12.9" ^
+    openmm cmake ninja swig pytest ^
     cuda-nvcc cuda-cudart-dev cxx-compiler
 conda activate openmm_env
 ```
@@ -117,6 +123,19 @@ $env:PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\vXX.Y\bin;$env:P
 
 The permanent fix is to update your NVIDIA driver to one that supports the NVRTC version bundled with your OpenMM build (run `nvcc --version` and compare to the driver's CUDA version in `nvidia-smi`).
 
+### Known issue: `import openmm` segfaults on a fresh container
+
+If `python -c "import openmm"` segfaults immediately after install, the crash is almost always inside an OpenCL ICD loaded from `/etc/OpenCL/vendors/`, not in OpenMM or GLUED. OpenMM scans that directory at import and dlopens every `.so` listed there; a broken third-party entry — most commonly the `pocl` ICD on Ubuntu base images, pointing at a missing or version-mismatched `libpocl` — takes the whole process down.
+
+```bash
+ls /etc/OpenCL/vendors/
+# For each .icd file, confirm the .so it points to exists at the right version.
+# If you only need NVIDIA OpenCL or CUDA, removing the bad entry is safe:
+sudo rm /etc/OpenCL/vendors/pocl.icd
+```
+
+Re-run `python -c "import openmm; print(openmm.__version__)"` — it should print the version without crashing. The GLUED CUDA plugin is unaffected; OpenMM is just being dragged down while enumerating OpenCL ICDs.
+
 ---
 
 ## macOS
@@ -124,8 +143,8 @@ The permanent fix is to update your NVIDIA driver to one that supports the NVRTC
 ### Prerequisites
 
 ```bash
-conda create -n openmm_env -c conda-forge \
-    openmm cmake ninja swig
+conda create -n openmm_env --override-channels -c conda-forge \
+    "python=3.12" openmm cmake ninja swig pytest
 conda activate openmm_env
 ```
 
