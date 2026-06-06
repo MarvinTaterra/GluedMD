@@ -3741,14 +3741,23 @@ void CommonCalcGluedForceKernel::buildPlan(const System& system,
  cvValueIdx += 1;
  } else if (cvType == GluedForce::CV_COM_DISTANCE) {
  if (plan_.numCOMDistanceCVs == 0) plan_.comDistanceFirstCVIndex = cvValueIdx;
- int ng1 = atoms[0];
- int totalAtoms = (int)atoms.size() - 1;
+ // Contract (Python Force.add_com_distance): `atoms` holds all atom indices
+ // of group1 followed by group2, and params[0] is the size of group1.
+ // Per-atom masses come from the System -- the Python layer cannot supply
+ // them -- so comDistanceMassData_ gets one entry per atom, matching the
+ // length of comDistanceUserAtoms_. (Previously ng1 was misread from
+ // atoms[0] and masses were taken from params, so comDistanceMassData_ was
+ // sized by params instead of by atom count; on the CUDA platform that
+ // mismatch crashed Context creation -- "Error uploading array
+ // comDistanceMasses" -- for any COM group with more than one atom.)
+ int ng1 = (int)std::lround(params.empty() ? 1.0 : params[0]);
+ int totalAtoms = (int)atoms.size();
  comDistanceNGroup1_.push_back(ng1);
  comDistanceCVAtomCount_.push_back(totalAtoms);
- for (int a = 1; a <= totalAtoms; a++)
+ for (int a = 0; a < totalAtoms; a++) {
  comDistanceUserAtoms_.push_back(atoms[a]);
- for (float m : vector<float>(params.begin(), params.end()))
- comDistanceMassData_.push_back(m);
+ comDistanceMassData_.push_back((float)system.getParticleMass(atoms[a]));
+ }
  plan_.numCOMDistanceCVs++;
  cvValueIdx += 1;
  } else if (cvType == GluedForce::CV_GYRATION) {
