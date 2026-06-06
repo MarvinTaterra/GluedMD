@@ -31,6 +31,7 @@ public:
                        std::vector<double>& values) override;
 
     std::vector<double> downloadCVValues() override;
+    double downloadLastBias() override;
 
     std::vector<char> getBiasStateBytes() override;
     void setBiasStateBytes(const std::vector<char>& bytes) override;

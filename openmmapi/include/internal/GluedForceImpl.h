@@ -53,6 +53,9 @@ public:
     // Download CV values from the last force evaluation
     std::vector<double> downloadCVValues();
 
+    // Total applied bias energy (kJ/mol) from the last force evaluation.
+    double downloadLastBias();
+
     // Returns [zed, rct, nker, neff] for the biasIndex-th OPES bias.
     std::vector<double> getOPESMetrics(int biasIndex);
 

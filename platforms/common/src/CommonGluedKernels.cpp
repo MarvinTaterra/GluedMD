@@ -4922,3 +4922,19 @@ vector<double> CommonCalcGluedForceKernel::downloadCVValues() {
  return values;
 }
 
+double CommonCalcGluedForceKernel::downloadLastBias() {
+ // Sum of all bias-energy slots = the total bias GLUED adds to the system
+ // (OPES + walls/restraints), exactly as execute() reports it. The eval
+ // kernels write these every force evaluation, so this read-back needs no
+ // re-evaluation (and triggers no PyTorch autograd).
+ if (!plan_.biasEnergies.isInitialized() || plan_.biasEnergies.getSize() == 0)
+ return 0.0;
+ ContextSelector selector(cc_);
+ vector<double> e(plan_.biasEnergies.getSize());
+ plan_.biasEnergies.download(e);
+ double total = 0.0;
+ for (double v : e)
+ total += v;
+ return total;
+}
+

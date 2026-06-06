@@ -190,6 +190,10 @@ public:
     // Download CV values computed during the last force evaluation.
     std::vector<double> getLastCVValues(OpenMM::Context& context) const;
 
+    // Total applied bias energy (kJ/mol, OPES + walls/restraints) from the last
+    // force evaluation — for OPES reweighting. Cached read-back; autograd-safe.
+    double getLastBias(OpenMM::Context& context) const;
+
     // --- Multiwalker B2: shared GPU bias arrays ---
     // These methods enable multiple OpenMM Contexts (walkers) on the same GPU to
     // share a single bias grid (MetaD) or kernel list (OPES), with all deposits

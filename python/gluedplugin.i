@@ -145,6 +145,7 @@ public:
     std::vector<double> getTestBiasGradients() const;
 
     std::vector<double> getLastCVValues(OpenMM::Context& context) const;
+    double getLastBias(OpenMM::Context& context) const;
 
     %extend {
         // Returns [zed, rct, nker, neff] for the biasIndex-th OPES bias.

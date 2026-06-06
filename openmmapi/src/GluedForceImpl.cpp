@@ -71,6 +71,10 @@ vector<double> GluedForceImpl::downloadCVValues() {
     return kernel_.getAs<CalcGluedForceKernel>().downloadCVValues();
 }
 
+double GluedForceImpl::downloadLastBias() {
+    return kernel_.getAs<CalcGluedForceKernel>().downloadLastBias();
+}
+
 vector<double> GluedForceImpl::getOPESMetrics(int biasIndex) {
     return kernel_.getAs<CalcGluedForceKernel>().getOPESMetrics(biasIndex);
 }

@@ -165,6 +165,11 @@ vector<double> GluedForce::getLastCVValues(OpenMM::Context& context) const {
         getImplInContext(context)).downloadCVValues();
 }
 
+double GluedForce::getLastBias(OpenMM::Context& context) const {
+    return dynamic_cast<GluedForceImpl&>(
+        getImplInContext(context)).downloadLastBias();
+}
+
 vector<double> GluedForce::getOPESMetrics(OpenMM::Context& context, int biasIndex) const {
     return dynamic_cast<GluedForceImpl&>(
         getImplInContext(context)).getOPESMetrics(biasIndex);

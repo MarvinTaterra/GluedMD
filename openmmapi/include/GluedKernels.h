@@ -51,6 +51,11 @@ public:
 
     virtual std::vector<double> downloadCVValues() = 0;
 
+    // Total applied bias energy (kJ/mol) from the last force evaluation —
+    // cached GPU read-back (no re-evaluation), so safe to call from a reporter
+    // even with a PyTorch CV. Default 0 for platforms not implementing it.
+    virtual double downloadLastBias() { return 0.0; }
+
     /**
      * Returns diagnostic metrics for the biasIndex-th OPES bias:
      *   [0] zed  = exp(logZ)          — normalization estimate
