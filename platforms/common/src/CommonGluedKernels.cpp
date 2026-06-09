@@ -2607,9 +2607,15 @@ KERNEL void opesEvalBias(
  for (int d = 0; d < numCVsBias; d++)
   sVals[d] = cvValues[cvIdxList[d]];
 
- // Kernel contribution h_k * (G_k - ε) with hard cutoff at cutoff2.
- // G_k - ε > 0 for all norm2 < cutoff2 (since G_k=exp(-norm2/2) > exp(-cutoff2/2)=ε).
- // dV/ds_d uses d(G_k)/ds_d = G_k * (-dc_d/sigma_d^2); the ε term is constant → no gradient.
+ // Cutoff-corrected KDE: each kernel contributes max(G_k - kfloor, 0) with
+ // kfloor = exp(-cutoff2/2), so it goes smoothly to 0 at the cutoff and is never
+ // negative. kfloor MUST match the deposit's eps_dep; the regularization ε used
+ // in log(pz+ε) is a DIFFERENT, larger quantity. (Using ε as the kernel floor
+ // made moderate-distance kernels contribute negatively -> prob_unnorm < 0 ->
+ // log(negative) = NaN, which silently skipped the bias force.) Non-finite
+ // kernels (e.g. a merge that drove sigma->0) are skipped so prob_unnorm stays
+ // finite; the energy is floored if the argument is ever non-positive.
+ double kfloor = exp(-0.5 * cutoff2);
  double prob_unnorm = 0.0;
  double dAccum[MAX_OPES_CVS];
  for (int d = 0; d < numCVsBias; d++) dAccum[d] = 0.0;
@@ -2617,27 +2623,29 @@ KERNEL void opesEvalBias(
  for (int k = 0; k < numKernels; k++) {
   double norm2 = 0.0;
   double dc_d[MAX_OPES_CVS], sig_d[MAX_OPES_CVS];
-  bool skip = false;
   for (int d = 0; d < numCVsBias; d++) {
    dc_d[d] = sVals[d] - (double)centers[k*numCVsBias + d];
    sig_d[d] = (double)sigmas[k*numCVsBias + d];
    norm2 += dc_d[d]*dc_d[d] / (sig_d[d]*sig_d[d]);
-   if (norm2 >= cutoff2) { skip = true; break; }
   }
-  if (skip) continue;
-  double h_k = exp((double)logWeights[k]);
-  double G_k = exp(-0.5*norm2);
-  double fk  = h_k * (G_k - eps);
-  prob_unnorm += fk;
+  if (!(norm2 < cutoff2)) continue;            // skips >=cutoff AND NaN/inf (sigma->0)
+  double G_k  = exp(-0.5*norm2);
+  double kern = G_k - kfloor;
+  if (kern <= 0.0) continue;                   // kernel support ends at the cutoff floor
+  double h_k  = exp((double)logWeights[k]);
+  if (!(h_k > 0.0 && h_k < 1e308)) continue;   // skip non-finite / zero weights
+  prob_unnorm += h_k * kern;
   for (int d = 0; d < numCVsBias; d++)
    dAccum[d] += h_k * G_k * (-dc_d[d] / (sig_d[d]*sig_d[d]));
  }
 
- // p/Zed = prob_unnorm * nker / sum_uprob
+ // p/Zed = prob_unnorm * nker / sum_uprob  (prob_unnorm >= 0 now -> pz >= 0)
  double sum_uprob = sumUprobGPU[0];
  double pz = (sum_uprob > 0.0) ? prob_unnorm * (double)numKernels / sum_uprob : 0.0;
+ if (!(pz >= 0.0)) pz = 0.0;                    // guard NaN / negative
 
- biasEnergies[biasIdx] = invGammaFactor * kT * log(pz + eps);
+ double Varg = pz + eps;
+ biasEnergies[biasIdx] = invGammaFactor * kT * ((Varg > 0.0) ? log(Varg) : log(eps));
 
  // dV/ds_d = invGF·kT · pz/(pz+ε) / prob_unnorm · dAccum[d]
  if (prob_unnorm > 0.0) {
@@ -2820,8 +2828,10 @@ KERNEL void opesGatherDeposit(
    double cm = f1*c1 + f2*c2;
    double ss = f1*(s1*s1+c1*c1) + f2*(s2*s2+c2*c2) - cm*cm;
    if (ss < 0.0) ss = 0.0;
+   double sm = sqrt(ss);
+   if (sm < sigmaMin) sm = sigmaMin;   // a degenerate merge can give ss->0; never store sigma=0
    kCenters[merge_k*D+d] = (float)cm;
-   kSigmas[merge_k*D+d]  = (float)sqrt(ss);
+   kSigmas[merge_k*D+d]  = (float)sm;
   }
   kLogWeights[merge_k] = (float)lw_mrg;
   nAfter = nBefore;
