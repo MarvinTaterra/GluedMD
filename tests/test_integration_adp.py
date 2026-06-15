@@ -517,6 +517,26 @@ def test_bias_eds():
     print(f"  bias_eds:              E = {E:.4f} kJ/mol  ✓")
 
 
+def test_bias_multithermal():
+    """OPES multithermal (energy CV + β-ladder) on the solvated system: E finite.
+
+    The CV_ENERGY device path builds a linked inner context (clone of the base system)
+    and evaluates the unbiased PE on the GPU — so this case is CUDA/OpenCL only.
+    """
+    if _PLAT.getName() not in ("CUDA", "OpenCL"):
+        print("  bias_multithermal:     SKIP (CV_ENERGY needs CUDA/OpenCL)")
+        return
+    kB = 0.0083144621; kT0 = kB * 300.0
+    betas = [1.0 / (kB * T) for T in (300.0, 350.0, 400.0, 450.0)]
+    f = gp.GluedForce(); f.setUsesPeriodicBoundaryConditions(True)
+    e = _add_cv(f, gp.GluedForce.CV_ENERGY, [], [])
+    _add_bias(f, gp.GluedForce.BIAS_OPES_MULTITHERMAL, [e], [kT0] + betas, [200])
+    ctx = _make_ctx(f)
+    E = _E(ctx)
+    assert math.isfinite(E), f"multithermal E non-finite: {E}"
+    print(f"  bias_multithermal:     E = {E:.4f} kJ/mol  ✓")
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # Main runner
 # ══════════════════════════════════════════════════════════════════════════
@@ -555,6 +575,7 @@ _BIAS_TESTS = [
     test_bias_external,
     test_bias_ext_lagrangian,
     test_bias_eds,
+    test_bias_multithermal,
 ]
 
 if __name__ == "__main__":

@@ -61,7 +61,10 @@ public:
         // Stage 3.18 — PCA projection: atoms = selection, params = flattened PC vectors + mean
         CV_PCA                = 21,
         // Stage 3.19 — eRMSD for RNA (deferred); specialized nucleotide reference frames
-        CV_ERMSD              = 22
+        CV_ERMSD              = 22,
+        // OPES multithermal — total UNBIASED potential energy U; no atoms, no params.
+        // Evaluated via a linked inner context that omits this GluedForce; Jacobian dU/dx = -F.
+        CV_ENERGY             = 23
     };
 
     // Bias type codes — populated in Stage 5
@@ -84,7 +87,11 @@ public:
         BIAS_EXT_LAGRANGIAN   = 12,
         // Stage 5.12 — Maximum Entropy / EDS experimental restraints; deferred past Sec 7
         BIAS_MAXENT           = 13,
-        BIAS_EDS              = 14
+        BIAS_EDS              = 14,
+        // OPES multithermal: expands a single CV_ENERGY over an inverse-temperature
+        // ladder {β_l}. cvIndices=[energy CV value index]; params=[kT0, β_0..β_{N-1}];
+        // intParams=[pace]. Per-state ΔF learned on the fly (host-side).
+        BIAS_OPES_MULTITHERMAL = 15
     };
 
     GluedForce();

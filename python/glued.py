@@ -14,10 +14,28 @@ Minimal OPES example::
 
 The raw ``GluedForce`` API (``addCollectiveVariable``, ``addBias``, all enum
 constants) remains fully accessible on ``Force`` instances.
+
+Minimal OPES multithermal example (run cold, sample hot, reweight back)::
+
+    import glued
+    f = glued.Force(temperature=300.0)          # simulation temperature = temp0
+    energy_cv, _ = f.add_multithermal(300.0, 600.0, n_temps=16, pace=500)
+    system.addForce(f)                          # integrator must run at 300 K
+    # … run dynamics, collecting per-frame U and V …
+    U, V = [], []
+    for _ in range(n_frames):
+        integrator.step(stride)
+        u, v = f.multithermal_uv(context)
+        U.append(u); V.append(v)
+    mean_at_500, ess = glued.reweight_to_temperature(U, V, 300.0, 500.0, observable)
 """
 
-import gluedplugin as _gp
+# Import openmm BEFORE gluedplugin: gluedplugin reuses openmm's SWIG std::vector
+# typemaps (vectori/vectord) via %import, and that cross-module type table is only
+# registered if openmm is loaded first. Importing gluedplugin first leaves the
+# wrapper's vector arguments unrecognised (TypeError on every addCollectiveVariable).
 import openmm as _mm
+import gluedplugin as _gp
 
 _R_KJ = 8.314462618e-3   # kJ / (mol · K)
 
@@ -670,3 +688,210 @@ class Force(_gp.GluedForce):
             params.extend([float(t), float(r)])
         params.append(kT)
         return self.addBias(_gp.GluedForce.BIAS_EDS, cvs, params)
+
+    # ==================================================================
+    # OPES multithermal (energy as CV) — Stage 3/4
+    # ==================================================================
+
+    def add_energy_cv(self):
+        """Add a total-potential-energy collective variable.
+
+        The CV value is the system's **unbiased** potential energy U, evaluated
+        fully GPU-resident in a linked inner context that holds every System force
+        *except* this GluedForce (so the bias never enters U). Its per-atom Jacobian
+        is dU/dx = −F. This is the CV that OPES multithermal expands.
+
+        Returns
+        -------
+        int  The CV index.
+
+        Notes
+        -----
+        * Requires the **CUDA or OpenCL** platform (the Reference platform has no
+          device-resident inner context).
+        * The inner context omits constraints and virtual sites. Constraints do not
+          contribute to U/F, so constrained systems (e.g. H-bond-constrained, rigid
+          3-site water) are fine; **virtual-site systems are not yet supported** —
+          validate on vsite-free systems.
+        """
+        return self.addCollectiveVariable(_gp.GluedForce.CV_ENERGY, [], [])
+
+    def add_multithermal(self, temp_min, temp_max, n_temps=16, *,
+                         temp0=None, temps=None, pace=500, spacing='geometric'):
+        """OPES multithermal: sample a temperature range from a single replica.
+
+        Adds a total-energy CV (:meth:`add_energy_cv`) and expands it over an
+        inverse-temperature ladder spanning ``[temp_min, temp_max]``, applying a bias
+        that flattens the marginal distribution of U over that range. A single
+        trajectory run at ``temp0`` then visits configurations characteristic of the
+        whole range; reweight back to any target temperature in the range afterwards
+        with :func:`reweight_to_temperature`.
+
+        Reference: Invernizzi, Piaggi & Parrinello, *Unified approach to enhanced
+        sampling*, PRX 10, 041034 (2020).
+
+        Parameters
+        ----------
+        temp_min, temp_max : float
+            Lowest / highest temperature (K) of the expanded ensemble.
+        n_temps : int
+            Number of temperatures in the ladder (default 16). A few tens are plenty;
+            neighbouring canonical distributions only need to overlap.
+        temp0 : float or None
+            Reference (simulation) temperature in K. Defaults to the Force-level
+            ``temperature``. **Your integrator must run at this temperature.** With
+            flat ΔF the bias force is zero when the ladder reduces to {temp0}.
+        temps : list[float] or None
+            Explicit temperature list (K); overrides ``temp_min/temp_max/n_temps``.
+        pace : int
+            ΔF-update stride in steps (default 500).
+        spacing : {'geometric', 'uniform'}
+            Ladder spacing (default 'geometric' — near-constant neighbour overlap).
+
+        Returns
+        -------
+        (energy_cv, bias_index) : tuple[int, int]
+        """
+        if temps is not None:
+            ladder = [float(t) for t in temps]
+            if not ladder:
+                raise ValueError("temps must be a non-empty list of temperatures")
+        else:
+            ladder = multithermal_temperature_ladder(
+                temp_min, temp_max, int(n_temps), spacing=spacing)
+        T0 = temp0 if temp0 is not None else self._temperature
+        if T0 is None:
+            raise ValueError(
+                "temp0 (reference/simulation temperature) is required — pass "
+                "temp0=... or construct Force(temperature=...)")
+        kT0   = _R_KJ * float(T0)
+        betas = [1.0 / (_R_KJ * float(t)) for t in ladder]
+        energy_cv = self.add_energy_cv()
+        params    = [kT0] + betas            # [kT0, β_0, …, β_{N-1}]
+        bias = self.addBias(_gp.GluedForce.BIAS_OPES_MULTITHERMAL,
+                            [energy_cv], params, [int(pace)])
+        # Stash the configuration so reweighting can be done without re-deriving β0.
+        self._multithermal = {
+            'energy_cv': energy_cv, 'temp0': float(T0),
+            'temps': ladder, 'bias': bias,
+        }
+        return energy_cv, bias
+
+    def multithermal_uv(self, context, energy_cv=None):
+        """Return ``(U, V)`` for the current frame.
+
+        U is the total potential energy CV value (kJ/mol) and V is the total applied
+        bias energy (kJ/mol). Collect these every frame during a multithermal run and
+        pass the arrays to :func:`reweight_to_temperature`. Call after a
+        ``context.getState(getEnergy=True)`` (or any force evaluation) so the cached
+        values are current.
+
+        ``energy_cv`` defaults to the CV index returned by :meth:`add_multithermal`.
+        Assumes the multithermal bias is the only bias on this Force (so V is the
+        multithermal bias); if you add other biases, track V yourself.
+        """
+        if energy_cv is None:
+            if not hasattr(self, '_multithermal'):
+                raise ValueError("no multithermal bias on this Force; pass energy_cv=")
+            energy_cv = self._multithermal['energy_cv']
+        U = list(self.getLastCVValues(context))[energy_cv]
+        V = self.getLastBias(context)
+        return U, V
+
+
+# ======================================================================
+# OPES multithermal: temperature ladder + reweighting (Stage 3)
+# ======================================================================
+
+def multithermal_temperature_ladder(temp_min, temp_max, n_temps, *,
+                                     spacing='geometric'):
+    """Build a temperature ladder (K) for OPES multithermal.
+
+    Parameters
+    ----------
+    temp_min, temp_max : float  Range endpoints (K), inclusive.
+    n_temps : int               Number of temperatures (>= 1).
+    spacing : {'geometric', 'uniform'}
+        'geometric' (default): ``T_k = temp_min·(temp_max/temp_min)**(k/(n-1))`` —
+        constant ratio between neighbours, giving near-uniform overlap of the
+        canonical distributions (the natural choice for an expanded ensemble).
+        'uniform': linear in temperature.
+    """
+    import math
+    n = int(n_temps)
+    if n < 1:
+        raise ValueError("n_temps must be >= 1")
+    if temp_min <= 0 or temp_max <= 0:
+        raise ValueError("temperatures must be positive")
+    if n == 1:
+        return [float(temp_min)]
+    if spacing == 'geometric':
+        ratio = (temp_max / temp_min) ** (1.0 / (n - 1))
+        return [float(temp_min) * ratio ** k for k in range(n)]
+    if spacing == 'uniform':
+        return [float(temp_min) + (temp_max - temp_min) * k / (n - 1)
+                for k in range(n)]
+    raise ValueError(f"spacing must be 'geometric' or 'uniform', got {spacing!r}")
+
+
+def multithermal_log_weights(potential_energy, bias, temp0, temp_target,
+                             kB=_R_KJ):
+    """Per-frame log reweighting weights from temp0 to temp_target.
+
+    ``log w_i = β0·V_i − (β′ − β0)·U_i``  with β0 = 1/(kB·temp0),
+    β′ = 1/(kB·temp_target). U is the (unbiased) potential energy CV value and V is
+    the applied multithermal bias for each frame (see :meth:`Force.multithermal_uv`).
+    Returns a NumPy array of unnormalised log-weights.
+    """
+    import numpy as np
+    U = np.asarray(potential_energy, dtype=float)
+    V = np.asarray(bias, dtype=float)
+    beta0 = 1.0 / (kB * float(temp0))
+    betap = 1.0 / (kB * float(temp_target))
+    return beta0 * V - (betap - beta0) * U
+
+
+def kish_ess(log_weights):
+    """Kish effective sample size ``(Σw)²/Σw²`` from log-weights (stable).
+
+    Ranges from 1 (one frame dominates) to N (uniform weights). A healthy
+    reweighting keeps ESS a sizeable fraction of N.
+    """
+    import numpy as np
+    lw = np.asarray(log_weights, dtype=float)
+    lw = lw - np.max(lw)
+    w = np.exp(lw)
+    return float(w.sum() ** 2 / np.sum(w * w))
+
+
+def reweight_to_temperature(potential_energy, bias, temp0, temp_target,
+                            observable=None, kB=_R_KJ):
+    """Reweight multithermal samples from temp0 to temp_target.
+
+    Parameters
+    ----------
+    potential_energy, bias : sequence[float]
+        Per-frame U and V (kJ/mol). See :meth:`Force.multithermal_uv`.
+    temp0 : float        Simulation (reference) temperature (K).
+    temp_target : float  Temperature to reweight to (K), within the ladder range.
+    observable : sequence[float] or None
+        Per-frame values of an observable to average. If None, just return the
+        normalised weights.
+
+    Returns
+    -------
+    (weights, ess)         if ``observable`` is None
+    (weighted_mean, ess)   otherwise
+        ``weights`` are normalised (sum to 1); ``ess`` is the Kish effective
+        sample size.
+    """
+    import numpy as np
+    log_w = multithermal_log_weights(potential_energy, bias, temp0, temp_target, kB)
+    lw = log_w - np.max(log_w)
+    w = np.exp(lw)
+    w /= w.sum()
+    ess = float(1.0 / np.sum(w * w))
+    if observable is None:
+        return w, ess
+    obs = np.asarray(observable, dtype=float)
+    return float(np.sum(w * obs)), ess

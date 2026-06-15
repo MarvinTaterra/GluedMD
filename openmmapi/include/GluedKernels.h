@@ -31,6 +31,18 @@ public:
                             const GluedForce& force) = 0;
 
     /**
+     * Hand the kernel a linked inner Context (clone of the System minus this
+     * GluedForce) used to evaluate the unbiased total potential energy U and
+     * forces F for a CV_ENERGY (OPES multithermal). Called by GluedForceImpl
+     * after createLinkedContext. The matching ContextImpl* is passed alongside
+     * because the kernel cannot reach Context::getImpl() (private); the device
+     * path drives the inner evaluation through it (calcForcesAndEnergy,
+     * getPlatformData). No-op default for platforms without an energy CV.
+     */
+    virtual void setInnerContext(OpenMM::Context* inner,
+                                 OpenMM::ContextImpl* innerImpl) {}
+
+    /**
      * Evaluate all CV kernels, all bias energy/gradient kernels, and apply
      * chain-rule force scatter.  Returns the total bias energy.
      */

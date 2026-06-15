@@ -27,6 +27,15 @@ public:
 
     void updateState(OpenMM::ContextImpl& context, int step) override;
 
+    // Linked inner context (System minus this GluedForce) for the CV_ENERGY value
+    // and forces (OPES multithermal). The device path drives it through the
+    // ContextImpl* (calcForcesAndEnergy + getInnerComputeContext on its PlatformData).
+    void setInnerContext(OpenMM::Context* inner,
+                         OpenMM::ContextImpl* innerImpl) override {
+        innerContext_ = inner;
+        innerContextImpl_ = innerImpl;
+    }
+
     void getCurrentCVs(OpenMM::ContextImpl& context,
                        std::vector<double>& values) override;
 
@@ -48,12 +57,20 @@ public:
 
 protected:
     OpenMM::ComputeContext& cc_;
+    OpenMM::Context* innerContext_ = nullptr;   // CV_ENERGY linked inner context (unbiased U/F)
+    OpenMM::ContextImpl* innerContextImpl_ = nullptr;  // its ContextImpl (device path driver)
     int forceGroupFlag_ = 1;
 
     // CUDA-specific virtual accessors — overridden by CudaCalcGluedForceKernel.
     // Default implementations return nullptr (non-CUDA platforms).
     virtual void* getNativeCudaStream() const { return nullptr; }
     virtual void* getComputeArrayDevPtr(OpenMM::ComputeArray& arr) const { return nullptr; }
+
+    // Returns the ComputeContext backing a linked inner Context. Reads the
+    // platform-specific PlatformData, so it is overridden in the Cuda/OpenCL
+    // kernel subclasses; the common-layer default throws (see .cpp). Used by the
+    // CV_ENERGY device path to reach the inner context's posq/force buffers.
+    virtual OpenMM::ComputeContext& getInnerComputeContext(OpenMM::ContextImpl& innerContext);
 
 private:
     // test kernel
@@ -276,6 +293,19 @@ private:
         OpenMM::ComputeArray ermsdRefG;         // float[totalRefG] 4D Bottaro G-vectors
         OpenMM::ComputeArray ermsdCutoffs;      // float[numErmsdCVs]
 
+        // Total potential energy CV (OPES multithermal). No atoms/params. The CV value is
+        // the system's UNBIASED potential energy U (evaluated in a linked inner context that
+        // omits this GluedForce), and its per-atom Jacobian is dU/dx = -F (the unbiased forces).
+        // numParticles Jacobian entries per energy CV (one per atom): entry energyFirstJacEntry+a
+        // corresponds to user atom a, with jacobianAtomIdx = userToGpu[a] (set in
+        // rebuildGpuAtomIndices) and grads = -F[a] (refreshed each execute()). Evaluated fully
+        // device-to-device: the inner context's positions are written by a GPU copy kernel, U/F
+        // computed on the GPU (ContextImpl::calcForcesAndEnergy), and the inner force buffer copied
+        // straight into these grads — no posq/force host round-trip (see execute()).
+        int numEnergyCVs       = 0;
+        int energyFirstCVIndex = 0;
+        int energyFirstJacEntry = 0;
+
         bool periodic = false;
     } plan_;
 
@@ -299,6 +329,17 @@ private:
     OpenMM::ComputeKernel puckerKernel_;
     OpenMM::ComputeKernel ermsdKernel_;
     OpenMM::ComputeKernel scatterKernel_;
+
+    // CV_ENERGY device-to-device path (OPES multithermal). The inner context's
+    // positions are copied in with energyCopyStateKernel_, evaluated on the GPU via
+    // ContextImpl::calcForcesAndEnergy, and its long force buffer copied straight into
+    // the energy CV Jacobian (grads = -F) with energyCopyForcesKernel_ — no host
+    // round-trip. innerInvAtomOrder_ maps inner user atom -> inner GPU slot, kept in
+    // sync by a ReorderListener on the inner ComputeContext (see execute()).
+    OpenMM::ComputeKernel energyCopyStateKernel_;
+    OpenMM::ComputeKernel energyCopyForcesKernel_;
+    OpenMM::ComputeArray  innerInvAtomOrder_;
+    bool energyDeviceInitialized_ = false;
 
     // PyTorch (TorchScript) CV plan.
     // GPU-native path (primary): posq → extractKernel → posBufGPU → torch (CUDA tensor,
@@ -598,6 +639,34 @@ private:
         OpenMM::ComputeKernel updateStateKernel;
     };
 
+    // OPES multithermal (Invernizzi/Parrinello expanded ensemble over temperature).
+    // Expands a single CV_ENERGY (value = unbiased PE U) over an inverse-temperature
+    // ladder {β_l}. Bias V = -kT0·(diffMax + log(Σ_l exp(diff_l - diffMax)/N)),
+    // diff_l = -(β_l-β0)·U + ΔF_l/kT0; dV/dU = kT0·Σ_l p_l·(β_l-β0). The per-state ΔF_l
+    // are learned on the fly via the OPES expanded-ensemble recursion. Fully GPU-resident:
+    // multithermalEvalBias fills biasEnergies[biasEnergyIdx] (V) and cvBiasGradients (dV/dU)
+    // every step; multithermalUpdateDeltaF advances ΔF_l/rct/counter every PACE steps in
+    // updateState(). The energy CV's U (cvValues) and the scatter (dV/dU·F through the single
+    // energy Jacobian) are already on the GPU. CPU mirrors below are serialization staging only.
+    struct MultithermalBias {
+        int energyCvIdx = 0;                 // global cvValues index of the CV_ENERGY
+        int energyLocalIdx = 0;              // energyCvIdx - energyFirstCVIndex (validation only)
+        double kT0 = 2.479;                  // reference kT (kJ/mol)
+        double beta0 = 0.0;                  // 1/kT0
+        int pace = 500;
+        int biasEnergyIdx = -1;
+        std::vector<double> betaMinusBeta0;  // β_l - β0   (length N) — uploaded to betaMinusBeta0GPU
+        std::vector<double> deltaF;          // ΔF_l staging buffer (download on demand for serialization)
+        double rct = 0.0;                    // c(t) staging (download on demand)
+        long long counter = 1;               // update-counter staging (download on demand)
+        OpenMM::ComputeArray betaMinusBeta0GPU;  // double[N]
+        OpenMM::ComputeArray deltaFGPU;          // double[N] — learned on the GPU
+        OpenMM::ComputeArray rctGPU;             // double[1]
+        OpenMM::ComputeArray counterGPU;         // double[1] (init 1.0)
+        OpenMM::ComputeKernel evalKernel;
+        OpenMM::ComputeKernel updateDeltaFKernel;
+    };
+
 protected:
     // Bias state vectors — protected so CudaCalcGluedForceKernel can read
     // device pointers for B2 multiwalker sharing via getSharedBiasPtrs().
@@ -618,6 +687,7 @@ protected:
     std::vector<MetaDGridBias>        externalGridBiases_;
     std::vector<ExtLagBias>           extLagBiases_;
     std::vector<EdsBias>              edsBiases_;
+    std::vector<MultithermalBias>     multithermalBiases_;
 
 private:
 
