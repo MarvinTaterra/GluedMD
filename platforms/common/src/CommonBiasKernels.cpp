@@ -34,6 +34,24 @@ void CommonCalcGluedForceKernel::setupBiases(const GluedForce& force) {
  // cvBiasGradients is fully populated before chain-rule scatter.
  int numBiases = force.getNumBiases();
 
+ // Reject biasing a VOLUME or CELL CV: those kernels emit no Jacobian entries and there
+ // is no virial/box-derivative path, so a bias on them would apply zero force on every
+ // atom (a silent no-op). Fail loudly instead — VOLUME/CELL are read-only CVs (use them
+ // for monitoring / COLVAR output). (H13)
+ for (int b = 0; b < numBiases; b++) {
+ int t; vector<int> ci; vector<double> p; vector<int> ip;
+ force.getBiasInfo(b, t, ci, p, ip);
+ for (int idx : ci) {
+ bool isVol = plan_.numVolumeCVs > 0 && idx >= plan_.volumeFirstCVIndex &&
+ idx < plan_.volumeFirstCVIndex + plan_.numVolumeCVs;
+ bool isCell = plan_.numCellCVs > 0 && idx >= plan_.cellFirstCVIndex &&
+ idx < plan_.cellFirstCVIndex + plan_.numCellCVs;
+ if (isVol || isCell)
+ throw OpenMMException("GLUED: biasing a VOLUME/CELL CV is not supported (no "
+ "virial/force path); these CVs are read-only — use them for monitoring only.");
+ }
+ }
+
  // Reserve all bias vectors before the loop to prevent reallocation.
  // Reallocation would invalidate pointers stored in kernel addArg() calls.
  // Also count totalEnergySlots: PBMetaD has one slot per subgrid (per CV dim).
@@ -114,7 +132,9 @@ void CommonCalcGluedForceKernel::setupBiases(const GluedForce& force) {
  h.evalKernel->addArg(plan_.cvBiasGradients); // 4
  h.evalKernel->addArg(plan_.biasEnergies); // 5
  h.evalKernel->addArg(h.biasEnergyIdx); // 6
- h.evalKernel->addArg(); // 7: spare (8.5.1 fix)
+ // periodic flag (int_params[0]): wrap (s - s0) into the nearest image for periodic CVs
+ int harmPeriodic = bIntParams.empty() ? 0 : bIntParams[0];
+ h.evalKernel->addArg(harmPeriodic); // 7: periodic (was spare)
 
  } else if (bType == GluedForce::BIAS_MOVING_RESTRAINT) {
  movingRestraintBiases_.emplace_back();
