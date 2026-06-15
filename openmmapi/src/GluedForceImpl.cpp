@@ -61,10 +61,22 @@ void GluedForceImpl::initialize(ContextImpl& context) {
         Vec3 a, b, c;
         sys.getDefaultPeriodicBoxVectors(a, b, c);
         innerSystem_->setDefaultPeriodicBoxVectors(a, b, c);
-        // Clone every force except this GluedForce. (Constraints/virtual sites are not
-        // copied: constraints don't contribute to PE/forces from getState; virtual-site
-        // force redistribution is a documented Stage-1 limitation — validate on
-        // vsite-free systems. Mirrors ATMForceImpl::copySystem.)
+        // Clone every force except this GluedForce. Constraints and virtual sites are
+        // intentionally NOT copied (mirrors ATMForceImpl::copySystem / CustomCVForceImpl):
+        //  - Constraints contribute no PE and no force to calcForcesAndEnergy (the
+        //    integrator applies them), so U/F are unchanged by omitting them.
+        //  - Virtual sites MUST be omitted for correctness, not as a limitation. The inner
+        //    context's vsite positions are exact (copyState copies the outer posq, where the
+        //    outer context already placed each vsite from its parents), so U is exact. The
+        //    inner context, being vsite-free, leaves the raw force F_v on the vsite slot
+        //    rather than folding it onto parents; the energy Jacobian carries that as the
+        //    vsite atom's dU/dx entry; the chain-rule scatter deposits the bias force onto
+        //    the OUTER vsite slot; and the OUTER context's distributeForcesFromVirtualSites
+        //    (run in finishComputation, AFTER this scatter) redistributes it to the parent
+        //    atoms exactly ONCE. Cloning the vsites here would make the inner pass fold F_v
+        //    onto parents too, double-counting the M·F_v term. So OPC/TIP4P-D/TIP5P/
+        //    a99SB-disp are supported out of the box (validated in tests/test_cv_energy_vsite.py).
+        //    Caveat: assumes a standard integrator that recomputes vsite positions each step.
         for (int i = 0; i < sys.getNumForces(); i++) {
             const Force& f = sys.getForce(i);
             if (&f == &owner_)

@@ -36,6 +36,7 @@ add_python_test(cv_puckering        test_cv_puckering.py        180)
 add_python_test(cv_secondary_structure  test_cv_secondary_structure.py  240)
 add_python_test(cv_ermsd  test_cv_ermsd.py  240)
 add_python_test(cv_energy  test_cv_energy.py  180)
+add_python_test(cv_energy_vsite  test_cv_energy_vsite.py  300 requires_cuda)
 
 # ---- Stage 4 / 5: bias methods -----------------------------------------
 add_python_test(bias_harmonic           test_bias_harmonic.py           180)
