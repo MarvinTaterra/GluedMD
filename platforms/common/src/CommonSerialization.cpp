@@ -161,6 +161,19 @@ vector<char> CommonCalcGluedForceKernel::getBiasStateBytes() {
  mx.lambdaGPU.download(mx.lambda);
  write(mx.lambda.data(), D * 8);
  }
+ // OPES multithermal: per state ΔF[N], plus rct and the update counter (GPU-resident).
+ int32_t nmt = (int32_t)multithermalBiases_.size();
+ write(&nmt, 4);
+ for (auto& mt : multithermalBiases_) {
+ int N = (int)mt.betaMinusBeta0.size();
+ mt.deltaFGPU.download(mt.deltaF);
+ { vector<double> tmp(1); mt.rctGPU.download(tmp);     mt.rct     = tmp[0]; }
+ { vector<double> tmp(1); mt.counterGPU.download(tmp); mt.counter = (long long)tmp[0]; }
+ int32_t n32 = N; write(&n32, 4);
+ write(mt.deltaF.data(), (size_t)N * 8);
+ write(&mt.rct, 8);
+ double cnt = (double)mt.counter; write(&cnt, 8);
+ }
  return buf;
 }
 
@@ -371,6 +384,28 @@ void CommonCalcGluedForceKernel::setBiasStateBytes(
  read(mx.lambda.data(), D * 8);
  mx.lambdaGPU.upload(mx.lambda);
  }
+ }
+ }
+ // OPES multithermal: ΔF[N], rct, counter (may be absent in states saved before this).
+ if (p < bytes.data() + bytes.size()) {
+ int32_t nmt; read(&nmt, 4);
+ if (nmt != (int32_t)multithermalBiases_.size())
+ throw OpenMMException("GLUED bias-state: OPES multithermal bias count mismatch (expected " +
+ std::to_string(multithermalBiases_.size()) + ", got " + std::to_string((long long)nmt) + ")");
+ ContextSelector selector(cc_);
+ for (auto& mt : multithermalBiases_) {
+ int N = (int)mt.betaMinusBeta0.size();
+ int32_t n32; read(&n32, 4);
+ if (n32 != N)
+ throw OpenMMException("GLUED bias-state: OPES multithermal state size mismatch (expected " +
+ std::to_string(N) + ", got " + std::to_string((long long)n32) + ")");
+ mt.deltaF.resize(N);
+ read(mt.deltaF.data(), (size_t)N * 8);
+ read(&mt.rct, 8);
+ double cnt; read(&cnt, 8); mt.counter = (long long)cnt;
+ mt.deltaFGPU.upload(mt.deltaF);
+ mt.rctGPU.upload(vector<double>{mt.rct});
+ mt.counterGPU.upload(vector<double>{(double)mt.counter});
  }
  }
 }
