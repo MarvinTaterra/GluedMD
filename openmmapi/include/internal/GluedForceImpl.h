@@ -71,6 +71,14 @@ private:
     const GluedForce& owner_;
     OpenMM::Kernel kernel_;
     int lastStepIndex_ = -1;
+
+    // CV_ENERGY (OPES multithermal): a linked inner Context holding a clone of the
+    // System's forces EXCEPT this GluedForce, used to evaluate the unbiased total PE
+    // U and forces F. Owned here; created lazily in initialize() only if an energy CV
+    // is present. (ATMForce/CustomCVForce pattern.)
+    OpenMM::System* innerSystem_ = nullptr;
+    OpenMM::Integrator* innerIntegrator_ = nullptr;
+    OpenMM::Context* innerContext_ = nullptr;
 };
 
 } // namespace GluedPlugin
