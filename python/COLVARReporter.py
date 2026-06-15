@@ -55,8 +55,11 @@ class COLVARReporter:
     def describeNextReport(self, simulation):
         """Return (steps_until_next, needs_pos, needs_vel, needs_forces, needs_energy)."""
         steps = self._interval - simulation.currentStep % self._interval
-        # CV values come from GPU directly — no simulation state components needed.
-        return (steps, False, False, False, False)
+        # Request energy so OpenMM forces a fresh force/energy evaluation on the
+        # report step. Without it, getLastCVValues() may return CV values cached
+        # from an earlier step (the last time the force was evaluated), producing
+        # a COLVAR line that is stale relative to `state`'s reported time.
+        return (steps, False, False, False, True)
 
     def report(self, simulation, state):
         """Write one line of CV values for the current step."""
@@ -94,5 +97,9 @@ class COLVARReporter:
         if self._out is not None and isinstance(self._file, str):
             try:
                 self._out.close()
-            except Exception:
-                pass
+            except (OSError, ValueError) as exc:
+                # OSError: flush/close I/O failure; ValueError: already closed.
+                # Don't crash interpreter shutdown, but surface the cause.
+                import sys
+                print(f"COLVARReporter: error closing output file: {exc}",
+                      file=sys.stderr)

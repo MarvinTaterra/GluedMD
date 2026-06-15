@@ -90,6 +90,15 @@ public:
     GluedForce();
     ~GluedForce() override;
 
+    // L24: impl_ is a non-owning back-pointer set by a per-Context GluedForceImpl.
+    // The default (shallow) copy would alias it, so a copy could end up pointing
+    // at an impl owned by another Force's Context — a dangling pointer once that
+    // Context is destroyed. We therefore copy all CV/bias/config data but reset
+    // impl_ to nullptr on any copy; a copied Force is simply "not yet bound to a
+    // Context" until createImpl() runs for it.
+    GluedForce(const GluedForce& other);
+    GluedForce& operator=(const GluedForce& other);
+
     // --- CV management ---
 
     // Returns the first CV value index for this variable (s for PATH, the single
@@ -115,6 +124,13 @@ public:
 
     // --- Global config ---
 
+    // NOTE (informational / fallback only): this temperature is stored and
+    // round-trips through serialization, but it is NOT the source of truth for
+    // any bias's kT. Each bias method receives its own kT through its parameter
+    // vector (e.g. well-tempered METAD, OPES), and that per-bias value is what
+    // the kernels actually use. setTemperature()/getTemperature() exist for
+    // diagnostics and as a documented fallback; changing this value does not
+    // retroactively alter the kT of biases that were already configured.
     void setTemperature(double kelvin);
     double getTemperature() const;
 
@@ -242,6 +258,10 @@ private:
     double testForceScale_ = 0.0;
     std::vector<double> testBiasGradients_;
     // Set during Context creation; points to the most-recently-created impl.
+    // Non-owning back-pointer: the impl is owned by the Context and clears this
+    // (in ~GluedForceImpl) when destroyed. Reset to nullptr on copy (see the
+    // copy constructor / assignment operator above) so a copied Force never
+    // aliases another's impl.
     mutable GluedForceImpl* impl_ = nullptr;
 };
 

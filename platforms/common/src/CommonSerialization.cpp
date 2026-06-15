@@ -67,9 +67,9 @@ vector<char> CommonCalcGluedForceKernel::getBiasStateBytes() {
  write(&ns, 4);
  write(o.runningMean.data(), D * 8);
  write(o.runningM2.data(), D * 8);
- write(o.kernelCentersCPU.data(), nk * D * 4);
- write(o.kernelSigmasCPU.data(), nk * D * 4);
- write(o.kernelLogWeightsCPU.data(), nk * 4);
+ write(o.kernelCentersCPU.data(), (size_t)nk * D * 8);   // double (M-OPESfloat)
+ write(o.kernelSigmasCPU.data(), (size_t)nk * D * 8);
+ write(o.kernelLogWeightsCPU.data(), (size_t)nk * 8);
  }
  int32_t na = (int32_t)abmdBiases_.size();
  write(&na, 4);
@@ -168,21 +168,39 @@ void CommonCalcGluedForceKernel::setBiasStateBytes(
  const vector<char>& bytes) {
  if (bytes.empty()) return;
  const char* p = bytes.data();
+ const char* const end = bytes.data() + bytes.size();
+ // Bounds-checked reader: every memcpy must fit in the remaining input or the
+ // blob is rejected. (H31)
  auto read = [&](void* dst, size_t n) {
+ if ((size_t)(end - p) < n)
+ throw OpenMMException("GLUED bias-state: truncated/corrupt blob");
  std::memcpy(dst, p, n);
  p += n;
  };
  // Detect versioned header: magic 'GPUS' + int32 version.
  // Legacy blobs (no header) start with int32 numOpesBiases — typically a small
  // non-negative integer whose first byte is never 'G', so detection is safe.
+ // Header autodetection is made unambiguous by requiring the full 8-byte
+ // header (magic + version) to be present before a leading 'GPUS' is treated
+ // as a magic. A legacy headerless blob begins with an int32 OPES count whose
+ // first byte is a small non-negative value (never the ASCII 'G' = 0x47 unless
+ // the count exceeds 0x47000000, far beyond any plausible bias count). (L25)
  const char expected[4] = {'G','P','U','S'};
- if (bytes.size() >= 8 && std::memcmp(p, expected, 4) == 0) {
+ if ((size_t)(end - p) >= 8 && std::memcmp(p, expected, 4) == 0) {
  p += 4; // skip magic
- int32_t version; read(&version, 4); // consume version (reserved for future use)
+ int32_t version; read(&version, 4);
+ // Only version 1 is known; reject anything else. (M-Version)
+ if (version != 1)
+ throw OpenMMException("GLUED bias-state: unknown blob version");
  }
  int32_t nb;
  read(&nb, 4);
- if (nb != (int32_t)opesBiases_.size()) return; // mismatch — ignore
+ // On any count mismatch the saved state came from a different system
+ // configuration; abandoning silently would leave biases half-restored,
+ // so throw naming the category and expected/actual counts. (H-Restore)
+ if (nb != (int32_t)opesBiases_.size())
+ throw OpenMMException("GLUED bias-state: OPES bias count mismatch (expected " +
+ std::to_string(opesBiases_.size()) + ", got " + std::to_string((long long)nb) + ")");
  ContextSelector selector(cc_);
  for (auto& o : opesBiases_) {
  int32_t nk, ns;
@@ -191,14 +209,27 @@ void CommonCalcGluedForceKernel::setBiasStateBytes(
  read(&ns, 4);
  o.nSamples = ns;
  int D = o.numCVsBias;
- read(o.runningMean.data(), D * 8);
- read(o.runningM2.data(), D * 8);
- o.kernelCentersCPU.resize(nk * D);
- o.kernelSigmasCPU.resize(nk * D);
- o.kernelLogWeightsCPU.resize(nk);
- read(o.kernelCentersCPU.data(), nk * D * 4);
- read(o.kernelSigmasCPU.data(), nk * D * 4);
- read(o.kernelLogWeightsCPU.data(), nk * 4);
+ // Validate the kernel count before any resize/read: reject negatives, values
+ // beyond the GPU buffer capacity, and counts whose byte footprint does not
+ // fit in the remaining input. All arithmetic in size_t to avoid 32-bit
+ // overflow. (H32, M-Serial32)
+ if (nk < 0 || nk > o.maxKernels)
+ throw OpenMMException("GLUED bias-state: OPES kernel count out of range");
+ const size_t Dsz = (size_t)D;
+ const size_t nksz = (size_t)nk;
+ // Bytes still needed for this OPES bias: runningMean+runningM2 (D*8 each),
+ // centers+sigmas (nk*D*8 each, double), logWeights (nk*8, double). (M-OPESfloat)
+ const size_t needBytes = Dsz * 8 * 2 + nksz * Dsz * 8 * 2 + nksz * 8;
+ if ((size_t)(end - p) < needBytes)
+ throw OpenMMException("GLUED bias-state: truncated/corrupt blob");
+ read(o.runningMean.data(), Dsz * 8);
+ read(o.runningM2.data(), Dsz * 8);
+ o.kernelCentersCPU.resize(nksz * Dsz);
+ o.kernelSigmasCPU.resize(nksz * Dsz);
+ o.kernelLogWeightsCPU.resize(nksz);
+ read(o.kernelCentersCPU.data(), nksz * Dsz * 8);
+ read(o.kernelSigmasCPU.data(), nksz * Dsz * 8);
+ read(o.kernelLogWeightsCPU.data(), nksz * 8);
  o.numKernels = nk;
  o.numKernelsGPU.upload(vector<int>{nk});
  if (nk > 0) {
@@ -223,43 +254,48 @@ void CommonCalcGluedForceKernel::setBiasStateBytes(
  if (p < bytes.data() + bytes.size()) {
  int32_t na;
  read(&na, 4);
- if (na == (int32_t)abmdBiases_.size()) {
+ if (na != (int32_t)abmdBiases_.size())
+ throw OpenMMException("GLUED bias-state: ABMD bias count mismatch (expected " +
+ std::to_string(abmdBiases_.size()) + ", got " + std::to_string((long long)na) + ")");
  for (auto& a : abmdBiases_) {
- read(a.rhoMinCPU.data(), a.numCVsBias * 8);
+ read(a.rhoMinCPU.data(), (size_t)a.numCVsBias * 8);
  a.rhoMin.upload(a.rhoMinCPU);
- }
  }
  }
  // MetaD grid state (may be absent in states saved before )
  if (p < bytes.data() + bytes.size()) {
  int32_t nm;
  read(&nm, 4);
- if (nm == (int32_t)metaDGridBiases_.size()) {
+ if (nm != (int32_t)metaDGridBiases_.size())
+ throw OpenMMException("GLUED bias-state: MetaD bias count mismatch (expected " +
+ std::to_string(metaDGridBiases_.size()) + ", got " + std::to_string((long long)nm) + ")");
  for (auto& m : metaDGridBiases_) {
  int32_t nd;
  read(&nd, 4);
  m.numDeposited = nd;
- read(m.gridCPU.data(), m.totalGridPoints * 8);
+ read(m.gridCPU.data(), (size_t)m.totalGridPoints * 8);
  m.grid.upload(m.gridCPU);
- }
  }
  }
  // PBMetaD grid state (may be absent in states saved before )
  if (p < bytes.data() + bytes.size()) {
  int32_t npb;
  read(&npb, 4);
- if (npb == (int32_t)pbmetaDGridBiases_.size()) {
+ if (npb != (int32_t)pbmetaDGridBiases_.size())
+ throw OpenMMException("GLUED bias-state: PBMetaD bias count mismatch (expected " +
+ std::to_string(pbmetaDGridBiases_.size()) + ", got " + std::to_string((long long)npb) + ")");
  for (auto& pb : pbmetaDGridBiases_) {
  int32_t nsub;
  read(&nsub, 4);
- if (nsub != (int32_t)pb.subGrids.size()) continue;
+ if (nsub != (int32_t)pb.subGrids.size())
+ throw OpenMMException("GLUED bias-state: PBMetaD sub-grid count mismatch (expected " +
+ std::to_string(pb.subGrids.size()) + ", got " + std::to_string((long long)nsub) + ")");
  for (auto& m : pb.subGrids) {
  int32_t nd;
  read(&nd, 4);
  m.numDeposited = nd;
- read(m.gridCPU.data(), m.totalGridPoints * 8);
+ read(m.gridCPU.data(), (size_t)m.totalGridPoints * 8);
  m.grid.upload(m.gridCPU);
- }
  }
  }
  }
@@ -278,7 +314,9 @@ void CommonCalcGluedForceKernel::setBiasStateBytes(
  // OPES_EXPANDED logZ and numUpdates
  if (p < bytes.data() + bytes.size()) {
  int32_t noe; read(&noe, 4);
- if (noe == (int32_t)opesExpandedBiases_.size()) {
+ if (noe != (int32_t)opesExpandedBiases_.size())
+ throw OpenMMException("GLUED bias-state: OPES_EXPANDED bias count mismatch (expected " +
+ std::to_string(opesExpandedBiases_.size()) + ", got " + std::to_string((long long)noe) + ")");
  for (auto& oe : opesExpandedBiases_) {
  read(&oe.logZCPU, 8);
  int32_t nu; read(&nu, 4);
@@ -286,40 +324,41 @@ void CommonCalcGluedForceKernel::setBiasStateBytes(
  oe.numUpdatesGPU.upload(vector<int>{(int)nu});
  }
  }
- }
  // Extended Lagrangian: s and p state
  if (p < bytes.data() + bytes.size()) {
  int32_t nel; read(&nel, 4);
- if (nel == (int32_t)extLagBiases_.size()) {
+ if (nel != (int32_t)extLagBiases_.size())
+ throw OpenMMException("GLUED bias-state: extended-Lagrangian bias count mismatch (expected " +
+ std::to_string(extLagBiases_.size()) + ", got " + std::to_string((long long)nel) + ")");
  for (auto& el : extLagBiases_) {
  int D = (int)el.cvIndices.size();
- read(el.s.data(), D * 8);
- read(el.p.data(), D * 8);
+ read(el.s.data(), (size_t)D * 8);
+ read(el.p.data(), (size_t)D * 8);
  el.initialized = true;
  el.sGPUArr.upload(el.s);
  el.pGPUArr.upload(el.p);
  }
  }
- }
  // EDS White-Voth state: lambda, mean, ssd, accum, count
  if (p < bytes.data() + bytes.size()) {
  int32_t neds; read(&neds, 4);
- if (neds == (int32_t)edsBiases_.size()) {
+ if (neds != (int32_t)edsBiases_.size())
+ throw OpenMMException("GLUED bias-state: EDS bias count mismatch (expected " +
+ std::to_string(edsBiases_.size()) + ", got " + std::to_string((long long)neds) + ")");
  for (auto& eds : edsBiases_) {
  int D = (int)eds.cvIndices.size();
  vector<double> mean(D), ssd(D), accum(D);
  vector<int> cnt(D);
- read(eds.lambda.data(), D * 8);
- read(mean.data(), D * 8);
- read(ssd.data(), D * 8);
- read(accum.data(), D * 8);
+ read(eds.lambda.data(), (size_t)D * 8);
+ read(mean.data(), (size_t)D * 8);
+ read(ssd.data(), (size_t)D * 8);
+ read(accum.data(), (size_t)D * 8);
  for (int k = 0; k < D; k++) { int32_t c; read(&c, 4); cnt[k] = c; }
  eds.lambdaGPU.upload(eds.lambda);
  eds.meanGPU.upload(mean);
  eds.ssdGPU.upload(ssd);
  eds.accumGPU.upload(accum);
  eds.countGPU.upload(cnt);
- }
  }
  }
  // MaxEnt: lambda state

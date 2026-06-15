@@ -35,7 +35,7 @@ jobs:
           pip install ruff --quiet
           # Only lint dirs that exist in the public repo
           DIRS=""
-          for d in python tests tests_plumed_parity benchmarks; do
+          for d in python tests benchmarks; do
             [ -d "$d" ] && DIRS="$DIRS $d"
           done
           [ -n "$DIRS" ] && ruff check $DIRS

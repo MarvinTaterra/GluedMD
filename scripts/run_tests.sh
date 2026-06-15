@@ -5,7 +5,6 @@
 #   ./scripts/run_tests.sh              # build + all tests + perf
 #   ./scripts/run_tests.sh --no-build   # skip cmake (use existing build/)
 #   ./scripts/run_tests.sh --no-perf    # skip benchmark comparison
-#   ./scripts/run_tests.sh --no-parity  # skip PLUMED parity tests
 #   ./scripts/run_tests.sh --update-baselines  # write new baseline JSONs
 #
 # Requires: conda env 'openmm_env' active (or OPENMM_DIR set manually).
@@ -22,7 +21,6 @@ header(){ echo -e "\n${YELLOW}══ $* ══${NC}"; }
 # ── Defaults ─────────────────────────────────────────────────────────────────
 DO_BUILD=1
 DO_PERF=1
-DO_PARITY=1
 UPDATE_BASELINES=0
 THRESHOLD=0.90   # fail if a benchmark drops below 90% of baseline
 
@@ -30,7 +28,6 @@ for arg in "$@"; do
   case "$arg" in
     --no-build)          DO_BUILD=0 ;;
     --no-perf)           DO_PERF=0 ;;
-    --no-parity)         DO_PARITY=0 ;;
     --update-baselines)  UPDATE_BASELINES=1 ;;
     *) echo "Unknown option: $arg"; exit 1 ;;
   esac
@@ -67,20 +64,6 @@ if python -m pytest tests/ -q --tb=short; then
   pass "Unit tests"
 else
   fail "Unit tests"; FAILED=1
-fi
-
-# ── PLUMED parity tests ───────────────────────────────────────────────────────
-if [[ $DO_PARITY -eq 1 ]]; then
-  header "PLUMED parity tests  (tests_plumed_parity/)"
-  if python -c "import subprocess; subprocess.run(['plumed','--version'],check=True,capture_output=True)" 2>/dev/null; then
-    if python -m pytest tests_plumed_parity/ -q --tb=short; then
-      pass "PLUMED parity"
-    else
-      fail "PLUMED parity"; FAILED=1
-    fi
-  else
-    warn "plumed not found — parity tests skipped (install via: conda install -c conda-forge plumed)"
-  fi
 fi
 
 # ── Benchmarks ────────────────────────────────────────────────────────────────

@@ -4,16 +4,19 @@ include(${SWIG_USE_FILE})
 # Locate Python includes via python3-config
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development NumPy)
 
-set_property(SOURCE gluedplugin.i PROPERTY CPLUSPLUS ON)
-set_property(SOURCE gluedplugin.i PROPERTY SWIG_FLAGS
-    "-I${OPENMM_DIR}/include")
+# Substitute @GLUED_VERSION@ (etc.) before SWIG sees the interface file.
+configure_file(gluedplugin.i
+    "${CMAKE_CURRENT_BINARY_DIR}/gluedplugin_configured.i" @ONLY)
 
-configure_file(gluedplugin.i gluedplugin_configured.i @ONLY)
+set(GLUED_SWIG_IFACE "${CMAKE_CURRENT_BINARY_DIR}/gluedplugin_configured.i")
+set_property(SOURCE "${GLUED_SWIG_IFACE}" PROPERTY CPLUSPLUS ON)
+set_property(SOURCE "${GLUED_SWIG_IFACE}" PROPERTY SWIG_FLAGS
+    "-I${OPENMM_DIR}/include")
 
 swig_add_library(gluedplugin
     TYPE MODULE
     LANGUAGE python
-    SOURCES gluedplugin.i
+    SOURCES "${GLUED_SWIG_IFACE}"
 )
 
 swig_link_libraries(gluedplugin

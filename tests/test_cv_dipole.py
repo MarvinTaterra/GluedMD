@@ -27,11 +27,15 @@ def get_cuda_platform():
 
 
 def _dipole(positions, atoms, charges):
-    """Reference dipole vector."""
+    """Reference dipole vector (PLUMED-style: subtract the group's mean charge so a
+    non-neutral group's dipole is taken about its center / is gauge-independent)."""
+    n = len(charges)
+    ctot = (sum(charges) / n) if n else 0.0
     mu = [0.0, 0.0, 0.0]
     for a, q in zip(atoms, charges):
+        qe = q - ctot
         for k in range(3):
-            mu[k] += q * positions[a][k]
+            mu[k] += qe * positions[a][k]
     return mu
 
 
@@ -100,14 +104,16 @@ def test_dipole_force_component(platform):
     positions = [[0.3, 0.2, 0.1], [0.1, 0.4, 0.5]] + [[0.0]*3]*2
     charges = [2.0, -1.0]
     unit = mm.unit.kilojoules_per_mole / mm.unit.nanometer
-    # component=0 (x): dCV/dr_a_x = q_a, so F_a_x = -q_a
+    # component=0 (x): dCV/dr_a_x = (q_a - ctot) after neutralization, so F_a_x = -(q_a - ctot)
+    ctot = sum(charges) / len(charges)
+    qeff = [q - ctot for q in charges]
     ctx, f = _make_ctx(positions, [0, 1], charges, comp=0, platform=platform)
     state = ctx.getState(getForces=True)
     raw = state.getForces(asNumpy=False)
     fx0 = raw[0][0].value_in_unit(unit)
     fx1 = raw[1][0].value_in_unit(unit)
-    assert abs(fx0 - (-charges[0])) < TOL_F, f"F_a0_x: expected {-charges[0]}, got {fx0}"
-    assert abs(fx1 - (-charges[1])) < TOL_F, f"F_a1_x: expected {-charges[1]}, got {fx1}"
+    assert abs(fx0 - (-qeff[0])) < TOL_F, f"F_a0_x: expected {-qeff[0]}, got {fx0}"
+    assert abs(fx1 - (-qeff[1])) < TOL_F, f"F_a1_x: expected {-qeff[1]}, got {fx1}"
     # y and z forces should be zero for x-component CV
     fy0 = raw[0][1].value_in_unit(unit)
     assert abs(fy0) < TOL_F, f"F_a0_y should be 0, got {fy0}"

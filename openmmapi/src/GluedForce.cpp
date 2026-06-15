@@ -11,8 +11,46 @@ using namespace std;
 GluedForce::GluedForce() {}
 GluedForce::~GluedForce() {}
 
+// L24: copy all CV/bias/config state but never alias the per-Context impl
+// back-pointer. A copied Force is "not yet bound to a Context".
+GluedForce::GluedForce(const GluedForce& other)
+    : Force(other),
+      cvs_(other.cvs_),
+      numCVValues_(other.numCVValues_),
+      biases_(other.biases_),
+      temperature_(other.temperature_),
+      usesPBC_(other.usesPBC_),
+      testForceMode_(other.testForceMode_),
+      testForceScale_(other.testForceScale_),
+      testBiasGradients_(other.testBiasGradients_),
+      impl_(nullptr) {}
+
+GluedForce& GluedForce::operator=(const GluedForce& other) {
+    if (this == &other)
+        return *this;
+    Force::operator=(other);
+    cvs_              = other.cvs_;
+    numCVValues_     = other.numCVValues_;
+    biases_          = other.biases_;
+    temperature_     = other.temperature_;
+    usesPBC_         = other.usesPBC_;
+    testForceMode_   = other.testForceMode_;
+    testForceScale_  = other.testForceScale_;
+    testBiasGradients_ = other.testBiasGradients_;
+    impl_            = nullptr;  // do not alias other's per-Context impl
+    return *this;
+}
+
 int GluedForce::addCollectiveVariable(int type, const vector<int>& atoms,
                                            const vector<double>& parameters) {
+    // Cheap structural validation. Full atom/param validation (which requires the
+    // System) is performed in the common kernel layer at initialize() time.
+    if (type < 0) {
+        std::stringstream ss;
+        ss << "GluedForce::addCollectiveVariable: invalid CV type " << type
+           << " (must be >= 0)";
+        throw OpenMMException(ss.str());
+    }
     int firstIdx = numCVValues_;
     numCVValues_ += (type == CV_PATH) ? 2 : 1;
     CV cv;
@@ -44,6 +82,21 @@ void GluedForce::getCollectiveVariableInfo(int idx, int& type,
 int GluedForce::addBias(int type, const vector<int>& cvIndices,
                              const vector<double>& parameters,
                              const vector<int>& integerParameters) {
+    // Validate that every referenced CV value index is in range. cvIndices refer
+    // to CV *value* slots (0 .. getNumCollectiveVariables()-1), so they must be
+    // bounded by numCVValues_ — not by the number of addCollectiveVariable calls.
+    const int numCVs = getNumCollectiveVariables();
+    const int biasIdx = static_cast<int>(biases_.size());
+    for (size_t i = 0; i < cvIndices.size(); i++) {
+        int cvIndex = cvIndices[i];
+        if (cvIndex < 0 || cvIndex >= numCVs) {
+            std::stringstream ss;
+            ss << "GluedForce::addBias: bias " << biasIdx << " (type " << type
+               << ") references CV value index " << cvIndex
+               << ", which is out of range [0, " << numCVs << ")";
+            throw OpenMMException(ss.str());
+        }
+    }
     Bias bias;
     bias.type = type;
     bias.cvIndices = cvIndices;

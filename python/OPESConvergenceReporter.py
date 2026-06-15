@@ -125,6 +125,7 @@ class OPESConvergenceReporter:
         self._converged = False
         self._done = False
         self._converged_at_step = None
+        self._last_reported_step = None   # guards against double-reporting one step
 
     # ------------------------------------------------------------------
     # Public API
@@ -161,7 +162,16 @@ class OPESConvergenceReporter:
                 f"{simulation.currentStep}; running {self._post_steps:,} more steps.")
 
     def run(self, simulation, max_steps):
-        """Attach, run in check_interval batches, then detach."""
+        """Attach, run in check_interval batches, then detach.
+
+        If the reporter is already attached to ``simulation.reporters`` we do
+        NOT attach a second copy: OpenMM drives one ``report()`` per stride via
+        ``describeNextReport`` already, and our own batched ``simulation.step``
+        loop would otherwise interleave with it.  Combined with the
+        per-step guard in ``report()`` (``_last_reported_step``), this prevents
+        the convergence state machine from advancing twice for the same step
+        when ``check_interval`` and the batch boundaries are misaligned.
+        """
         was_attached = self in simulation.reporters
         if not was_attached:
             simulation.reporters.append(self)
@@ -184,8 +194,17 @@ class OPESConvergenceReporter:
         return (steps, False, False, False, False)
 
     def report(self, simulation, state):
-        self._open()
         step = simulation.currentStep
+        # Guard against double-reporting the same step. This can happen when
+        # the reporter is already attached AND run() re-drives the loop, or when
+        # check_interval and the step batches misalign so two reports land on
+        # the same step. Advancing the convergence state machine twice for one
+        # step would corrupt _consecutive_passes / _prev_signal.
+        if self._last_reported_step == step:
+            return
+        self._last_reported_step = step
+
+        self._open()
         metrics = self._force.getOPESMetrics(simulation.context, self._bias_idx)
         zed, rct, nker, neff = metrics
 
