@@ -517,11 +517,13 @@ void CommonCalcGluedForceKernel::setupBiases(const GluedForce& force) {
  o.cvIdxGPU.upload(vector<int>(cvIndices.begin(), cvIndices.end()));
 
  int D = o.numCVsBias;
- o.kernelCenters.initialize<float>(cc_, o.maxKernels * D,
+ // double storage for the OPES kernel table (centers/sigmas/logWeights) — float drifts
+ // visibly over millions of steps and broke OPES energy agreement at ~1e-4. (M-OPESfloat)
+ o.kernelCenters.initialize<double>(cc_, o.maxKernels * D,
  "opesBias_centers_" + to_string(bIdx));
- o.kernelSigmas.initialize<float>(cc_, o.maxKernels * D,
+ o.kernelSigmas.initialize<double>(cc_, o.maxKernels * D,
  "opesBias_sigmas_" + to_string(bIdx));
- o.kernelLogWeights.initialize<float>(cc_, o.maxKernels,
+ o.kernelLogWeights.initialize<double>(cc_, o.maxKernels,
  "opesBias_logW_" + to_string(bIdx));
 
  // GPU-resident Welford state and logZ
