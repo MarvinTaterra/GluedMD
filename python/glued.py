@@ -709,10 +709,14 @@ class Force(_gp.GluedForce):
         -----
         * Requires the **CUDA or OpenCL** platform (the Reference platform has no
           device-resident inner context).
-        * The inner context omits constraints and virtual sites. Constraints do not
-          contribute to U/F, so constrained systems (e.g. H-bond-constrained, rigid
-          3-site water) are fine; **virtual-site systems are not yet supported** —
-          validate on vsite-free systems.
+        * The inner context omits constraints and virtual sites — both are handled
+          correctly without copying them. Constraints contribute no potential energy or
+          force, so constrained systems (H-bond constraints, rigid water) are fine.
+          **Virtual-site water/force fields are fully supported** (OPC, TIP4P-Ew,
+          TIP4P-D, TIP5P, a99SB-disp): the bias force on a virtual site is redistributed
+          to its parent atoms by the outer context's normal virtual-site machinery, after
+          the chain-rule scatter — validated in ``tests/test_cv_energy_vsite.py``. (This
+          assumes a standard integrator that recomputes virtual-site positions each step.)
         """
         return self.addCollectiveVariable(_gp.GluedForce.CV_ENERGY, [], [])
 
