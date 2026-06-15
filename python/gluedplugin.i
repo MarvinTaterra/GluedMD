@@ -56,7 +56,8 @@ public:
         CV_CELL                = 19,
         CV_SECONDARY_STRUCTURE = 20,
         CV_PCA                 = 21,
-        CV_ERMSD               = 22
+        CV_ERMSD               = 22,
+        CV_ENERGY              = 23
     };
 
     enum BiasType {
@@ -73,7 +74,8 @@ public:
         BIAS_OPES_EXPANDED    = 11,
         BIAS_EXT_LAGRANGIAN   = 12,
         BIAS_MAXENT           = 13,
-        BIAS_EDS              = 14
+        BIAS_EDS              = 14,
+        BIAS_OPES_MULTITHERMAL = 15
     };
 
     GluedForce();
