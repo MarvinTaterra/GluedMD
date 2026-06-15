@@ -8,6 +8,8 @@
 #include "lepton/ParsedExpression.h"
 #include <cmath>
 #include <cstring>
+#include <map>
+#include <string>
 
 #ifdef GLUED_HAS_TORCH
 #pragma GCC diagnostic push
@@ -25,27 +27,23 @@ using namespace OpenMM;
 using namespace std;
 
 // ---------------------------------------------------------------------------
-// atomicAdd portability shim
+// atomicAdd portability shim.
 //
-// CUDA exposes atomicAdd() as a built-in for int / long long / float and (on
-// sm_60+) double. OpenCL doesn't expose any function called atomicAdd. The
-// kernel source below uses the CUDA spelling everywhere; this shim makes the
-// same source compile under OpenCL by mapping atomicAdd onto atom_add (for
-// int / unsigned long) and a CAS loop on the bit pattern (for double).
-//
-// Prepended to every kernel that performs atomic accumulation:
-//   - kGeometryFunctions (covers test/distance/angle/dihedral/COM/Rg/path/RMSD/...
-//     coordination/DRMSD/contact map/plane/projection — all geometry-CV kernels)
-//   - kScatterKernelSrc  (chain-rule force scatter)
-//   - kOPESKernelSrc     (OPES kernel-table slot counters)
-//   - kMetaDKernelSrc    (well-tempered METAD grid deposition — uses double)
-//
-// Requires cl_khr_int64_extended_atomics for the double overload's
-// atom_cmpxchg on unsigned long. Supported by NVIDIA OpenCL on every sm_50+
-// GPU; check device capabilities if porting to a non-NVIDIA OpenCL runtime.
+// CUDA exposes atomicAdd() as a built-in for int / unsigned long long / float and
+// (sm_60+) double. OpenCL has no symbol called atomicAdd. The kernel sources below
+// use the CUDA spelling; this shim maps it onto atom_add (int / unsigned long) and a
+// cmpxchg loop on the bit pattern (double) so the SAME source compiles under OpenCL.
+// The double overload needs 64-bit base atomics; we enable the extension explicitly
+// (OpenMM's common.cl also enables it conditionally, but enabling here is harmless and
+// makes the cmpxchg path self-contained). Prepended to every kernel that performs
+// atomic accumulation: geometry CVs, the chain-rule scatter, OPES slot counters, and
+// the (double) METAD grid deposit. On CUDA the whole block is #ifdef'd out (atomicAdd
+// is a built-in there), so NVRTC never sees it.
 // ---------------------------------------------------------------------------
 extern const string kAtomicAddShim = R"(
 #ifdef __OPENCL_VERSION__
+#pragma OPENCL EXTENSION cl_khr_int64_base_atomics : enable
+#pragma OPENCL EXTENSION cl_khr_int64_extended_atomics : enable
 inline int __attribute__((overloadable))
 atomicAdd(volatile __global int* p, int val) {
     return atomic_add(p, val);
@@ -392,8 +390,11 @@ KERNEL void cvDihedral(
  // Blondel-Karplus Jacobian
  real invT2 = (t2 > (real)1e-10) ? ((real)1.0/t2) : (real)0.0;
  real invU2 = (u2 > (real)1e-10) ? ((real)1.0/u2) : (real)0.0;
- real c1 = (b1.x*b2.x + b1.y*b2.y + b1.z*b2.z) / d; // b1·b2 / d
- real c2 = (b3.x*b2.x + b3.y*b2.y + b3.z*b2.z) / d; // b3·b2 / d
+ // Guard 1/|b2|: a zero-length central bond (B==C) would otherwise make c1/c2 NaN
+ // and poison the Jacobian. With invD=0 the gradient degenerates to ~0 (no NaN).
+ real invD = (d > (real)1e-10) ? ((real)1.0/d) : (real)0.0;
+ real c1 = (b1.x*b2.x + b1.y*b2.y + b1.z*b2.z) * invD; // b1·b2 / d
+ real c2 = (b3.x*b2.x + b3.y*b2.y + b3.z*b2.z) * invD; // b3·b2 / d
 
  real aT = d * invT2;
  real aU = d * invU2;
@@ -1040,33 +1041,33 @@ KERNEL void cvCoordination(
 // extractPos: gather atom positions from posq (real4) into a flat float[N*3] buffer for torch.
 // deinterleavGrad: scatter interleaved float[N*3] torch gradient into separate XYZ Jacobian arrays.
 extern const string kPyTorchKernelSrc = R"(
-__kernel void pytorchExtractPos(
- __global const real4* posq,
- __global const int* atomIdx,
- __global float* posBuf,
+KERNEL void pytorchExtractPos(
+ GLOBAL const real4* RESTRICT posq,
+ GLOBAL const int* RESTRICT atomIdx,
+ GLOBAL float* RESTRICT posBuf,
  int numAtoms)
 {
- int i = get_global_id(0);
- if (i >= numAtoms) return;
+ for (int i = GLOBAL_ID; i < numAtoms; i += GLOBAL_SIZE) {
  real4 p = posq[atomIdx[i]];
  posBuf[3*i] = (float)p.x;
  posBuf[3*i+1] = (float)p.y;
  posBuf[3*i+2] = (float)p.z;
+ }
 }
 
-__kernel void pytorchDeinterleavGrad(
- __global const float* gradBuf,
- __global float* jacX,
- __global float* jacY,
- __global float* jacZ,
+KERNEL void pytorchDeinterleavGrad(
+ GLOBAL const float* RESTRICT gradBuf,
+ GLOBAL float* RESTRICT jacX,
+ GLOBAL float* RESTRICT jacY,
+ GLOBAL float* RESTRICT jacZ,
  int jacOffset,
  int numAtoms)
 {
- int i = get_global_id(0);
- if (i >= numAtoms) return;
+ for (int i = GLOBAL_ID; i < numAtoms; i += GLOBAL_SIZE) {
  jacX[jacOffset + i] = gradBuf[3*i];
  jacY[jacOffset + i] = gradBuf[3*i+1];
  jacZ[jacOffset + i] = gradBuf[3*i+2];
+ }
 }
 )";
 
@@ -1516,15 +1517,22 @@ KERNEL void cvVolumeCell(
  for (int i = 0; i < numVolumeCVs; i++)
  cvValues[volumeFirstCVIndex + i] = (double)vol;
 
+ // a = boxVecX, b = boxVecY, c = boxVecZ
+ real la = sqrt(boxVecX.x*boxVecX.x + boxVecX.y*boxVecX.y + boxVecX.z*boxVecX.z);
+ real lb = sqrt(boxVecY.x*boxVecY.x + boxVecY.y*boxVecY.y + boxVecY.z*boxVecY.z);
+ real lc = sqrt(boxVecZ.x*boxVecZ.x + boxVecZ.y*boxVecZ.y + boxVecZ.z*boxVecZ.z);
+ real bc = boxVecY.x*boxVecZ.x + boxVecY.y*boxVecZ.y + boxVecY.z*boxVecZ.z;
+ real ac = boxVecX.x*boxVecZ.x + boxVecX.y*boxVecZ.y + boxVecX.z*boxVecZ.z;
+ real ab = boxVecX.x*boxVecY.x + boxVecX.y*boxVecY.y + boxVecX.z*boxVecY.z;
  for (int i = 0; i < numCellCVs; i++) {
  int comp = cellComponents[i];
  real val;
- if (comp == 0)
- val = boxVecX.x;
- else if (comp == 1)
- val = sqrt(boxVecY.x*boxVecY.x + boxVecY.y*boxVecY.y);
- else
- val = sqrt(boxVecZ.x*boxVecZ.x + boxVecZ.y*boxVecZ.y + boxVecZ.z*boxVecZ.z);
+ if (comp == 0) val = la; // |a|
+ else if (comp == 1) val = lb; // |b|
+ else if (comp == 2) val = lc; // |c|
+ else if (comp == 3) val = acos(bc / (lb*lc)); // alpha = angle(b,c)
+ else if (comp == 4) val = acos(ac / (la*lc)); // beta = angle(a,c)
+ else val = acos(ab / (la*lb)); // gamma = angle(a,b)
  cvValues[cellFirstCVIndex + i] = (double)val;
  }
 }
@@ -2460,15 +2468,20 @@ KERNEL void harmonicEvalBias(
  int numCVsBias,
  GLOBAL double* RESTRICT cvBiasGradients,
  GLOBAL double* RESTRICT biasEnergies,
- int biasIdx
+ int biasIdx,
+ int periodic
 ) {
  if (GLOBAL_ID != 0) return;
+ const double TWO_PI = 6.283185307179586;
  double V = 0.0;
  for (int d = 0; d < numCVsBias; d++) {
  double s = cvValues[cvIdxList[d]];
  double k = (double)params[2*d];
  double s0 = (double)params[2*d + 1];
  double ds = s - s0;
+ // Periodic CV (e.g. a dihedral at the +/-pi seam): fold the difference into the
+ // nearest image so the restraint pulls the short way around. (C9 / H-Periodic)
+ if (periodic != 0) ds -= TWO_PI * round(ds / TWO_PI);
  V += 0.5 * k * ds * ds;
  cvBiasGradients[cvIdxList[d]] += k * ds;
  }
@@ -2644,8 +2657,12 @@ KERNEL void opesEvalBias(
  double pz = (sum_uprob > 0.0) ? prob_unnorm * (double)numKernels / sum_uprob : 0.0;
  if (!(pz >= 0.0)) pz = 0.0;                    // guard NaN / negative
 
+ // Floor the log argument so the uniform variant (eps==0) cannot emit -inf when the CV
+ // leaves every kernel cutoff (pz==0 -> Varg==0 -> log(0)). A finite floor yields a finite,
+ // bounded "far from all kernels" bias instead of poisoning the energy with -inf/NaN.
  double Varg = pz + eps;
- biasEnergies[biasIdx] = invGammaFactor * kT * ((Varg > 0.0) ? log(Varg) : log(eps));
+ double logArg = (Varg > (double)1e-30) ? Varg : (double)1e-30;
+ biasEnergies[biasIdx] = invGammaFactor * kT * log(logArg);
 
  // dV/ds_d = invGF·kT · pz/(pz+ε) / prob_unnorm · dAccum[d]
  if (prob_unnorm > 0.0) {
@@ -2768,8 +2785,12 @@ KERNEL void opesGatherDeposit(
    // We multiply on every read instead of one-and-permanent: the difference
    // is < 5% in σ for typical runs (biased-phase Welford increments are
    // already γ-broader, so over-scaling is partial and bounded).
+   // Adaptive-sigma variance: PLUMED uses sigma = sqrt(av_M2 / counter / factor) with
+   // factor = biasfactor(gamma) for METAD and 1 for EXPLORE — i.e. it DIVIDES the variance
+   // by gamma. The previous code multiplied by gamma, making METAD kernels ~sqrt(gamma) too
+   // broad. EXPLORE (variant 2, factor=1) is unchanged. (H-OPESsigma)
    double factor = (variant == 2) ? 1.0 : gammaArg;
-   double var = (n > 1) ? runningM2[d] * factor / (double)(n - 1) : 0.0;
+   double var = (n > 1) ? runningM2[d] / factor / (double)(n - 1) : 0.0;
    sig = (var > 0.0) ? sqrt(var) : 1.0;
    if (sig < sigmaMin) sig = sigmaMin;
   } else {
@@ -3722,6 +3743,60 @@ void CommonCalcGluedForceKernel::buildPlan(const System& system,
  pcaRefPosData_.clear();
  pcaEigvecData_.clear();
 
+ // ---- Validation pass: fail loudly instead of out-of-bounds host/GPU reads ----
+ // Checks atom-index ranges, per-kind minimum atom/param counts, fixed-size kernel
+ // limits (path frames, eRMSD residues, etc.), unknown CV types, and that CVs of the
+ // same kind occupy a contiguous run of value slots (the per-kind kernels index as
+ // firstCVIndex + i, so interleaving kinds would corrupt the slot mapping).
+ {
+ int numParticles = system.getNumParticles();
+ std::map<int,int> kindFirst, kindCount; // value-slot contiguity per kind
+ int vIdx = 0;
+ for (int i = 0; i < numSpecs; i++) {
+ int cvType; vector<int> atoms; vector<double> params;
+ force.getCollectiveVariableInfo(i, cvType, atoms, params);
+ auto err = [&](const string& m){ throw OpenMMException("GluedForce CV " + std::to_string(i) + ": " + m); };
+ auto needA = [&](int n){ if ((int)atoms.size() < n) err("expected >= " + std::to_string(n) + " atoms, got " + std::to_string(atoms.size())); };
+ auto needP = [&](int n){ if ((int)params.size() < n) err("expected >= " + std::to_string(n) + " parameters, got " + std::to_string(params.size())); };
+ for (int a : atoms) if (a < 0 || a >= numParticles) err("atom index " + std::to_string(a) + " out of range [0," + std::to_string(numParticles) + ")");
+ int nValues = 1;
+ bool enforceContig = true;
+ switch (cvType) {
+ case GluedForce::CV_DISTANCE: needA(2); break;
+ case GluedForce::CV_ANGLE: needA(3); break;
+ case GluedForce::CV_DIHEDRAL: needA(4); break;
+ case GluedForce::CV_COM_DISTANCE: needA(1); needP(1); break;
+ case GluedForce::CV_GYRATION: needA(1); break;
+ case GluedForce::CV_COORDINATION: needA(2); needP(3);
+ if (atoms[0] < 1 || atoms[0] >= (int)atoms.size()) err("coordination group-A size atoms[0]=" + std::to_string(atoms[0]) + " invalid"); break;
+ case GluedForce::CV_RMSD: needA(1); needP(3*(int)atoms.size()); break;
+ case GluedForce::CV_PATH: { needP(2); int N=(int)params[1]; if (N < 2) err("path needs >= 2 frames"); if (N > 128) err("path frame count " + std::to_string(N) + " exceeds MAX_PATH_FRAMES=128"); needP(2 + N*3*(int)atoms.size()); nValues = 2; } break;
+ case GluedForce::CV_POSITION: needA(1); needP(1); break;
+ case GluedForce::CV_DRMSD: needA(2); needP((int)atoms.size()/2); break;
+ case GluedForce::CV_CONTACTMAP: needA(2); needP(4*((int)atoms.size()/2)); break;
+ case GluedForce::CV_PLANE: needA(3); needP(1); break;
+ case GluedForce::CV_PROJECTION: needA(2); needP(3); break;
+ case GluedForce::CV_VOLUME: break;
+ case GluedForce::CV_CELL: needP(1); break;
+ case GluedForce::CV_DIPOLE: needA(1); needP((int)atoms.size()+1); break;
+ case GluedForce::CV_PCA: needA(1); needP(6*(int)atoms.size()); break;
+ case GluedForce::CV_SECONDARY_STRUCTURE: needA(5); needP(2); break;
+ case GluedForce::CV_PUCKERING: needA(5); needP(2); break;
+ case GluedForce::CV_ERMSD: { needP(1); int N=(int)(params[0]+0.5); if (N < 1) err("eRMSD needs >= 1 residue"); if (N > 64) err("eRMSD residue count " + std::to_string(N) + " exceeds kernel limit 64"); needA(3*N); needP(2 + 4*N*(N-1)); } break;
+ case GluedForce::CV_EXPRESSION: enforceContig = false; break; // stores its own output index
+ case GluedForce::CV_PYTORCH: enforceContig = false; break; // stores its own output index
+ default: err("unknown CV type " + std::to_string(cvType));
+ }
+ if (enforceContig) {
+ if (kindFirst.find(cvType) == kindFirst.end()) kindFirst[cvType] = vIdx;
+ else if (kindFirst[cvType] + kindCount[cvType] != vIdx)
+ err("CVs of the same kind must be added contiguously (interleaving CV kinds is unsupported)");
+ kindCount[cvType] += nValues;
+ }
+ vIdx += nValues;
+ }
+ }
+
  int cvValueIdx = 0; // running CV value index (2 per PATH, 1 per others)
  for (int i = 0; i < numSpecs; i++) {
  int cvType;
@@ -3773,8 +3848,15 @@ void CommonCalcGluedForceKernel::buildPlan(const System& system,
  } else if (cvType == GluedForce::CV_GYRATION) {
  if (plan_.numGyrationCVs == 0) plan_.gyrationFirstCVIndex = cvValueIdx;
  gyrationNAtoms_.push_back((int)atoms.size());
- for (int a : atoms) gyrationUserAtoms_.push_back(a);
- for (double m : params) gyrationMassData_.push_back((float)m);
+ // Masses come from the System (one per atom), matching the COM-distance fix:
+ // the Python layer cannot supply masses, so reading them from `params` left
+ // gyrationMassData_ empty (size mismatch -> CUDA "Error uploading array" /
+ // garbage totalMass -> NaN Rg). One entry per atom keeps the upload sized to
+ // gyrationUserAtoms_.size().
+ for (int a : atoms) {
+ gyrationUserAtoms_.push_back(a);
+ gyrationMassData_.push_back((float)system.getParticleMass(a));
+ }
  plan_.numGyrationCVs++;
  cvValueIdx += 1;
  } else if (cvType == GluedForce::CV_COORDINATION) {
@@ -3894,7 +3976,14 @@ void CommonCalcGluedForceKernel::buildPlan(const System& system,
  int N = (int)atoms.size();
  dipoleNAtoms_.push_back(N);
  for (int a : atoms) dipoleUserAtoms_.push_back(a);
- for (int j = 0; j < N; j++) dipoleChargeData_.push_back((float)params[j]);
+ // PLUMED-style charge neutralization: subtract the group-mean charge so the dipole of
+ // a non-neutral group is taken about its center (gauge/origin-independent). For a neutral
+ // group (Sum q = 0) this is a no-op. The neutralized charges feed both the value and the
+ // Jacobian (the kernel just reads charges[]).
+ double qsum = 0.0;
+ for (int j = 0; j < N; j++) qsum += params[j];
+ double ctot = (N > 0) ? qsum / (double)N : 0.0;
+ for (int j = 0; j < N; j++) dipoleChargeData_.push_back((float)(params[j] - ctot));
  dipoleComponentData_.push_back((int)params[N]);
  plan_.numDipoleCVs++;
  cvValueIdx += 1;
@@ -4288,7 +4377,10 @@ void CommonCalcGluedForceKernel::buildPlan(const System& system,
  winOff[c] = cursor;
  int subtype = (int)secStrParamData_[2*c];
  int N = secStrNAtoms_[c];
- cursor += (subtype == 0) ? (N - 5) : (N / 6);
+ // MUST match the kernel's numWindows and the Jacobian sizing (secStrTotalWindows):
+ // alpha = N/5 - 5 windows, beta = N/30. Using (N-5)/(N/6) here over-counted the
+ // per-CV base offset ~5x and overran the Jacobian arrays for >1 SS CV.
+ cursor += (subtype == 0) ? (N/5 - 5) : (N / 30);
  }
  winOff[numSsCVs] = cursor;
  }
