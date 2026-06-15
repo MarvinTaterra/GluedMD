@@ -10,6 +10,8 @@ using namespace std;
 void ReferenceCalcGluedForceKernel::initialize(const System& system,
                                                     const GluedForce& force) {
     numParticles_ = system.getNumParticles();
+    if (force.getNumCollectiveVariableSpecs() > 0 || force.getNumBiases() > 0)
+        throw OpenMMException("The GLUED plugin does not implement CV/bias evaluation on the Reference platform; use the CUDA, OpenCL, or HIP platform.");
 }
 
 double ReferenceCalcGluedForceKernel::execute(ContextImpl& context,
