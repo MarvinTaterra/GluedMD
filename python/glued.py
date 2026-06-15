@@ -135,19 +135,26 @@ class Force(_gp.GluedForce):
         """Radius of gyration of an atom selection (nm)."""
         return self.addCollectiveVariable(_gp.GluedForce.CV_GYRATION, atoms)
 
-    def add_coordination(self, group_a, group_b, r0, n=6, m=12, d0=0.0):
-        """Coordination number using a rational switching function.
+    def add_coordination(self, group_a, group_b, r0, n=6, m=12):
+        """Coordination number using a rational switching function
+        f(r) = (1 − (r/r0)ⁿ) / (1 − (r/r0)ᵐ).
 
         Parameters
         ----------
         group_a, group_b : list[int]  Atom indices for the two groups.
         r0 : float  Switching distance (nm).
         n, m : int  Numerator/denominator exponents of the switch (default 6/12).
-        d0 : float  Offset distance (nm, default 0).
+
+        Notes
+        -----
+        The kernel contract is ``atoms = [len(group_a), *group_a, *group_b]`` and
+        ``params = [r0, n, m]`` (the group-A size is the first atom slot, not a param).
+        PLUMED's ``D_0`` offset is not implemented in the kernel and is therefore not
+        exposed here.
         """
-        atoms = list(group_a) + list(group_b)
+        atoms = [len(group_a)] + list(group_a) + list(group_b)
         return self.addCollectiveVariable(
-            _gp.GluedForce.CV_COORDINATION, atoms, [len(group_a), r0, n, m, d0]
+            _gp.GluedForce.CV_COORDINATION, atoms, [r0, n, m]
         )
 
     def add_rmsd(self, atoms, reference_positions):
@@ -173,23 +180,27 @@ class Force(_gp.GluedForce):
             _gp.GluedForce.CV_DRMSD, atom_pairs, ref_distances
         )
 
-    def add_contact_map(self, pairs, *, r0, n=6, m=12, w=1.0, ref=0.0):
-        """Contact map (sum of switching functions over atom pairs).
+    def add_contact_map(self, pairs, *, r0, n=6, m=12, w=1.0):
+        """Contact map (weighted sum of rational switching functions over atom pairs).
 
         Parameters
         ----------
         pairs : flat list [a0, b0, a1, b1, …].
-        r0, n, m, w, ref : per-pair scalars or lists.
+        r0, n, m, w : per-pair scalars or lists.
+
+        Notes
+        -----
+        Kernel contract is 4 params per pair ``[r0, n, m, w]``. (PLUMED's per-pair
+        reference offset is not implemented in the kernel and is not exposed.)
         """
         n_pairs = len(pairs) // 2
         r0_  = _scalar_or_list(r0,  n_pairs)
         n_   = _scalar_or_list(n,   n_pairs)
         m_   = _scalar_or_list(m,   n_pairs)
         w_   = _scalar_or_list(w,   n_pairs)
-        ref_ = _scalar_or_list(ref, n_pairs)
         params = []
         for i in range(n_pairs):
-            params.extend([r0_[i], n_[i], m_[i], w_[i], ref_[i]])
+            params.extend([r0_[i], n_[i], m_[i], w_[i]])
         return self.addCollectiveVariable(_gp.GluedForce.CV_CONTACTMAP, pairs, params)
 
     def add_path(self, atoms, frames, lambda_):
@@ -217,25 +228,78 @@ class Force(_gp.GluedForce):
             _gp.GluedForce.CV_POSITION, [atom], [component]
         )
 
-    def add_plane_distance(self, plane_atoms, query_atom):
-        """Signed distance of *query_atom* from the plane defined by three atoms."""
-        return self.addCollectiveVariable(
-            _gp.GluedForce.CV_PLANE, list(plane_atoms) + [query_atom]
-        )
+    def add_plane(self, plane_atoms, component=2):
+        """A Cartesian component of the unit normal to the plane through three atoms.
 
-    def add_projection(self, atom_a, atom_b, axis_a, axis_b):
-        """Projection of vector (a→b) onto unit axis (axis_a→axis_b) (nm)."""
-        return self.addCollectiveVariable(
-            _gp.GluedForce.CV_PROJECTION, [atom_a, atom_b, axis_a, axis_b]
-        )
+        Parameters
+        ----------
+        plane_atoms : sequence of 3 atom indices defining the plane.
+        component : int  ``0=nx, 1=ny, 2=nz`` of the unit normal n̂ = (B−A)×(C−A)/|…|.
 
-    def add_dipole(self, atoms, component=0):
-        """Electric dipole moment.
-
-        component : 0=magnitude, 1=x, 2=y, 3=z (e·nm).
+        Notes
+        -----
+        This is what the CV_PLANE kernel actually computes. A true signed
+        point-to-plane distance is not implemented (see :meth:`add_plane_distance`).
         """
+        plane_atoms = list(plane_atoms)
+        if len(plane_atoms) != 3:
+            raise ValueError("plane_atoms must be exactly 3 atom indices")
+        if int(component) not in (0, 1, 2):
+            raise ValueError("component must be 0=nx, 1=ny, or 2=nz")
         return self.addCollectiveVariable(
-            _gp.GluedForce.CV_DIPOLE, atoms, [component]
+            _gp.GluedForce.CV_PLANE, plane_atoms, [int(component)]
+        )
+
+    def add_plane_distance(self, plane_atoms, query_atom):
+        """Not implemented — the CV_PLANE kernel returns a unit-normal component, not a
+        point-to-plane distance. Use :meth:`add_plane` for the normal component."""
+        raise NotImplementedError(
+            "signed point-to-plane distance is not implemented; the CV_PLANE kernel "
+            "returns a component of the plane's unit normal — use add_plane(plane_atoms, "
+            "component) instead."
+        )
+
+    def add_projection(self, atom_a, atom_b, direction):
+        """Projection of the vector (a→b) onto a fixed direction (nm).
+
+        Parameters
+        ----------
+        atom_a, atom_b : int  The vector is r_b − r_a.
+        direction : sequence of 3 floats  Projection axis (normalized internally).
+
+        Notes
+        -----
+        The kernel uses a *fixed* direction (``params=[nx,ny,nz]``), not a dynamic
+        two-atom axis.
+        """
+        direction = list(direction)
+        if len(direction) != 3:
+            raise ValueError("direction must be a 3-vector (nx, ny, nz)")
+        return self.addCollectiveVariable(
+            _gp.GluedForce.CV_PROJECTION, [atom_a, atom_b], direction
+        )
+
+    def add_dipole(self, atoms, charges, component=3):
+        """Electric dipole moment of an atom group (e·nm).
+
+        Parameters
+        ----------
+        atoms : list[int]  Atom indices in the group.
+        charges : sequence of float  Per-atom charges (e), one per atom — the kernel
+            needs these explicitly (they are not read from the System's NonbondedForce).
+        component : int  ``0=x, 1=y, 2=z, 3=|μ|`` (magnitude). Default 3.
+
+        Notes
+        -----
+        Kernel contract: ``params = [q0, …, qN-1, component]``. For a non-neutral group
+        the dipole is taken about the group's mean charge (PLUMED's Q/N neutralization).
+        """
+        atoms = list(atoms)
+        charges = _scalar_or_list(charges, len(atoms))
+        if int(component) not in (0, 1, 2, 3):
+            raise ValueError("component must be 0=x, 1=y, 2=z, or 3=|mu|")
+        return self.addCollectiveVariable(
+            _gp.GluedForce.CV_DIPOLE, atoms, list(charges) + [int(component)]
         )
 
     def add_volume(self):
@@ -407,7 +471,7 @@ class Force(_gp.GluedForce):
         )
 
     def add_linear(self, cvs, k):
-        """Linear coupling: V = −k·s.
+        """Linear coupling: V = +k·s (force −k on the CV).
 
         Parameters
         ----------
