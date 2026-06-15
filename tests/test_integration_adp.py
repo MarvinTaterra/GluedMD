@@ -188,11 +188,10 @@ def test_cv_psi_dihedral():
 def test_cv_com_distance():
     """COM(ALA1 N,CA,C) vs COM(ALA2 N,CA,C) distance: finite, > 0."""
     f = gp.GluedForce(); f.setUsesPeriodicBoundaryConditions(True)
-    # atoms = [n_g1, g1_atoms..., g2_atoms...]
-    # params = masses of all atoms in order
+    # contract: atoms = [g1_atoms..., g2_atoms...], params = [n_group1]; masses from System
     _add_cv(f, gp.GluedForce.CV_COM_DISTANCE,
-            [3, N1, CA1, C1, N2, CA2, C2],
-            [14.007, 12.011, 12.011, 14.007, 12.011, 12.011])
+            [N1, CA1, C1, N2, CA2, C2],
+            [3])
     ctx = _make_ctx(f)
     cv = _cv(ctx, f)
     assert 0.1 < cv[0] < 1.5, f"COM distance = {cv[0]:.4f} nm"
