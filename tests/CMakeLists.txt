@@ -35,6 +35,7 @@ add_python_test(cv_pca              test_cv_pca.py              240)
 add_python_test(cv_puckering        test_cv_puckering.py        180)
 add_python_test(cv_secondary_structure  test_cv_secondary_structure.py  240)
 add_python_test(cv_ermsd  test_cv_ermsd.py  240)
+add_python_test(cv_energy  test_cv_energy.py  180)
 
 # ---- Stage 4 / 5: bias methods -----------------------------------------
 add_python_test(bias_harmonic           test_bias_harmonic.py           180)
@@ -49,6 +50,7 @@ add_python_test(bias_abmd               test_bias_abmd.py               240)
 add_python_test(bias_external           test_bias_external.py           240)
 add_python_test(bias_ext_lagrangian     test_bias_ext_lagrangian.py     240)
 add_python_test(bias_eds                test_bias_eds.py                240)
+add_python_test(bias_multithermal       test_bias_multithermal.py       240)
 
 # ---- Stage 6.1: bias state serialization --------------------------------
 add_python_test(bias_state_serialization  test_bias_state_serialization.py  300)
@@ -59,3 +61,4 @@ add_python_test(cv_query_and_reporter   test_cv_query_and_reporter.py   180)
 
 # ---- Integration: ADP production system --------------------------------
 add_python_test(integration_adp         test_integration_adp.py         600)
+add_python_test(adp_multithermal         test_adp_multithermal.py        600 requires_cuda)
