@@ -62,6 +62,13 @@ protected:
         CUdeviceptr ptr = cudaArr.getDevicePointer();
         return reinterpret_cast<void*>(static_cast<uintptr_t>(ptr));
     }
+
+    // CV_ENERGY device path: the linked inner Context's CudaContext, read from its
+    // PlatformData. Mirrors CudaCalcCustomCVForceKernel::getInnerComputeContext.
+    ComputeContext& getInnerComputeContext(ContextImpl& innerContext) override {
+        return *reinterpret_cast<CudaPlatform::PlatformData*>(
+            innerContext.getPlatformData())->contexts[0];
+    }
 };
 
 // Called by OpenMM's plugin loader. Must be named exactly "registerKernelFactories".
