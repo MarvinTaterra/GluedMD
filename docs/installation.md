@@ -228,13 +228,3 @@ The low-level SWIG module is also directly importable:
 ```python
 import gluedplugin as gp   # raw API — all GluedForce methods available
 ```
-
----
-
-## Reference source trees (development machine only)
-
-| Path | Contents |
-|---|---|
-| `/mnt/c/Users/Marvin/Desktop/openmm` | OpenMM 8.4.0 source |
-| `/mnt/c/Users/Marvin/Desktop/openmm-plumed` | openmm-plumed plugin |
-| `/mnt/c/Users/Marvin/Desktop/plumed2` | PLUMED2 source |
