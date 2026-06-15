@@ -1,6 +1,9 @@
 #include "CommonGluedKernels.h"
 #include "GluedForce.h"
 #include "openmm/internal/ContextImpl.h"
+#include "openmm/Context.h"
+#include "openmm/State.h"
+#include "openmm/Vec3.h"
 #include "openmm/common/ContextSelector.h"
 #include "openmm/common/CommonKernelUtilities.h"
 #include "openmm/common/ExpressionUtilities.h"
@@ -2453,6 +2456,53 @@ KERNEL void chainRuleScatter(
 )";
 
 // ---------------------------------------------------------------------------
+// CV_ENERGY device-to-device kernels (OPES multithermal).
+//
+// energyCopyState copies positions from the outer context straight into the linked
+// inner context's posq (mixed-precision correction too), using the reorder maps so
+// each atom lands in the inner GPU slot for that user atom — the inner charge (.w) is
+// preserved. energyCopyForces reads the inner context's fixed-point long force buffer
+// after its on-GPU calcForcesAndEnergy and writes dU/dx = -F into the energy CV's
+// Jacobian grads. The grads entry baseEntry+u is user atom u (its jacobianAtomIdx =
+// userToGpu[u] is set in rebuildGpuAtomIndices); inner GPU slot i maps to user atom
+// innerAtomOrder[i]. real4/mixed4/mm_long and USE_MIXED_PRECISION are auto-defined by
+// compileProgram. Mirrors OpenMM's customCVForce.cc copyState/copyForces.
+// ---------------------------------------------------------------------------
+extern const string kEnergyCopyKernelSrc = R"(
+KERNEL void energyCopyState(GLOBAL real4* RESTRICT posq, GLOBAL real4* RESTRICT innerPosq,
+#ifdef USE_MIXED_PRECISION
+        GLOBAL real4* RESTRICT posqCorrection, GLOBAL real4* RESTRICT innerPosqCorrection,
+#endif
+        GLOBAL const int* RESTRICT atomOrder, GLOBAL const int* RESTRICT innerInvAtomOrder,
+        int numAtoms) {
+    for (int i = GLOBAL_ID; i < numAtoms; i += GLOBAL_SIZE) {
+        int index = innerInvAtomOrder[atomOrder[i]];
+        real4 p = posq[i];
+        p.w = innerPosq[index].w;        // keep the inner context's charge
+        innerPosq[index] = p;
+#ifdef USE_MIXED_PRECISION
+        innerPosqCorrection[index] = posqCorrection[i];
+#endif
+    }
+}
+
+KERNEL void energyCopyForces(GLOBAL const mm_long* RESTRICT innerForces,
+        GLOBAL const int* RESTRICT innerAtomOrder,
+        GLOBAL float* RESTRICT jacGradsX, GLOBAL float* RESTRICT jacGradsY,
+        GLOBAL float* RESTRICT jacGradsZ,
+        int numAtoms, int innerPaddedNumAtoms, int baseEntry) {
+    const double invFixed = 1.0 / (double) 0x100000000LL;   // undo fixed-point 2^32
+    for (int i = GLOBAL_ID; i < numAtoms; i += GLOBAL_SIZE) {
+        int u = innerAtomOrder[i];
+        int e = baseEntry + u;
+        jacGradsX[e] = (float)(-(double) innerForces[i]                          * invFixed);
+        jacGradsY[e] = (float)(-(double) innerForces[i +   innerPaddedNumAtoms]  * invFixed);
+        jacGradsZ[e] = (float)(-(double) innerForces[i + 2*innerPaddedNumAtoms]  * invFixed);
+    }
+}
+)";
+
+// ---------------------------------------------------------------------------
 // Harmonic restraint bias kernel (single thread).
 //
 // V = Σ_d k_d/2 * (s_d − s0_d)²
@@ -3072,6 +3122,84 @@ KERNEL void opesExpandedUpdateLogZ(
  logZGPU[0] = mx + log(exp(A - mx) + exp(B - mx)) - log((double)(n + 1));
  }
  numUpdatesGPU[0] = n + 1;
+}
+)";
+
+// ---------------------------------------------------------------------------
+// OPES multithermal bias kernels (single thread, fully GPU-resident).
+//
+// Expands one CV_ENERGY (value = unbiased PE U) over an inverse-temperature
+// ladder {β_l}. Equivalent to OPES_EXPANDED with one energy CV per temperature,
+// the canonical (β_l-β0)·U expansion and a fixed 1/N normalization (rather than a
+// single learned logZ); per-state free energies ΔF_l are learned on the fly.
+//   diff_l = -(β_l-β0)·U + ΔF_l/kT0
+//   V      = -kT0·(diffMax + log( Σ_l exp(diff_l - diffMax) / N ))
+//   dV/dU  =  kT0·Σ_l p_l·(β_l-β0),  p_l = softmax(diff)_l
+// ΔF_l, rct (the c(t) reweighting offset) and the update counter live on the GPU
+// and are advanced by multithermalUpdateDeltaF every PACE steps using the PREVIOUS
+// step's U and V (biasEnergies[biasIdx]) — a one-step lag identical to the
+// OPES_EXPANDED logZ update. All state is double. The recursion is the stabilized
+// log-mean-exp free-energy update (increment = kT0·log(1+exp((V-rct)/kT0 - log(c-1)))).
+// ---------------------------------------------------------------------------
+extern const string kMultithermalKernelSrc = R"(
+KERNEL void multithermalEvalBias(
+ GLOBAL const double* RESTRICT cvValues,
+ int energyCvIdx,
+ GLOBAL const double* RESTRICT betaMinusBeta0,
+ GLOBAL const double* RESTRICT deltaF,
+ int numStates,
+ double kT0,
+ GLOBAL double* RESTRICT cvBiasGradients,
+ GLOBAL double* RESTRICT biasEnergies,
+ int biasIdx
+) {
+ if (GLOBAL_ID != 0) return;
+ double U = cvValues[energyCvIdx];
+ double diffMax = -1e300;
+ for (int l = 0; l < numStates; l++) {
+ double d = -betaMinusBeta0[l] * U + deltaF[l] / kT0;
+ if (d > diffMax) diffMax = d;
+ }
+ double sum = 0.0, dsum = 0.0;   // dsum = Σ exp(diff_l-diffMax)·(β_l-β0)
+ for (int l = 0; l < numStates; l++) {
+ double d = -betaMinusBeta0[l] * U + deltaF[l] / kT0;
+ double e = exp(d - diffMax);
+ sum  += e;
+ dsum += e * betaMinusBeta0[l];
+ }
+ biasEnergies[biasIdx] = -kT0 * (diffMax + log(sum / (double) numStates));
+ cvBiasGradients[energyCvIdx] += kT0 * (dsum / sum);   // dV/dU = kT0·Σ p_l(β_l-β0)
+}
+
+KERNEL void multithermalUpdateDeltaF(
+ GLOBAL const double* RESTRICT cvValues,
+ int energyCvIdx,
+ GLOBAL const double* RESTRICT betaMinusBeta0,
+ GLOBAL double* RESTRICT deltaF,
+ GLOBAL double* RESTRICT rctGPU,
+ GLOBAL double* RESTRICT counterGPU,
+ GLOBAL const double* RESTRICT biasEnergies,
+ int biasIdx,
+ int numStates,
+ double kT0
+) {
+ if (GLOBAL_ID != 0) return;
+ double U = cvValues[energyCvIdx];
+ double V = biasEnergies[biasIdx];
+ double rct = rctGPU[0];
+ counterGPU[0] += 1.0;
+ double cnt  = counterGPU[0];          // new counter (>= 2)
+ double logc = log(cnt - 1.0);
+ double arg  = (V - rct) / kT0 - logc;
+ double increment = (arg > 0.0) ? kT0 * (arg + log1p(exp(-arg)))
+                                : kT0 * log1p(exp(arg));
+ for (int l = 0; l < numStates; l++) {
+ double diff_l = -betaMinusBeta0[l] * U + (V - rct + deltaF[l]) / kT0 - logc;
+ double dec = (diff_l > 0.0) ? kT0 * (diff_l + log1p(exp(-diff_l)))
+                             : kT0 * log1p(exp(diff_l));
+ deltaF[l] += increment - dec;
+ }
+ rctGPU[0] = rct + increment + kT0 * log1p(-1.0 / cnt);
 }
 )";
 
@@ -3783,6 +3911,7 @@ void CommonCalcGluedForceKernel::buildPlan(const System& system,
  case GluedForce::CV_SECONDARY_STRUCTURE: needA(5); needP(2); break;
  case GluedForce::CV_PUCKERING: needA(5); needP(2); break;
  case GluedForce::CV_ERMSD: { needP(1); int N=(int)(params[0]+0.5); if (N < 1) err("eRMSD needs >= 1 residue"); if (N > 64) err("eRMSD residue count " + std::to_string(N) + " exceeds kernel limit 64"); needA(3*N); needP(2 + 4*N*(N-1)); } break;
+ case GluedForce::CV_ENERGY: break; // total potential energy; no atoms/params (inner-context eval)
  case GluedForce::CV_EXPRESSION: enforceContig = false; break; // stores its own output index
  case GluedForce::CV_PYTORCH: enforceContig = false; break; // stores its own output index
  default: err("unknown CV type " + std::to_string(cvType));
@@ -4029,6 +4158,12 @@ void CommonCalcGluedForceKernel::buildPlan(const System& system,
  ermsdRefGData_.push_back((float)params[2 + p]);
  plan_.numErmsdCVs++;
  cvValueIdx += 1;
+ } else if (cvType == GluedForce::CV_ENERGY) {
+ // Total unbiased potential energy U (OPES multithermal). No atoms/params; the
+ // value + per-atom Jacobian (-F) come from a linked inner context in execute().
+ if (plan_.numEnergyCVs == 0) plan_.energyFirstCVIndex = cvValueIdx;
+ plan_.numEnergyCVs++;
+ cvValueIdx += 1;
  }
  }
 
@@ -4089,7 +4224,10 @@ void CommonCalcGluedForceKernel::buildPlan(const System& system,
  ermsdTotalJac += 6 * N * (N-1);
  }
  plan_.ermsdFirstJacEntry = plan_.puckerFirstJacEntry + puckerTotalAtoms;
- plan_.numJacEntries = plan_.ermsdFirstJacEntry + ermsdTotalJac;
+ // Energy CV: numParticles Jacobian entries per CV (one per atom, dU/dx = -F).
+ plan_.energyFirstJacEntry = plan_.ermsdFirstJacEntry + ermsdTotalJac;
+ plan_.numJacEntries = plan_.energyFirstJacEntry
+                       + plan_.numEnergyCVs * system.getNumParticles();
  // Volume and Cell have no atom Jacobian entries
 
  // Assign jacOffset to each PyTorchCVPlan
@@ -4438,8 +4576,34 @@ void CommonCalcGluedForceKernel::buildPlan(const System& system,
  rebuildGpuAtomIndices();
 }
 
+// Keeps a device-side inverse atom-order map (user atom -> GPU slot) in sync with a
+// ComputeContext's atom reordering. Used for the CV_ENERGY inner context so the
+// copyState kernel can place each outer atom into the right inner GPU slot. Identical
+// to OpenMM's CommonCalcCustomCVForceKernel::ReorderListener.
+namespace {
+class EnergyReorderListener : public ComputeContext::ReorderListener {
+public:
+    EnergyReorderListener(ComputeContext& cc, ArrayInterface& invAtomOrder)
+        : cc_(cc), invAtomOrder_(invAtomOrder) {}
+    void execute() override {
+        std::vector<int> invOrder(cc_.getPaddedNumAtoms());
+        const std::vector<int>& order = cc_.getAtomIndex();
+        for (int i = 0; i < (int) order.size(); i++)
+            invOrder[order[i]] = i;
+        invAtomOrder_.upload(invOrder);
+    }
+private:
+    ComputeContext& cc_;
+    ArrayInterface& invAtomOrder_;
+};
+} // anonymous namespace
 
-
+// Default: the common layer cannot read platform-specific PlatformData. The Cuda and
+// OpenCL kernel subclasses override this; reaching here means an energy CV was added on
+// a platform with no device-resident inner context.
+ComputeContext& CommonCalcGluedForceKernel::getInnerComputeContext(ContextImpl& innerContext) {
+    throw OpenMMException("GluedForce: CV_ENERGY requires the CUDA or OpenCL platform");
+}
 
 void CommonCalcGluedForceKernel::initialize(const System& system,
  const GluedForce& force) {
@@ -4723,6 +4887,68 @@ double CommonCalcGluedForceKernel::execute(ContextImpl& context,
 #endif
  }
 
+ // === CV_ENERGY (OPES multithermal): U and dU/dx = -F from the linked inner context ===
+ // The inner context holds the System MINUS this GluedForce, so its potential energy is
+ // the UNBIASED total PE U and its forces are the unbiased F (self-excluding by
+ // construction). Fully device-to-device: positions are copied outer->inner with a GPU
+ // kernel, the inner context evaluates U/F on the GPU (calcForcesAndEnergy), and the inner
+ // long force buffer is copied straight into the energy CV's Jacobian (grads = -F) with a
+ // second GPU kernel — no posq/force round-trip through the host. U is the scalar energy
+ // reduction returned by calcForcesAndEnergy (naturally a host value). Runs after the
+ // geometric/pytorch CV values and BEFORE bias eval (which reads cvValues[energyFirstCVIndex]).
+ // The inner context shares the outer CUDA context (createLinkedContext), so the active
+ // ContextSelector(cc_) above also covers the inner kernels.
+ if (plan_.numEnergyCVs > 0 && innerContextImpl_ != nullptr) {
+ int Np = cc_.getNumAtoms();
+ ComputeContext& cc2 = getInnerComputeContext(*innerContextImpl_);
+
+ // One-time setup: device-side inner reorder map + the two copy kernels (compiled
+ // against the outer context, like the scatter kernel). Deferred to first execute()
+ // because the inner ComputeContext does not exist at initialize() time.
+ if (!energyDeviceInitialized_) {
+ energyDeviceInitialized_ = true;
+ innerInvAtomOrder_.initialize<int>(cc_, cc_.getPaddedNumAtoms(), "gluedInnerInvAtomOrder");
+ EnergyReorderListener* listener = new EnergyReorderListener(cc2, innerInvAtomOrder_);
+ cc2.addReorderListener(listener);   // cc2 takes ownership
+ listener->execute();                // populate before the first copyState
+ ComputeProgram prog = cc_.compileProgram(kEnergyCopyKernelSrc, {});
+ energyCopyStateKernel_ = prog->createKernel("energyCopyState");
+ energyCopyStateKernel_->addArg(cc_.getPosq());
+ energyCopyStateKernel_->addArg(cc2.getPosq());
+ if (cc_.getUseMixedPrecision()) {
+ energyCopyStateKernel_->addArg(cc_.getPosqCorrection());
+ energyCopyStateKernel_->addArg(cc2.getPosqCorrection());
+ }
+ energyCopyStateKernel_->addArg(cc_.getAtomIndexArray());
+ energyCopyStateKernel_->addArg(innerInvAtomOrder_);
+ energyCopyStateKernel_->addArg(Np);
+ energyCopyStateKernel_->addArg();                           // spare (8.5.1 alignment fix)
+ energyCopyForcesKernel_ = prog->createKernel("energyCopyForces");
+ energyCopyForcesKernel_->addArg(cc2.getLongForceBuffer());  // 0
+ energyCopyForcesKernel_->addArg(cc2.getAtomIndexArray());   // 1
+ energyCopyForcesKernel_->addArg(plan_.jacobianGradsX);      // 2
+ energyCopyForcesKernel_->addArg(plan_.jacobianGradsY);      // 3
+ energyCopyForcesKernel_->addArg(plan_.jacobianGradsZ);      // 4
+ energyCopyForcesKernel_->addArg(Np);                        // 5
+ energyCopyForcesKernel_->addArg(cc2.getPaddedNumAtoms());   // 6
+ energyCopyForcesKernel_->addArg((int) 0);                   // 7: baseEntry (per-CV)
+ energyCopyForcesKernel_->addArg();                          // spare (8.5.1 alignment fix)
+ }
+
+ // Sync the inner box, push positions, evaluate on the GPU, copy forces back.
+ Vec3 ba, bb, bc;
+ context.getPeriodicBoxVectors(ba, bb, bc);
+ innerContextImpl_->setPeriodicBoxVectors(ba, bb, bc);
+ cc2.reorderAtoms();                       // keeps innerInvAtomOrder_ current via listener
+ energyCopyStateKernel_->execute(Np);
+ double U = innerContextImpl_->calcForcesAndEnergy(true, true, -1);   // all force groups
+ for (int e = 0; e < plan_.numEnergyCVs; e++) {
+ plan_.cvValues.uploadSubArray(&U, plan_.energyFirstCVIndex + e, 1);
+ energyCopyForcesKernel_->setArg(7, plan_.energyFirstJacEntry + e * Np);
+ energyCopyForcesKernel_->execute(Np);
+ }
+ }
+
  // evaluate bias potentials and accumulate into cvBiasGradients.
  // Must run after CV kernels (need cvValues) and before scatter (fills gradients).
  // Skip when testBiasGradients_ is set (unit tests supply gradients directly).
@@ -4791,6 +5017,14 @@ double CommonCalcGluedForceKernel::execute(ContextImpl& context,
  for (auto& mx : maxentBiases_)
  mx.evalKernel->execute(1);
 
+ // OPES multithermal: expand the CV_ENERGY over the β-ladder on the GPU. The eval
+ // kernel reads the GPU-resident U (cvValues[energyCvIdx], filled by the device energy
+ // path above), writes the force factor dV/dU into cvBiasGradients[energyCvIdx]
+ // (auto-cleared this step) and the bias value V into its biasEnergies slot; the
+ // chain-rule scatter then applies dV/dU·F via the energy CV's single Jacobian (-F).
+ for (auto& mt : multithermalBiases_)
+ mt.evalKernel->execute(1);
+
  // D2H only when energy reporting is requested — MetaD height and OPES neff
  // are now fully GPU-resident and no longer need this mirror every step.
  if (includeEnergy && !plan_.biasEnergiesCPU.empty()) {
@@ -4822,7 +5056,7 @@ void CommonCalcGluedForceKernel::updateState(ContextImpl& context,
  // cvValues holds results from the PREVIOUS execute(); skip if uninitialized.
  if (!cvValuesReady_) return;
  if (step == lastUpdateStep_) return;
- if (opesBiases_.empty() && abmdBiases_.empty() && metaDGridBiases_.empty() && pbmetaDGridBiases_.empty() && opesExpandedBiases_.empty() && extLagBiases_.empty() && edsBiases_.empty() && maxentBiases_.empty()) return;
+ if (opesBiases_.empty() && abmdBiases_.empty() && metaDGridBiases_.empty() && pbmetaDGridBiases_.empty() && opesExpandedBiases_.empty() && extLagBiases_.empty() && edsBiases_.empty() && maxentBiases_.empty() && multithermalBiases_.empty()) return;
  lastUpdateStep_ = step;
 
  ContextSelector selector(cc_);
@@ -4889,6 +5123,15 @@ void CommonCalcGluedForceKernel::updateState(ContextImpl& context,
  for (auto& oe : opesExpandedBiases_) {
  if (step == 0 || step % oe.pace != 0) continue;
  oe.updateLogZKernel->execute(1);
+ }
+
+ // OPES multithermal: learn per-state ΔF_l every pace steps — fully GPU-resident.
+ // The kernel reads the previous execute()'s U (cvValues[energyCvIdx]) and V
+ // (biasEnergies[biasIdx]) and advances ΔF_l/rct/counter (the expanded-ensemble
+ // free-energy recursion) — a one-step lag identical to OPES_EXPANDED's logZ update.
+ for (auto& mt : multithermalBiases_) {
+ if (step == 0 || mt.pace <= 0 || step % mt.pace != 0) continue;
+ mt.updateDeltaFKernel->execute(1);
  }
 
  // MetaD deposition (pace-gated) — fully GPU-resident.
