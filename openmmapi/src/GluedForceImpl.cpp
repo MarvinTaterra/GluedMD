@@ -13,7 +13,14 @@ using namespace std;
 GluedForceImpl::GluedForceImpl(const GluedForce& owner)
     : owner_(owner) {}
 
-GluedForceImpl::~GluedForceImpl() {}
+GluedForceImpl::~GluedForceImpl() {
+    // H27: owner_.impl_ was set to point at this impl in initialize(). If we are
+    // that impl, clear the back-pointer so getBiasStateBytes()/setBiasStateBytes()
+    // on the owning Force after Context destruction throw cleanly instead of
+    // dereferencing a dangling pointer (use-after-free).
+    if (owner_.impl_ == this)
+        owner_.impl_ = nullptr;
+}
 
 void GluedForceImpl::initialize(ContextImpl& context) {
     kernel_ = context.getPlatform().createKernel(
