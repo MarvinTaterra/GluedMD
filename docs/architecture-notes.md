@@ -1,8 +1,5 @@
 # GLUED Architecture Notes
 
-Source references: `C:/Users/Marvin/Desktop/openmm` (tag 8.4.0),
-`C:/Users/Marvin/Desktop/openmm-plumed`, `C:/Users/Marvin/Desktop/plumed2`.
-
 ---
 
 ## 1 — How `Force::createImpl()` becomes a per-step kernel call
