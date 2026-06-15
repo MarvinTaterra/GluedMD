@@ -23,6 +23,7 @@ extern const string kEdsKernelSrc;
 extern const string kMaxEntKernelSrc;
 extern const string kMetaDKernelSrc;
 extern const string kPBMetaDKernelSrc;
+extern const string kMultithermalKernelSrc;
 
 
 // Allocate GPU state and compile kernels for every registered bias.
@@ -56,7 +57,7 @@ void CommonCalcGluedForceKernel::setupBiases(const GluedForce& force) {
  // Reallocation would invalidate pointers stored in kernel addArg() calls.
  // Also count totalEnergySlots: PBMetaD has one slot per subgrid (per CV dim).
  {
- int nH=0, nMv=0, nOp=0, nAb=0, nMd=0, nPb=0, nEx=0, nLin=0, nWall=0, nOpEx=0, nEl=0, nEds=0, nMxe=0;
+ int nH=0, nMv=0, nOp=0, nAb=0, nMd=0, nPb=0, nEx=0, nLin=0, nWall=0, nOpEx=0, nEl=0, nEds=0, nMxe=0, nMt=0;
  int totalEnergySlots = 0;
  for (int b = 0; b < numBiases; b++) {
  int t; vector<int> ci; vector<double> p; vector<int> ip;
@@ -75,6 +76,7 @@ void CommonCalcGluedForceKernel::setupBiases(const GluedForce& force) {
  else if (t == GluedForce::BIAS_EXT_LAGRANGIAN) { nEl++; totalEnergySlots++; }
  else if (t == GluedForce::BIAS_EDS) { nEds++; totalEnergySlots++; }
  else if (t == GluedForce::BIAS_MAXENT) { nMxe++; totalEnergySlots++; }
+ else if (t == GluedForce::BIAS_OPES_MULTITHERMAL) { nMt++; totalEnergySlots++; }
  }
  // Allocate the shared bias energy buffer and CPU mirror.
  int slots = max(1, totalEnergySlots);
@@ -93,6 +95,7 @@ void CommonCalcGluedForceKernel::setupBiases(const GluedForce& force) {
  extLagBiases_.reserve(nEl);
  edsBiases_.reserve(nEds);
  maxentBiases_.reserve(nMxe);
+ multithermalBiases_.reserve(nMt);
  }
 
  int biasEnergyCounter = 0; // monotonically assigned slot in plan_.biasEnergies
@@ -770,6 +773,70 @@ void CommonCalcGluedForceKernel::setupBiases(const GluedForce& force) {
  oe.updateLogZKernel->addArg(oe.numUpdatesGPU); // 4
  oe.updateLogZKernel->addArg(D); // 5: numStates
  oe.updateLogZKernel->addArg(oe.invKT); // 6
+
+ } else if (bType == GluedForce::BIAS_OPES_MULTITHERMAL) {
+ // OPES multithermal: expand one CV_ENERGY over an inverse-temperature ladder.
+ // cvIndices = [energy CV value index]; params = [kT0, β_0, ..., β_{N-1}] (β in 1/(kJ/mol));
+ // intParams = [pace]. Fully GPU-resident: eval + ΔF-learning run as device kernels.
+ multithermalBiases_.emplace_back();
+ MultithermalBias& mt = multithermalBiases_.back();
+ mt.energyCvIdx = cvIndices.empty() ? -1 : cvIndices[0];
+ mt.energyLocalIdx = mt.energyCvIdx - plan_.energyFirstCVIndex;
+ if (plan_.numEnergyCVs == 0 || mt.energyLocalIdx < 0 ||
+     mt.energyLocalIdx >= plan_.numEnergyCVs)
+ throw OpenMM::OpenMMException("BIAS_OPES_MULTITHERMAL: cvIndices[0] must reference a "
+ "CV_ENERGY value index");
+ mt.kT0 = bParams[0];
+ mt.beta0 = 1.0 / mt.kT0;
+ mt.pace = (bIntParams.size() > 0) ? bIntParams[0] : 500;
+ int Nstates = (int)bParams.size() - 1;   // β_0 .. β_{N-1}
+ if (Nstates < 1)
+ throw OpenMM::OpenMMException("BIAS_OPES_MULTITHERMAL needs at least one temperature "
+ "(params = [kT0, beta_0, ...])");
+ mt.betaMinusBeta0.resize(Nstates);
+ for (int l = 0; l < Nstates; l++)
+ mt.betaMinusBeta0[l] = bParams[1 + l] - mt.beta0;
+ mt.deltaF.assign(Nstates, 0.0);   // learned on the fly (init flat)
+ mt.rct = 0.0;
+ mt.counter = 1;
+ mt.biasEnergyIdx = biasEnergyCounter++;
+
+ mt.betaMinusBeta0GPU.initialize<double>(cc_, Nstates,
+ "mtBias_dbeta_" + to_string(bIdx));
+ mt.betaMinusBeta0GPU.upload(mt.betaMinusBeta0);
+ mt.deltaFGPU.initialize<double>(cc_, Nstates,
+ "mtBias_deltaF_" + to_string(bIdx));
+ mt.deltaFGPU.upload(mt.deltaF);                    // zeros
+ mt.rctGPU.initialize<double>(cc_, 1, "mtBias_rct_" + to_string(bIdx));
+ mt.rctGPU.upload(vector<double>{0.0});
+ mt.counterGPU.initialize<double>(cc_, 1, "mtBias_counter_" + to_string(bIdx));
+ mt.counterGPU.upload(vector<double>{1.0});
+
+ ComputeProgram mtProg = cc_.compileProgram(kMultithermalKernelSrc, {});
+ mt.evalKernel = mtProg->createKernel("multithermalEvalBias");
+ mt.evalKernel->addArg(plan_.cvValues);          // 0
+ mt.evalKernel->addArg(mt.energyCvIdx);          // 1
+ mt.evalKernel->addArg(mt.betaMinusBeta0GPU);    // 2
+ mt.evalKernel->addArg(mt.deltaFGPU);            // 3
+ mt.evalKernel->addArg(Nstates);                 // 4
+ mt.evalKernel->addArg(mt.kT0);                  // 5
+ mt.evalKernel->addArg(plan_.cvBiasGradients);   // 6
+ mt.evalKernel->addArg(plan_.biasEnergies);      // 7
+ mt.evalKernel->addArg(mt.biasEnergyIdx);        // 8
+ mt.evalKernel->addArg();                        // 9: spare (8.5.1 fix)
+
+ mt.updateDeltaFKernel = mtProg->createKernel("multithermalUpdateDeltaF");
+ mt.updateDeltaFKernel->addArg(plan_.cvValues);        // 0
+ mt.updateDeltaFKernel->addArg(mt.energyCvIdx);        // 1
+ mt.updateDeltaFKernel->addArg(mt.betaMinusBeta0GPU);  // 2
+ mt.updateDeltaFKernel->addArg(mt.deltaFGPU);          // 3
+ mt.updateDeltaFKernel->addArg(mt.rctGPU);             // 4
+ mt.updateDeltaFKernel->addArg(mt.counterGPU);         // 5
+ mt.updateDeltaFKernel->addArg(plan_.biasEnergies);    // 6
+ mt.updateDeltaFKernel->addArg(mt.biasEnergyIdx);      // 7
+ mt.updateDeltaFKernel->addArg(Nstates);               // 8
+ mt.updateDeltaFKernel->addArg(mt.kT0);                // 9
+ mt.updateDeltaFKernel->addArg();                      // 10: spare (8.5.1 fix)
 
  } else if (bType == GluedForce::BIAS_EXT_LAGRANGIAN) {
  // Extended Lagrangian / AFED
