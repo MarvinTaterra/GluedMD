@@ -16,12 +16,16 @@ def get_cuda_platform():
         return None
 
 
-def make_context(positions_nm, cv_specs, bias_gradients=None, platform=None):
-    """cv_specs: list of (cv_type, atoms_list, params_list)."""
+def make_context(positions_nm, cv_specs, bias_gradients=None, platform=None, masses=None):
+    """cv_specs: list of (cv_type, atoms_list, params_list).
+
+    COM-distance and gyration take per-atom masses from the System (not from params);
+    pass `masses` to set them, else all atoms default to 1.0.
+    """
     n = len(positions_nm)
     sys_ = mm.System()
-    for _ in range(n):
-        sys_.addParticle(1.0)
+    for i in range(n):
+        sys_.addParticle(masses[i] if masses is not None else 1.0)
 
     f = gp.GluedForce()
     for cv_type, atoms, params in cv_specs:
@@ -68,9 +72,10 @@ def test_com_distance_single_atom_groups(platform):
     # atoms[0]=n_group1=1, atoms[1]=0 (g1), atoms[2]=1 (g2)
     # params = masses [1.0, 1.0]
     pos = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.5, 0.5, 0.5)]
+    # contract: atoms = [*g1, *g2], params=[n_group1]; masses come from the System
     specs = [(gp.GluedForce.CV_COM_DISTANCE,
-              [1, 0, 1],        # n_g1=1, atom0, atom1
-              [1.0, 1.0])]      # masses
+              [0, 1],           # g1=atom0, g2=atom1
+              [1])]             # n_group1=1
     ctx, f = make_context(pos, specs, platform=platform)
     cvs = eval_cv(ctx, f)
     assert abs(cvs[0] - 1.0) < TOL_CV, f"COM dist={cvs[0]:.8f}, expected 1.0"
@@ -83,8 +88,8 @@ def test_com_distance_two_atom_group(platform):
     # Expected distance = 1.5 nm
     pos = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (2.0, 0.0, 0.0), (5.0, 5.0, 5.0)]
     specs = [(gp.GluedForce.CV_COM_DISTANCE,
-              [2, 0, 1, 2],        # n_g1=2, atoms 0,1 (g1), atom 2 (g2)
-              [1.0, 1.0, 1.0])]    # masses
+              [0, 1, 2],           # g1=atoms 0,1 ; g2=atom 2
+              [2])]                # n_group1=2
     ctx, f = make_context(pos, specs, platform=platform)
     cvs = eval_cv(ctx, f)
     assert abs(cvs[0] - 1.5) < TOL_CV, f"COM dist={cvs[0]:.8f}, expected 1.5"
@@ -98,9 +103,9 @@ def test_com_distance_weighted_com(platform):
     # expected distance = 1.25 nm
     pos = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (2.0, 0.0, 0.0), (5.0, 5.0, 5.0)]
     specs = [(gp.GluedForce.CV_COM_DISTANCE,
-              [2, 0, 1, 2],
-              [1.0, 3.0, 1.0])]   # masses: m0=1, m1=3, m2=1
-    ctx, f = make_context(pos, specs, platform=platform)
+              [0, 1, 2],
+              [2])]               # n_group1=2; masses set in the System below
+    ctx, f = make_context(pos, specs, platform=platform, masses=[1.0, 3.0, 1.0, 1.0])
     cvs = eval_cv(ctx, f)
     assert abs(cvs[0] - 1.25) < TOL_CV, f"COM dist={cvs[0]:.8f}, expected 1.25"
     print(f"  test_com_distance_weighted_com: OK  (d={cvs[0]:.6f} nm)")
@@ -110,8 +115,8 @@ def test_com_distance_force_sum(platform):
     """Force sum over all COM-distance atoms must be zero."""
     pos = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (2.0, 0.0, 0.0), (5.0, 5.0, 5.0)]
     specs = [(gp.GluedForce.CV_COM_DISTANCE,
-              [2, 0, 1, 2],
-              [1.0, 1.0, 1.0])]
+              [0, 1, 2],
+              [2])]
     ctx, f = make_context(pos, specs, bias_gradients=[1.0], platform=platform)
     forces = get_forces(ctx)
     for c in range(3):
@@ -127,8 +132,8 @@ def test_com_distance_numerical_derivative(platform):
     dx = 1e-3
     base = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (2.0, 0.0, 0.0), (5.0, 5.0, 5.0)]
     specs = [(gp.GluedForce.CV_COM_DISTANCE,
-              [2, 0, 1, 2],
-              [1.0, 1.0, 1.0])]
+              [0, 1, 2],
+              [2])]
 
     pos_p = list(base); pos_p[0] = (dx, 0.0, 0.0)
     ctx_p, f_p = make_context(pos_p, specs, platform=platform)
@@ -156,9 +161,7 @@ def test_rg_symmetric(platform):
     """4 atoms at (±1, 0, 0) and (0, ±1, 0) with equal masses — Rg = 1 nm."""
     pos = [(1.0, 0.0, 0.0), (-1.0, 0.0, 0.0),
            (0.0, 1.0, 0.0), (0.0, -1.0, 0.0)]
-    specs = [(gp.GluedForce.CV_GYRATION,
-              [0, 1, 2, 3],
-              [1.0, 1.0, 1.0, 1.0])]
+    specs = [(gp.GluedForce.CV_GYRATION, [0, 1, 2, 3], [])]   # masses from System (all 1.0)
     ctx, f = make_context(pos, specs, platform=platform)
     cvs = eval_cv(ctx, f)
     assert abs(cvs[0] - 1.0) < TOL_CV, f"Rg={cvs[0]:.8f}, expected 1.0"
@@ -168,9 +171,7 @@ def test_rg_symmetric(platform):
 def test_rg_two_atoms(platform):
     """2 equal-mass atoms 2 nm apart — Rg = 1 nm."""
     pos = [(0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (5.0, 5.0, 5.0)]
-    specs = [(gp.GluedForce.CV_GYRATION,
-              [0, 1],
-              [1.0, 1.0])]
+    specs = [(gp.GluedForce.CV_GYRATION, [0, 1], [])]   # masses from System (all 1.0)
     ctx, f = make_context(pos, specs, platform=platform)
     cvs = eval_cv(ctx, f)
     assert abs(cvs[0] - 1.0) < TOL_CV, f"Rg={cvs[0]:.8f}, expected 1.0"
@@ -181,10 +182,8 @@ def test_rg_weighted(platform):
     """Unequal masses: heavy atom 0 (m=9) at origin, light atom 1 (m=1) at 10 nm.
     COM = 1 nm; Rg = sqrt(9/10*1^2 + 1/10*9^2) = sqrt(0.9+8.1) = 3.0 nm."""
     pos = [(0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (5.0, 5.0, 5.0)]
-    specs = [(gp.GluedForce.CV_GYRATION,
-              [0, 1],
-              [9.0, 1.0])]
-    ctx, f = make_context(pos, specs, platform=platform)
+    specs = [(gp.GluedForce.CV_GYRATION, [0, 1], [])]   # masses from System (set below)
+    ctx, f = make_context(pos, specs, platform=platform, masses=[9.0, 1.0, 1.0])
     cvs = eval_cv(ctx, f)
     assert abs(cvs[0] - 3.0) < TOL_CV, f"Rg={cvs[0]:.8f}, expected 3.0"
     print(f"  test_rg_weighted: OK  (Rg={cvs[0]:.6f} nm)")
@@ -194,9 +193,7 @@ def test_rg_force_sum(platform):
     """Force sum over all Rg atoms must be zero."""
     pos = [(1.0, 0.0, 0.0), (-1.0, 0.0, 0.0),
            (0.0, 1.0, 0.0), (0.0, -1.0, 0.0)]
-    specs = [(gp.GluedForce.CV_GYRATION,
-              [0, 1, 2, 3],
-              [1.0, 1.0, 1.0, 1.0])]
+    specs = [(gp.GluedForce.CV_GYRATION, [0, 1, 2, 3], [])]
     ctx, f = make_context(pos, specs, bias_gradients=[1.0], platform=platform)
     forces = get_forces(ctx)
     for c in range(3):
@@ -209,7 +206,7 @@ def test_rg_numerical_derivative(platform):
     """Finite-difference check on atom 0 x-component for 2-atom Rg."""
     dx = 1e-3
     base = [(0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (5.0, 5.0, 5.0)]
-    specs = [(gp.GluedForce.CV_GYRATION, [0, 1], [1.0, 1.0])]
+    specs = [(gp.GluedForce.CV_GYRATION, [0, 1], [])]
 
     pos_p = list(base); pos_p[0] = (dx, 0.0, 0.0)
     ctx_p, f_p = make_context(pos_p, specs, platform=platform)
@@ -236,8 +233,8 @@ def test_mixed_com_rg(platform):
     # Rg of {0,1,2}: COM=(2,0,0); Rg=sqrt((4+0+4)/3)=sqrt(8/3)
     pos = [(0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (4.0, 0.0, 0.0), (5.0, 5.0, 5.0)]
     specs = [
-        (gp.GluedForce.CV_COM_DISTANCE, [1, 0, 1], [1.0, 1.0]),
-        (gp.GluedForce.CV_GYRATION,     [0, 1, 2], [1.0, 1.0, 1.0]),
+        (gp.GluedForce.CV_COM_DISTANCE, [0, 1], [1]),     # g1={0}, g2={1}
+        (gp.GluedForce.CV_GYRATION,     [0, 1, 2], []),   # masses from System
     ]
     ctx, f = make_context(pos, specs, platform=platform)
     cvs = eval_cv(ctx, f)
