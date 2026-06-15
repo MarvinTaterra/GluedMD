@@ -49,6 +49,7 @@ import random
 import struct
 import warnings
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import openmm as mm
@@ -135,8 +136,14 @@ class BiasStateMerger:
     Primarily used for cross-GPU MetaD-grid additive merge:
       merged = BiasStateMerger.merge_additive([blob0, blob1], force)
 
-    For OPES, the merge strategy is "select the blob with the most kernels"
-    (the richest kernel list) and broadcast it.
+    The additive merge is *incremental* across sync cycles (see
+    :meth:`merge_additive_incremental`): only the per-group delta since the
+    last sync is folded into the shared grid, so already-shared bias is not
+    re-added each cycle.
+
+    For OPES, the kernel lists from all walkers are concatenated and the
+    Welford running statistics combined with the parallel (Chan) formula — a
+    real union merge rather than discarding walkers.
     """
 
     # ------------------------------------------------------------------
@@ -146,74 +153,280 @@ class BiasStateMerger:
     @staticmethod
     def merge_additive(blobs: List[bytes], force) -> bytes:
         """
-        Merge multiple bias state blobs into one.
+        Merge multiple bias state blobs into one (non-incremental / first sync).
 
         MetaD grids: element-wise sum of all blobs (walkers collectively fill
         the shared grid — correct for independent-walker multi-walker MetaD).
         numDeposited: sum across blobs.
 
-        OPES: select the blob whose OPES section has the most kernels.
+        OPES: union of all walkers' kernel lists with combined Welford stats
+        (see :meth:`_merge_opes`).
+
+        OPES_EXPANDED: combined independently of OPES (logZ averaged in linear
+        space weighted by numUpdates, numUpdates summed).
 
         All other sections (ABMD rhoMin, ExtLag s/p, EDS λ, MaxEnt λ):
         take from blob[0] (walkers in separate groups have independent states).
 
         Requires numpy.
+
+        Note
+        ----
+        This sums the *full absolute* grids of every blob.  For repeated syncs
+        of a persistent shared grid this double-counts already-shared bias; use
+        :meth:`merge_additive_incremental` for the steady-state sync path.
+        """
+        merged, _ = BiasStateMerger.merge_additive_incremental(
+            blobs, force, baselines=None)
+        return merged
+
+    @staticmethod
+    def merge_additive_incremental(blobs: List[bytes], force, baselines=None):
+        """
+        Incremental additive merge of bias state blobs.
+
+        Parameters
+        ----------
+        blobs : list of bytes
+            One getBiasState() blob per group primary (current state).
+        force : GluedForce or None
+            Reference force, used only for per-bias dimensionality.
+        baselines : list of dict or None
+            Per-group parsed baseline (the state each group last had broadcast
+            *to* it, i.e. the last shared grid that group started accumulating
+            from).  ``None`` (or a length mismatch) means "first sync": fall
+            back to summing the full absolute grids.
+
+        Returns
+        -------
+        (merged_blob, new_baselines)
+            ``merged_blob`` is the packed merged state to broadcast to every
+            group.  ``new_baselines`` is a list (one per group) of the parsed
+            merged state — store it and pass it back as ``baselines`` next
+            sync so the merge folds in only each group's delta.
+
+        Incremental rule (per grid cell, per group g)::
+
+            new_shared = previous_shared + Σ_g (G_g_now − G_g_last_synced)
+
+        where ``previous_shared`` is the common baseline that was broadcast to
+        all groups last cycle.  Because every group received the same baseline,
+        we use ``baselines[0]`` as ``previous_shared`` and each group's own
+        baseline as ``G_g_last_synced``.  numDeposited is folded the same way.
+
+        On the first sync (``baselines is None``) this reduces exactly to the
+        full-sum semantics of the legacy merge.
         """
         if len(blobs) == 0:
             raise ValueError("no blobs to merge")
         if len(blobs) == 1:
-            return blobs[0]
+            # Still parse so the returned baseline is well-formed.
+            parsed_single = BiasStateMerger._parse(blobs[0], force)
+            return blobs[0], [parsed_single]
 
         import numpy as np
 
         # Parse all blobs into structured dicts.
         parsed = [BiasStateMerger._parse(b, force) for b in blobs]
 
+        # Decide whether we have a usable per-group baseline.
+        incremental = (baselines is not None and len(baselines) == len(parsed))
+
         # Build merged result from parsed[0] as base, then override.
         result = {k: v for k, v in parsed[0].items()}
 
-        # --- MetaD grids: additive sum ---
+        def _grid_array(b):
+            return np.frombuffer(bytes(b), dtype="<f8")
+
+        # --- MetaD grids: additive (incremental) sum ---
         if parsed[0]["metad"]:
             merged_metad = []
             for i, (nd0, g0) in enumerate(parsed[0]["metad"]):
-                grids_i = [np.frombuffer(bytes(p["metad"][i][1]), dtype="<f8")
-                            for p in parsed]
-                summed = sum(grids_i)
-                total_nd = sum(p["metad"][i][0] for p in parsed)
-                merged_metad.append((total_nd, summed.tobytes()))
+                cur = [_grid_array(p["metad"][i][1]) for p in parsed]
+                nd_cur = [p["metad"][i][0] for p in parsed]
+                if incremental:
+                    prev_shared = _grid_array(baselines[0]["metad"][i][1])
+                    nd_prev_shared = baselines[0]["metad"][i][0]
+                    summed = prev_shared.copy()
+                    total_nd = nd_prev_shared
+                    for g in range(len(parsed)):
+                        base_g = _grid_array(baselines[g]["metad"][i][1])
+                        summed = summed + (cur[g] - base_g)
+                        total_nd += nd_cur[g] - baselines[g]["metad"][i][0]
+                else:
+                    summed = sum(cur)
+                    total_nd = sum(nd_cur)
+                merged_metad.append((int(total_nd), summed.tobytes()))
             result["metad"] = merged_metad
 
-        # --- PBMetaD sub-grids: additive sum ---
+        # --- PBMetaD sub-grids: additive (incremental) sum ---
         if parsed[0]["pbmetad"]:
             merged_pb = []
             for bi, subgrids0 in enumerate(parsed[0]["pbmetad"]):
                 merged_subs = []
                 for si, (nd0, g0) in enumerate(subgrids0):
-                    grids_i = [np.frombuffer(bytes(p["pbmetad"][bi][si][1]), dtype="<f8")
-                                for p in parsed]
-                    summed = sum(grids_i)
-                    total_nd = sum(p["pbmetad"][bi][si][0] for p in parsed)
-                    merged_subs.append((total_nd, summed.tobytes()))
+                    cur = [_grid_array(p["pbmetad"][bi][si][1]) for p in parsed]
+                    nd_cur = [p["pbmetad"][bi][si][0] for p in parsed]
+                    if incremental:
+                        prev_shared = _grid_array(baselines[0]["pbmetad"][bi][si][1])
+                        nd_prev_shared = baselines[0]["pbmetad"][bi][si][0]
+                        summed = prev_shared.copy()
+                        total_nd = nd_prev_shared
+                        for g in range(len(parsed)):
+                            base_g = _grid_array(baselines[g]["pbmetad"][bi][si][1])
+                            summed = summed + (cur[g] - base_g)
+                            total_nd += nd_cur[g] - baselines[g]["pbmetad"][bi][si][0]
+                    else:
+                        summed = sum(cur)
+                        total_nd = sum(nd_cur)
+                    merged_subs.append((int(total_nd), summed.tobytes()))
                 merged_pb.append(merged_subs)
             result["pbmetad"] = merged_pb
 
-        # --- OPES: pick blob with most kernels ---
+        # --- OPES: union merge of kernel lists + combined Welford stats ---
         if parsed[0]["opes"]:
-            best_idx = 0
-            best_total = sum(nk for (nk, _, _, _, _, _, _, _) in parsed[0]["opes"])
-            for i, p in enumerate(parsed[1:], 1):
-                total = sum(nk for (nk, _, _, _, _, _, _, _) in p["opes"])
-                if total > best_total:
-                    best_total = total
-                    best_idx = i
-            result["opes"] = parsed[best_idx]["opes"]
-            result["opes_expanded"] = parsed[best_idx]["opes_expanded"]
+            result["opes"] = BiasStateMerger._merge_opes(parsed, np)
 
-        return BiasStateMerger._pack(result)
+        # --- OPES_EXPANDED: merged independently of OPES (L32) ---
+        if parsed[0]["opes_expanded"]:
+            result["opes_expanded"] = BiasStateMerger._merge_opes_expanded(parsed)
+
+        merged_blob = BiasStateMerger._pack(result)
+
+        # The new baseline for every group is the merged (now shared) state.
+        # Re-parse once so all groups share an identical, independently-owned
+        # baseline dict for the next incremental delta.
+        merged_parsed = BiasStateMerger._parse(merged_blob, force)
+        new_baselines = [merged_parsed for _ in range(len(parsed))]
+        return merged_blob, new_baselines
+
+    # ------------------------------------------------------------------
+    # OPES merge helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _merge_opes(parsed: List[dict], np) -> List[tuple]:
+        """
+        Union-merge the OPES section across all parsed blobs.
+
+        The blob stores, per OPES bias: nk kernels (centers, sigmas,
+        logWeights), a scalar logZ, nSamples, and the per-CV Welford running
+        mean / M2.  This is enough to perform a real merge of *loosely coupled*
+        OPES walkers:
+
+          * kernels: concatenate all walkers' kernel lists (centers, sigmas,
+            logWeights);
+          * nSamples: sum;
+          * runningMean / runningM2: combine pairwise with the parallel
+            (Chan et al.) formula:
+                δ      = meanB − meanA
+                mean   = meanA + δ · nB / (nA + nB)
+                M2     = M2A + M2B + δ² · nA·nB / (nA + nB)
+          * logZ: recomputed as log Σ_k exp(logWeight_k) over the *unioned*
+            kernel set (the normalisation OPES uses), so it stays consistent
+            with the merged kernel list rather than copying one walker's value.
+
+        Walkers that share a common ancestry will list overlapping kernels;
+        this is a union (not de-duplication) merge, which is the standard
+        multi-walker OPES behaviour (each walker's deposits are kept).
+        """
+        n_bias = len(parsed[0]["opes"])
+        merged = []
+        for bi in range(n_bias):
+            # Dimensionality D from the first walker's mean buffer.
+            mean0 = np.frombuffer(bytes(parsed[0]["opes"][bi][3]), dtype="<f8")
+            D = mean0.shape[0]
+
+            centers_parts, sigmas_parts, lw_parts = [], [], []
+            # Pairwise-combined Welford accumulators.
+            n_acc = 0
+            mean_acc = np.zeros(D, dtype="<f8")
+            m2_acc = np.zeros(D, dtype="<f8")
+
+            for p in parsed:
+                (nk, logZ, ns, mean_b, m2_b,
+                 cen_b, sig_b, lw_b) = p["opes"][bi]
+                centers_parts.append(bytes(cen_b))
+                sigmas_parts.append(bytes(sig_b))
+                lw_parts.append(bytes(lw_b))
+
+                mean_g = np.frombuffer(bytes(mean_b), dtype="<f8")
+                m2_g   = np.frombuffer(bytes(m2_b),   dtype="<f8")
+                nB = int(ns)
+                if nB <= 0:
+                    continue
+                if n_acc == 0:
+                    n_acc = nB
+                    mean_acc = mean_g.copy()
+                    m2_acc = m2_g.copy()
+                else:
+                    delta = mean_g - mean_acc
+                    tot = n_acc + nB
+                    mean_acc = mean_acc + delta * (nB / tot)
+                    m2_acc = m2_acc + m2_g + (delta * delta) * (n_acc * nB / tot)
+                    n_acc = tot
+
+            centers_cat = b"".join(centers_parts)
+            sigmas_cat  = b"".join(sigmas_parts)
+            lw_cat      = b"".join(lw_parts)
+            nk_total = sum(p["opes"][bi][0] for p in parsed)
+
+            # Reconcile logZ over the unioned kernel weights:
+            #   logZ = log Σ_k exp(logWeight_k)   (log-sum-exp for stability)
+            if nk_total > 0:
+                lw_all = np.frombuffer(lw_cat, dtype="<f4").astype("<f8")
+                m = float(lw_all.max())
+                logZ_merged = m + float(np.log(np.exp(lw_all - m).sum()))
+            else:
+                logZ_merged = float(parsed[0]["opes"][bi][1])
+
+            merged.append((
+                int(nk_total), logZ_merged, int(n_acc),
+                mean_acc.tobytes(), m2_acc.tobytes(),
+                centers_cat, sigmas_cat, lw_cat))
+        return merged
+
+    @staticmethod
+    def _merge_opes_expanded(parsed: List[dict]) -> List[tuple]:
+        """
+        Merge the OPES_EXPANDED section independently of the OPES section (L32).
+
+        Each entry stores (logZ, numUpdates).  numUpdates is summed; logZ is
+        combined in linear space weighted by each walker's numUpdates (a
+        numUpdates-weighted average of exp(logZ)).  Falls back to a plain mean
+        when no walker has positive numUpdates.
+        """
+        import math as _math
+        n_oe = len(parsed[0]["opes_expanded"])
+        merged = []
+        for ei in range(n_oe):
+            entries = [p["opes_expanded"][ei] for p in parsed]
+            total_nu = sum(int(nu) for (_, nu) in entries)
+            if total_nu > 0:
+                # Weighted average of exp(logZ) using a shifted log-sum-exp.
+                logz_vals = [lz for (lz, _) in entries]
+                m = max(logz_vals)
+                acc = 0.0
+                for (lz, nu) in entries:
+                    if nu > 0:
+                        acc += nu * _math.exp(lz - m)
+                logZ_merged = m + _math.log(acc / total_nu)
+            else:
+                logZ_merged = sum(lz for (lz, _) in entries) / len(entries)
+            merged.append((logZ_merged, int(total_nu)))
+        return merged
 
     @staticmethod
     def _parse(blob: bytes, force) -> dict:
-        """Parse a getBiasState() blob into a structured dict using force config."""
+        """Parse a getBiasState() blob into a structured dict.
+
+        Parsing is driven by the blob's own count fields (n_opes, n_abmd, ...)
+        and per-entry sizes (nk, n_subgrids, ...).  The force configuration is
+        used only to recover the per-bias dimensionality ``D`` (the number of
+        CVs), which the blob does not store directly.  When the blob's section
+        counts disagree with the force configuration, a clear ValueError is
+        raised rather than silently mis-parsing.
+        """
         p = [0]   # mutable position
 
         def read_fmt(fmt):
@@ -226,6 +439,10 @@ class BiasStateMerger:
             return read_fmt("<i")[0]
 
         def read_bytes(n):
+            if p[0] + n > len(blob):
+                raise ValueError(
+                    f"bias-state blob truncated: needed {n} bytes at offset "
+                    f"{p[0]} but only {len(blob) - p[0]} remain")
             out = blob[p[0]:p[0]+n]
             p[0] += n
             return out
@@ -235,7 +452,8 @@ class BiasStateMerger:
         if has_header:
             p[0] += 4; read_i32()  # version
 
-        # Gather bias configuration from force.
+        # Gather bias configuration from force.  These per-bias dimension lists
+        # are validated against the blob's own counts below.
         opes_dims, abmd_dims, metad_specs, pbmetad_specs = [], [], [], []
         eds_dims, maxent_dims, extlag_dims, opes_expanded_count = [], [], [], 0
         if _GSP_AVAILABLE and force is not None:
@@ -273,13 +491,30 @@ class BiasStateMerger:
                 elif btype == gsp.GluedForce.BIAS_OPES_EXPANDED:
                     opes_expanded_count += 1
 
-        # Parse OPES section.
+        def _check_count(section, blob_n, config_dims):
+            """Validate the blob's section count against the force config.
+
+            The config list is only consulted when the force was supplied; an
+            empty list means "no force info" and we trust the blob.
+            """
+            if config_dims and blob_n != len(config_dims):
+                raise ValueError(
+                    f"bias-state {section} count mismatch: blob declares "
+                    f"{blob_n} but force config has {len(config_dims)}")
+
+        # Parse OPES section.  Drive iteration off the blob's n_opes, using the
+        # config only to recover D per bias.
         opes = []
         n_opes = read_i32()
-        for d_i, D in enumerate(opes_dims[:n_opes]):
+        _check_count("OPES", n_opes, opes_dims)
+        for d_i in range(n_opes):
+            D = opes_dims[d_i] if d_i < len(opes_dims) else None
             nk = read_i32()
             logZ = read_fmt("<d")[0]
             ns = read_i32()
+            if D is None:
+                raise ValueError(
+                    "cannot parse OPES bias without force config (need D=numCVs)")
             mean_bytes = read_bytes(D * 8)
             m2_bytes   = read_bytes(D * 8)
             centers_bytes    = read_bytes(nk * D * 4)
@@ -292,26 +527,46 @@ class BiasStateMerger:
         abmd = []
         if p[0] < len(blob):
             n_abmd = read_i32()
-            for d_i, D in enumerate(abmd_dims[:n_abmd]):
-                abmd.append(read_bytes(D * 8))
+            _check_count("ABMD", n_abmd, abmd_dims)
+            for d_i in range(n_abmd):
+                if d_i >= len(abmd_dims):
+                    raise ValueError(
+                        "cannot parse ABMD bias without force config (need D)")
+                abmd.append(read_bytes(abmd_dims[d_i] * 8))
 
-        # Parse MetaD section.
+        # Parse MetaD section.  G (grid size) is recovered from config.
         metad = []
         if p[0] < len(blob):
             n_metad = read_i32()
-            for G in metad_specs[:n_metad]:
+            _check_count("MetaD", n_metad, metad_specs)
+            for b_i in range(n_metad):
+                if b_i >= len(metad_specs):
+                    raise ValueError(
+                        "cannot parse MetaD bias without force config (need grid size)")
+                G = metad_specs[b_i]
                 nd = read_i32()
                 grid_bytes = read_bytes(G * 8)
                 metad.append((nd, grid_bytes))
 
-        # Parse PBMetaD section.
+        # Parse PBMetaD section.  Sub-grid count is driven by the blob; sizes
+        # come from config.
         pbmetad = []
         if p[0] < len(blob):
             n_pbmetad = read_i32()
-            for sub_sizes in pbmetad_specs[:n_pbmetad]:
+            _check_count("PBMetaD", n_pbmetad, pbmetad_specs)
+            for b_i in range(n_pbmetad):
+                if b_i >= len(pbmetad_specs):
+                    raise ValueError(
+                        "cannot parse PBMetaD bias without force config (need sub-grid sizes)")
+                sub_sizes = pbmetad_specs[b_i]
                 n_sub = read_i32()
+                if n_sub != len(sub_sizes):
+                    raise ValueError(
+                        f"PBMetaD bias {b_i} sub-grid count mismatch: blob "
+                        f"declares {n_sub} but force config has {len(sub_sizes)}")
                 subs = []
-                for G in sub_sizes[:n_sub]:
+                for si in range(n_sub):
+                    G = sub_sizes[si]
                     nd = read_i32()
                     grid_bytes = read_bytes(G * 8)
                     subs.append((nd, grid_bytes))
@@ -322,10 +577,14 @@ class BiasStateMerger:
         n_linear   = read_i32() if p[0] < len(blob) else 0
         n_wall     = read_i32() if p[0] < len(blob) else 0
 
-        # OPES expanded.
+        # OPES expanded.  Count driven by blob; validate against config.
         opes_expanded = []
         if p[0] < len(blob):
             n_oe = read_i32()
+            if opes_expanded_count and n_oe != opes_expanded_count:
+                raise ValueError(
+                    f"bias-state OPES_EXPANDED count mismatch: blob declares "
+                    f"{n_oe} but force config has {opes_expanded_count}")
             for _ in range(n_oe):
                 logZ_oe = read_fmt("<d")[0]
                 nu_oe   = read_i32()
@@ -335,7 +594,12 @@ class BiasStateMerger:
         ext_lag = []
         if p[0] < len(blob):
             n_el = read_i32()
-            for d_i, D in enumerate(extlag_dims[:n_el]):
+            _check_count("EXT_LAGRANGIAN", n_el, extlag_dims)
+            for d_i in range(n_el):
+                if d_i >= len(extlag_dims):
+                    raise ValueError(
+                        "cannot parse EXT_LAGRANGIAN bias without force config (need D)")
+                D = extlag_dims[d_i]
                 s_bytes = read_bytes(D * 8)
                 p_bytes = read_bytes(D * 8)
                 ext_lag.append((s_bytes, p_bytes))
@@ -344,7 +608,12 @@ class BiasStateMerger:
         eds = []
         if p[0] < len(blob):
             n_eds = read_i32()
-            for d_i, D in enumerate(eds_dims[:n_eds]):
+            _check_count("EDS", n_eds, eds_dims)
+            for d_i in range(n_eds):
+                if d_i >= len(eds_dims):
+                    raise ValueError(
+                        "cannot parse EDS bias without force config (need D)")
+                D = eds_dims[d_i]
                 lam  = read_bytes(D * 8)
                 mean = read_bytes(D * 8)
                 ssd  = read_bytes(D * 8)
@@ -356,8 +625,12 @@ class BiasStateMerger:
         maxent = []
         if p[0] < len(blob):
             n_mx = read_i32()
-            for d_i, D in enumerate(maxent_dims[:n_mx]):
-                maxent.append(read_bytes(D * 8))
+            _check_count("MAXENT", n_mx, maxent_dims)
+            for d_i in range(n_mx):
+                if d_i >= len(maxent_dims):
+                    raise ValueError(
+                        "cannot parse MAXENT bias without force config (need D)")
+                maxent.append(read_bytes(maxent_dims[d_i] * 8))
 
         return dict(
             opes=opes, abmd=abmd, metad=metad, pbmetad=pbmetad,
@@ -637,6 +910,21 @@ class MultiWalkerPool:
         self._pair_attempts: Dict[Tuple[int,int], int] = defaultdict(int)
         self._pair_accepted: Dict[Tuple[int,int], int] = defaultdict(int)
 
+        # Per-group last-synced baseline (parsed bias state) for the incremental
+        # additive merge.  None until the first sync establishes a shared grid.
+        self._sync_baselines = None
+
+        # Thread pool for true per-GPU parallel stepping.  Separate OpenMM
+        # Contexts on distinct devices are independent, and Integrator.step()
+        # releases the GIL during the C++/GPU computation, so one thread per GPU
+        # group steps the groups concurrently (real GPU-count speedup).  A pool
+        # is created only when there is more than one group.
+        self._executor = None
+        if len(self._groups) > 1:
+            self._executor = ThreadPoolExecutor(
+                max_workers=len(self._groups),
+                thread_name_prefix="glued-walker-group")
+
         # Validate RE parameters.
         if self._re_mode == "H-REUS":
             if kT is None:
@@ -735,17 +1023,65 @@ class MultiWalkerPool:
     # ------------------------------------------------------------------
 
     def _step_all(self, n: int):
-        """Advance all walkers in all groups by n MD steps."""
-        for wg in self._groups:
+        """Advance all walkers in all groups by n MD steps.
+
+        Each GPU group runs on its own worker thread so groups on distinct
+        devices advance concurrently (Integrator.step() releases the GIL during
+        the GPU computation).  Within a group walkers share one device and are
+        stepped serially.  With a single group, runs inline (no threads).
+        """
+        def _step_group(wg):
             for ctx in wg:
                 ctx.getIntegrator().step(n)
+
+        if self._executor is None:
+            for wg in self._groups:
+                _step_group(wg)
+            return
+
+        # Submit one task per GPU group and wait for all to finish.  Re-raise
+        # the first exception (if any) after every group has completed.
+        futures = [self._executor.submit(_step_group, wg) for wg in self._groups]
+        first_exc = None
+        for fut in futures:
+            try:
+                fut.result()
+            except Exception as exc:  # noqa: BLE001 — collect then re-raise
+                if first_exc is None:
+                    first_exc = exc
+        if first_exc is not None:
+            raise first_exc
+
+    def close(self):
+        """Shut down the per-GPU stepping thread pool.
+
+        Optional — the pool is also released when the object is garbage
+        collected.  Provided so callers can deterministically free threads.
+        """
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
+
+    def __del__(self):
+        # Best-effort cleanup; never raise from a finaliser.
+        try:
+            self.close()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Cross-GPU bias sync
     # ------------------------------------------------------------------
 
     def _sync_bias(self):
-        """Merge bias states across GPU groups and broadcast the result."""
+        """Merge bias states across GPU groups and broadcast the result.
+
+        The additive merge is *incremental*: only the per-group delta since the
+        last sync is folded into the shared grid, so already-shared bias is not
+        re-added each cycle.  Per-group baselines are cached in
+        ``self._sync_baselines`` (see
+        :meth:`BiasStateMerger.merge_additive_incremental`).
+        """
         if len(self._groups) < 2:
             return  # nothing to merge for a single group
 
@@ -757,12 +1093,18 @@ class MultiWalkerPool:
             # Representative force for configuration lookup.
             ref_force = primary_forces[0]
             try:
-                merged = BiasStateMerger.merge_additive(blobs, ref_force)
+                merged, self._sync_baselines = \
+                    BiasStateMerger.merge_additive_incremental(
+                        blobs, ref_force, baselines=self._sync_baselines)
             except Exception as exc:
                 warnings.warn(
                     f"Additive bias merge failed ({exc}); falling back to broadcast.",
                     stacklevel=2)
                 merged = blobs[0]
+                # Reset baselines: after a fallback broadcast every group starts
+                # from the broadcast state, so a stale incremental baseline would
+                # be wrong.  Force a fresh full-sum on the next successful sync.
+                self._sync_baselines = None
         else:
             merged = blobs[0]
 
@@ -800,20 +1142,58 @@ class MultiWalkerPool:
         v_i = si.getVelocities(asNumpy=True)
         v_j = sj.getVelocities(asNumpy=True)
 
+        # H35: capture each replica's periodic box vectors so they travel with
+        # the configuration on an accepted swap (and so foreign-position energy
+        # evaluations use the matching box).  Use the plain (list-of-Vec3) form
+        # so the three vectors unpack cleanly into setPeriodicBoxVectors(a,b,c).
+        box_i = si.getPeriodicBoxVectors()
+        box_j = sj.getPeriodicBoxVectors()
+
         if self._re_mode == "H-REUS":
             E_ii = si.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
             E_jj = sj.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
 
-            ctx_i.setPositions(x_j);  E_ij = _total_energy_kJ(ctx_i);  ctx_i.setPositions(x_i)
-            ctx_j.setPositions(x_i);  E_ji = _total_energy_kJ(ctx_j);  ctx_j.setPositions(x_j)
+            # H36: evaluate each foreign configuration with try/finally so the
+            # original positions (and box) are always restored even if the
+            # energy evaluation raises.  H35: set the foreign box alongside the
+            # foreign positions, then restore both.
+            try:
+                ctx_i.setPeriodicBoxVectors(*box_j)
+                ctx_i.setPositions(x_j)
+                E_ij = _total_energy_kJ(ctx_i)
+            finally:
+                ctx_i.setPeriodicBoxVectors(*box_i)
+                ctx_i.setPositions(x_i)
+            try:
+                ctx_j.setPeriodicBoxVectors(*box_i)
+                ctx_j.setPositions(x_i)
+                E_ji = _total_energy_kJ(ctx_j)
+            finally:
+                ctx_j.setPeriodicBoxVectors(*box_j)
+                ctx_j.setPositions(x_j)
 
             delta     = -beta_i * (E_ij + E_ji - E_ii - E_jj)
             v_i_new, v_j_new = v_j, v_i
 
         else:  # T-REMD
+            # L30: the T-REMD criterion only needs each replica's *own* energy
+            # at its own configuration.  Compute it directly from the captured
+            # State (no foreign positions set), so there are never pending
+            # foreign-position side effects to leave stale.
             if self._bias_group is not None:
-                U_ii = _total_energy_kJ(ctx_i) - _group_energy_kJ(ctx_i, 1 << self._bias_group)
-                U_jj = _total_energy_kJ(ctx_j) - _group_energy_kJ(ctx_j, 1 << self._bias_group)
+                # Isolate MM energy from bias energy.  Both reads are at the
+                # replica's current (own) configuration; wrap in try/finally as
+                # a safety net even though no positions are being swapped here.
+                try:
+                    U_ii = (_total_energy_kJ(ctx_i)
+                            - _group_energy_kJ(ctx_i, 1 << self._bias_group))
+                    U_jj = (_total_energy_kJ(ctx_j)
+                            - _group_energy_kJ(ctx_j, 1 << self._bias_group))
+                finally:
+                    # No positions were changed; restoring is a no-op safeguard
+                    # that also guarantees a consistent state if a read failed.
+                    ctx_i.setPositions(x_i)
+                    ctx_j.setPositions(x_j)
             else:
                 U_ii = si.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
                 U_jj = sj.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
@@ -831,7 +1211,10 @@ class MultiWalkerPool:
         if accepted:
             self._re_accepted          += 1
             self._pair_accepted[key]   += 1
+            # H35: box vectors travel with the configuration.
+            ctx_i.setPeriodicBoxVectors(*box_j)
             ctx_i.setPositions(x_j);  ctx_i.setVelocities(v_i_new)
+            ctx_j.setPeriodicBoxVectors(*box_i)
             ctx_j.setPositions(x_i);  ctx_j.setVelocities(v_j_new)
 
         return accepted
