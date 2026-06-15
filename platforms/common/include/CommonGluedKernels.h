@@ -1,1051 +1,811 @@
-#include "CommonGluedKernels.h"
-#include "GluedForce.h"
-#include "openmm/common/ContextSelector.h"
-#include <cmath>
+#ifndef COMMON_GLUED_KERNELS_H_
+#define COMMON_GLUED_KERNELS_H_
+
+#include "GluedKernels.h"
+#include "openmm/common/ComputeContext.h"
+#include "openmm/common/ComputeArray.h"
+#include "openmm/common/ComputeKernel.h"
+#include "openmm/Platform.h"
+#include "openmm/System.h"
 #include <string>
 #include <vector>
 
-using namespace GluedPlugin;
-using namespace OpenMM;
-using namespace std;
-
-// Kernel source strings defined in CommonGluedKernels.cpp
-extern const string kScatterKernelSrc;
-extern const string kHarmonicKernelSrc;
-extern const string kLinearKernelSrc;
-extern const string kWallKernelSrc;
-extern const string kOPESKernelSrc;
-extern const string kOPESExpandedKernelSrc;
-extern const string kMovingRestraintKernelSrc;
-extern const string kABMDKernelSrc;
-extern const string kExtLagKernelSrc;
-extern const string kEdsKernelSrc;
-extern const string kMaxEntKernelSrc;
-extern const string kMetaDKernelSrc;
-extern const string kPBMetaDKernelSrc;
-extern const string kMultithermalKernelSrc;
-
-
-// Allocate GPU state and compile kernels for every registered bias.
-// Also compiles the chain-rule scatter kernel (depends on Jacobian arrays).
-// Called from initialize() after compileCVKernels().
-void CommonCalcGluedForceKernel::setupBiases(const GluedForce& force) {
- // Bias kernels — set up one entry per addBias call.
- // Bias kernels run after CV kernels but before scatter so that
- // cvBiasGradients is fully populated before chain-rule scatter.
- int numBiases = force.getNumBiases();
-
- // Reject biasing a VOLUME or CELL CV: those kernels emit no Jacobian entries and there
- // is no virial/box-derivative path, so a bias on them would apply zero force on every
- // atom (a silent no-op). Fail loudly instead — VOLUME/CELL are read-only CVs (use them
- // for monitoring / COLVAR output). (H13)
- for (int b = 0; b < numBiases; b++) {
- int t; vector<int> ci; vector<double> p; vector<int> ip;
- force.getBiasInfo(b, t, ci, p, ip);
- for (int idx : ci) {
- bool isVol = plan_.numVolumeCVs > 0 && idx >= plan_.volumeFirstCVIndex &&
- idx < plan_.volumeFirstCVIndex + plan_.numVolumeCVs;
- bool isCell = plan_.numCellCVs > 0 && idx >= plan_.cellFirstCVIndex &&
- idx < plan_.cellFirstCVIndex + plan_.numCellCVs;
- if (isVol || isCell)
- throw OpenMMException("GLUED: biasing a VOLUME/CELL CV is not supported (no "
- "virial/force path); these CVs are read-only — use them for monitoring only.");
- }
- }
-
- // Reserve all bias vectors before the loop to prevent reallocation.
- // Reallocation would invalidate pointers stored in kernel addArg() calls.
- // Also count totalEnergySlots: PBMetaD has one slot per subgrid (per CV dim).
- {
- int nH=0, nMv=0, nOp=0, nAb=0, nMd=0, nPb=0, nEx=0, nLin=0, nWall=0, nOpEx=0, nEl=0, nEds=0, nMxe=0, nMt=0;
- int totalEnergySlots = 0;
- for (int b = 0; b < numBiases; b++) {
- int t; vector<int> ci; vector<double> p; vector<int> ip;
- force.getBiasInfo(b, t, ci, p, ip);
- if (t == GluedForce::BIAS_HARMONIC) { nH++; totalEnergySlots++; }
- else if (t == GluedForce::BIAS_MOVING_RESTRAINT) { nMv++; totalEnergySlots++; }
- else if (t == GluedForce::BIAS_OPES) { nOp++; totalEnergySlots++; }
- else if (t == GluedForce::BIAS_ABMD) { nAb++; totalEnergySlots++; }
- else if (t == GluedForce::BIAS_METAD) { nMd++; totalEnergySlots++; }
- else if (t == GluedForce::BIAS_PBMETAD) { nPb++; totalEnergySlots += 1; }
- else if (t == GluedForce::BIAS_EXTERNAL) { nEx++; totalEnergySlots++; }
- else if (t == GluedForce::BIAS_LINEAR) { nLin++; totalEnergySlots++; }
- else if (t == GluedForce::BIAS_UPPER_WALL ||
- t == GluedForce::BIAS_LOWER_WALL) { nWall++; totalEnergySlots++; }
- else if (t == GluedForce::BIAS_OPES_EXPANDED) { nOpEx++; totalEnergySlots++; }
- else if (t == GluedForce::BIAS_EXT_LAGRANGIAN) { nEl++; totalEnergySlots++; }
- else if (t == GluedForce::BIAS_EDS) { nEds++; totalEnergySlots++; }
- else if (t == GluedForce::BIAS_MAXENT) { nMxe++; totalEnergySlots++; }
- else if (t == GluedForce::BIAS_OPES_MULTITHERMAL) { nMt++; totalEnergySlots++; }
- }
- // Allocate the shared bias energy buffer and CPU mirror.
- int slots = max(1, totalEnergySlots);
- plan_.biasEnergies.initialize<double>(cc_, slots, "biasEnergies");
- plan_.biasEnergiesCPU.assign(totalEnergySlots, 0.0);
- harmonicBiases_.reserve(nH);
- movingRestraintBiases_.reserve(nMv);
- opesBiases_.reserve(nOp);
- abmdBiases_.reserve(nAb);
- metaDGridBiases_.reserve(nMd);
- pbmetaDGridBiases_.reserve(nPb);
- externalGridBiases_.reserve(nEx);
- linearBiases_.reserve(nLin);
- wallBiases_.reserve(nWall);
- opesExpandedBiases_.reserve(nOpEx);
- extLagBiases_.reserve(nEl);
- edsBiases_.reserve(nEds);
- maxentBiases_.reserve(nMxe);
- multithermalBiases_.reserve(nMt);
- }
-
- int biasEnergyCounter = 0; // monotonically assigned slot in plan_.biasEnergies
- for (int bIdx = 0; bIdx < numBiases; bIdx++) {
- int bType;
- vector<int> cvIndices;
- vector<double> bParams;
- vector<int> bIntParams;
- force.getBiasInfo(bIdx, bType, cvIndices, bParams, bIntParams);
-
- if (bType == GluedForce::BIAS_HARMONIC) {
- harmonicBiases_.emplace_back();
- HarmonicBias& h = harmonicBiases_.back();
- h.numCVsBias = (int)cvIndices.size();
- h.cvIdxGlobal = cvIndices;
- h.cvIdxGPU.initialize<int>(cc_, h.numCVsBias,
- "harmBias_cvIdx_" + to_string(bIdx));
- h.cvIdxGPU.upload(vector<int>(cvIndices.begin(), cvIndices.end()));
-
- // params layout: [k_0, s0_0, k_1, s0_1, ...]
- vector<float> pf;
- for (int d = 0; d < h.numCVsBias; d++) {
- pf.push_back((float)bParams[2*d]);
- pf.push_back((float)bParams[2*d + 1]);
- }
- h.params.initialize<float>(cc_, 2*h.numCVsBias,
- "harmBias_params_" + to_string(bIdx));
- h.params.upload(pf);
- h.biasEnergyIdx = biasEnergyCounter++;
-
- ComputeProgram hProg = cc_.compileProgram(kHarmonicKernelSrc, {});
- h.evalKernel = hProg->createKernel("harmonicEvalBias");
- h.evalKernel->addArg(plan_.cvValues); // 0
- h.evalKernel->addArg(h.cvIdxGPU); // 1
- h.evalKernel->addArg(h.params); // 2
- h.evalKernel->addArg(h.numCVsBias); // 3
- h.evalKernel->addArg(plan_.cvBiasGradients); // 4
- h.evalKernel->addArg(plan_.biasEnergies); // 5
- h.evalKernel->addArg(h.biasEnergyIdx); // 6
- // periodic flag (int_params[0]): wrap (s - s0) into the nearest image for periodic CVs
- int harmPeriodic = bIntParams.empty() ? 0 : bIntParams[0];
- h.evalKernel->addArg(harmPeriodic); // 7: periodic (was spare)
-
- } else if (bType == GluedForce::BIAS_MOVING_RESTRAINT) {
- movingRestraintBiases_.emplace_back();
- MovingRestraintBias& mv = movingRestraintBiases_.back();
- mv.numCVsBias = (int)cvIndices.size();
- mv.cvIdxGlobal = cvIndices;
- int M = bIntParams.size() > 0 ? bIntParams[0] : 1;
- mv.numScheduleSteps = M;
- int D = mv.numCVsBias;
- int stride = 1 + 2*D;
- mv.cvIdxGPU.initialize<int>(cc_, D,
- "movRestraint_cvIdx_" + to_string(bIdx));
- mv.cvIdxGPU.upload(vector<int>(cvIndices.begin(), cvIndices.end()));
- mv.schedule.initialize<double>(cc_, M * stride,
- "movRestraint_sched_" + to_string(bIdx));
- mv.schedule.upload(vector<double>(bParams.begin(), bParams.end()));
- mv.biasEnergyIdx = biasEnergyCounter++;
- ComputeProgram mvProg = cc_.compileProgram(kMovingRestraintKernelSrc, {});
- mv.evalKernel = mvProg->createKernel("movingRestraintEvalBias");
- mv.evalKernel->addArg(plan_.cvValues); // 0
- mv.evalKernel->addArg(mv.cvIdxGPU); // 1
- mv.evalKernel->addArg(mv.schedule); // 2
- mv.evalKernel->addArg(M); // 3
- mv.evalKernel->addArg(D); // 4
- mv.evalKernel->addArg(0.0); // 5: currentStep (setArg in execute)
- mv.evalKernel->addArg(plan_.cvBiasGradients); // 6
- mv.evalKernel->addArg(plan_.biasEnergies); // 7
- mv.evalKernel->addArg(mv.biasEnergyIdx); // 8
- mv.evalKernel->addArg(); // 9: spare (8.5.1 fix)
-
- } else if (bType == GluedForce::BIAS_ABMD) {
- abmdBiases_.emplace_back();
- AbmdBias& a = abmdBiases_.back();
- a.numCVsBias = (int)cvIndices.size();
- a.cvIdxGlobal = cvIndices;
- int D = a.numCVsBias;
- a.rhoMinCPU.resize(D, -1.0); // -1 = sentinel: first call always updates
- vector<float> kappaVec(D);
- vector<double> toVec(D);
- for (int d = 0; d < D; d++) {
- kappaVec[d] = (float)bParams[2*d];
- toVec[d] = bParams[2*d + 1]; // target value TO
- }
- a.cvIdxGPU.initialize<int>(cc_, D, "abmd_cvIdx_" + to_string(bIdx));
- a.cvIdxGPU.upload(vector<int>(cvIndices.begin(), cvIndices.end()));
- a.rhoMin.initialize<double>(cc_, D, "abmd_rhoMin_" + to_string(bIdx));
- a.rhoMin.upload(a.rhoMinCPU);
- a.toGPU.initialize<double>(cc_, D, "abmd_to_" + to_string(bIdx));
- a.toGPU.upload(toVec);
- a.kappa.initialize<float>(cc_, D, "abmd_kappa_" + to_string(bIdx));
- a.kappa.upload(kappaVec);
- a.biasEnergyIdx = biasEnergyCounter++;
- ComputeProgram abmdProg = cc_.compileProgram(kABMDKernelSrc, {});
- a.evalKernel = abmdProg->createKernel("abmdEvalBias");
- a.evalKernel->addArg(plan_.cvValues); // 0
- a.evalKernel->addArg(a.cvIdxGPU); // 1
- a.evalKernel->addArg(a.toGPU); // 2
- a.evalKernel->addArg(a.rhoMin); // 3
- a.evalKernel->addArg(a.kappa); // 4
- a.evalKernel->addArg(D); // 5
- a.evalKernel->addArg(plan_.cvBiasGradients); // 6
- a.evalKernel->addArg(plan_.biasEnergies); // 7
- a.evalKernel->addArg(a.biasEnergyIdx); // 8
- a.evalKernel->addArg(); // 9: spare
-
- } else if (bType == GluedForce::BIAS_METAD) {
- metaDGridBiases_.emplace_back();
- MetaDGridBias& m = metaDGridBiases_.back();
- m.numCVsBias = (int)cvIndices.size();
- m.D = m.numCVsBias;
- m.cvIdxGlobal = cvIndices;
-
- m.height0 = bParams[0];
- for (int d = 0; d < m.D; d++) m.sigma.push_back(bParams[1 + d]);
- m.gamma = bParams[1 + m.D];
- m.kT = bParams[2 + m.D];
- for (int d = 0; d < m.D; d++) m.origin.push_back(bParams[3 + m.D + d]);
- for (int d = 0; d < m.D; d++) m.maxVal.push_back(bParams[3 + 2*m.D + d]);
-
- m.pace = bIntParams[0];
- for (int d = 0; d < m.D; d++) m.numBins.push_back(bIntParams[1 + d]);
- for (int d = 0; d < m.D; d++) m.isPeriodic.push_back(bIntParams[1 + m.D + d]);
-
- m.spacing.resize(m.D); m.invSpacing.resize(m.D);
- m.actualPoints.resize(m.D); m.strides.resize(m.D);
- for (int d = 0; d < m.D; d++) {
- m.spacing[d] = (m.maxVal[d] - m.origin[d]) / m.numBins[d];
- m.invSpacing[d] = m.numBins[d] / (m.maxVal[d] - m.origin[d]);
- m.actualPoints[d] = m.numBins[d] + (m.isPeriodic[d] ? 0 : 1);
- }
- m.strides[0] = 1;
- for (int d = 1; d < m.D; d++)
- m.strides[d] = m.strides[d-1] * m.actualPoints[d-1];
- m.totalGridPoints = m.strides[m.D-1] * m.actualPoints[m.D-1];
-
- m.gridCPU.assign(m.totalGridPoints, 0.0);
-
- m.cvIdxGPU.initialize<int>(cc_, m.D, "metaD_cvIdx_" + to_string(bIdx));
- m.cvIdxGPU.upload(vector<int>(cvIndices.begin(), cvIndices.end()));
- m.grid.initialize<double>(cc_, m.totalGridPoints, "metaD_grid_" + to_string(bIdx));
- m.grid.upload(m.gridCPU);
- m.originGPU.initialize<double>(cc_, m.D, "metaD_origin_" + to_string(bIdx));
- m.originGPU.upload(m.origin);
- m.invSpacingGPU.initialize<double>(cc_, m.D, "metaD_invSp_" + to_string(bIdx));
- m.invSpacingGPU.upload(m.invSpacing);
- m.actualPointsGPU.initialize<int>(cc_, m.D, "metaD_npts_" + to_string(bIdx));
- m.actualPointsGPU.upload(vector<int>(m.actualPoints.begin(), m.actualPoints.end()));
- m.stridesGPU.initialize<int>(cc_, m.D, "metaD_strides_" + to_string(bIdx));
- m.stridesGPU.upload(vector<int>(m.strides.begin(), m.strides.end()));
- m.periodicGPU.initialize<int>(cc_, m.D, "metaD_periodic_" + to_string(bIdx));
- m.periodicGPU.upload(vector<int>(m.isPeriodic.begin(), m.isPeriodic.end()));
- m.sigmaGPU.initialize<double>(cc_, m.D, "metaD_sigma_" + to_string(bIdx));
- m.sigmaGPU.upload(m.sigma);
- m.centerGPU.initialize<double>(cc_, m.D, "metaD_center_" + to_string(bIdx));
- m.biasEnergyIdx = biasEnergyCounter++;
- m.heightInvFactor = (m.gamma <= 1.0) ? 0.0 : 1.0 / ((m.gamma - 1.0) * m.kT);
-
- ComputeProgram mdProg = cc_.compileProgram(kMetaDKernelSrc, {});
-
- m.evalKernel = mdProg->createKernel("metaDEvalBias");
- m.evalKernel->addArg(plan_.cvValues); // 0
- m.evalKernel->addArg(m.cvIdxGPU); // 1
- m.evalKernel->addArg(m.grid); // 2
- m.evalKernel->addArg(m.originGPU); // 3
- m.evalKernel->addArg(m.invSpacingGPU); // 4
- m.evalKernel->addArg(m.actualPointsGPU); // 5
- m.evalKernel->addArg(m.stridesGPU); // 6
- m.evalKernel->addArg(m.periodicGPU); // 7
- m.evalKernel->addArg(m.D); // 8
- m.evalKernel->addArg(plan_.cvBiasGradients); // 9
- m.evalKernel->addArg(plan_.biasEnergies); // 10
- m.evalKernel->addArg(m.biasEnergyIdx); // 11
- m.evalKernel->addArg(); // 12: spare (8.5.1 fix)
-
- m.depositKernel = mdProg->createKernel("metaDDeposit");
- m.depositKernel->addArg(m.grid); // 0
- m.depositKernel->addArg(m.originGPU); // 1
- m.depositKernel->addArg(m.invSpacingGPU); // 2
- m.depositKernel->addArg(m.actualPointsGPU); // 3
- m.depositKernel->addArg(m.stridesGPU); // 4
- m.depositKernel->addArg(m.periodicGPU); // 5
- m.depositKernel->addArg(m.D); // 6
- m.depositKernel->addArg(m.totalGridPoints); // 7
- m.depositKernel->addArg(m.centerGPU); // 8
- m.depositKernel->addArg(m.sigmaGPU); // 9
- m.depositKernel->addArg(plan_.biasEnergies); // 10
- m.depositKernel->addArg(m.biasEnergyIdx); // 11
- m.depositKernel->addArg(m.height0); // 12
- m.depositKernel->addArg(m.heightInvFactor); // 13
- m.depositKernel->addArg(); // 14: spare
-
- m.gatherCVsKernel = mdProg->createKernel("metaDGatherCVs");
- m.gatherCVsKernel->addArg(plan_.cvValues); // 0
- m.gatherCVsKernel->addArg(m.cvIdxGPU); // 1
- m.gatherCVsKernel->addArg(m.centerGPU); // 2
- m.gatherCVsKernel->addArg(m.D); // 3
-
- } else if (bType == GluedForce::BIAS_PBMETAD) {
- // N independent 1-D MetaD grids combined via log-sum-exp (PBMetaD, Pfaendtner & Bonomi 2015).
- // params: [height0, gamma, kT, sigma_0, origin_0, max_0, sigma_1, ...]
- // intParams: [pace, numBins_0, periodic_0, numBins_1, periodic_1, ...]
- pbmetaDGridBiases_.emplace_back();
- PBMetaDGridBias& pb = pbmetaDGridBiases_.back();
- int N = (int)cvIndices.size();
- double height0 = bParams[0];
- double gamma = bParams[1];
- double kT = bParams[2];
- pb.pace = bIntParams[0];
- pb.kT = kT;
- pb.subGrids.resize(N);
- pb.combinedEnergySlot = biasEnergyCounter++;  // ONE slot for entire PBMETAD bias
-
- // Shared buffers for combining: localEnergy[N], localGrad[N], softmaxWeights[N], cvIdxList[N]
- string pbtag = "pb_" + to_string(bIdx);
- pb.localEnergyGPU.initialize<double>(cc_, N, "pbMetaD_localE_" + pbtag);
- pb.localGradGPU.initialize<double>(cc_, N, "pbMetaD_localG_" + pbtag);
- pb.softmaxWeightsGPU.initialize<double>(cc_, N, "pbMetaD_softmax_" + pbtag);
- pb.cvIdxListGPU.initialize<int>(cc_, N, "pbMetaD_cvList_" + pbtag);
- {
-  vector<double> zeros(N, 0.0);
-  vector<double> uniform(N, 1.0 / N);
-  pb.localEnergyGPU.upload(zeros);
-  pb.localGradGPU.upload(zeros);
-  pb.softmaxWeightsGPU.upload(uniform);
-  vector<int> cvList(cvIndices.begin(), cvIndices.end());
-  pb.cvIdxListGPU.upload(cvList);
- }
-
- ComputeProgram mdProg  = cc_.compileProgram(kMetaDKernelSrc,   {});
- ComputeProgram pbProg  = cc_.compileProgram(kPBMetaDKernelSrc, {});
-
- for (int d = 0; d < N; d++) {
-  MetaDGridBias& m = pb.subGrids[d];
-  m.numCVsBias = 1;
-  m.D = 1;
-  m.cvIdxGlobal = { cvIndices[d] };
-
-  m.height0 = height0;
-  m.sigma.push_back(bParams[3 + 3*d]);
-  m.gamma = gamma;
-  m.kT = kT;
-  m.origin.push_back(bParams[3 + 3*d + 1]);
-  m.maxVal.push_back(bParams[3 + 3*d + 2]);
-  m.pace = pb.pace;
-
-  m.numBins.push_back(bIntParams[1 + 2*d]);
-  m.isPeriodic.push_back(bIntParams[1 + 2*d + 1]);
-
-  m.spacing.resize(1); m.invSpacing.resize(1);
-  m.actualPoints.resize(1); m.strides.resize(1);
-  m.spacing[0] = (m.maxVal[0] - m.origin[0]) / m.numBins[0];
-  m.invSpacing[0] = m.numBins[0] / (m.maxVal[0] - m.origin[0]);
-  m.actualPoints[0] = m.numBins[0] + (m.isPeriodic[0] ? 0 : 1);
-  m.strides[0] = 1;
-  m.totalGridPoints = m.actualPoints[0];
-  m.gridCPU.assign(m.totalGridPoints, 0.0);
-  m.biasEnergyIdx = -1;  // not used; combined slot is pb.combinedEnergySlot
-  m.heightInvFactor = (gamma <= 1.0) ? 0.0 : 1.0 / ((gamma - 1.0) * kT);
-
-  string tag = "pb_" + to_string(bIdx) + "_d" + to_string(d);
-  m.cvIdxGPU.initialize<int>(cc_, 1, "pbMetaD_cvIdx_" + tag);
-  m.cvIdxGPU.upload(vector<int>{ cvIndices[d] });
-  m.grid.initialize<double>(cc_, m.totalGridPoints, "pbMetaD_grid_" + tag);
-  m.grid.upload(m.gridCPU);
-  m.originGPU.initialize<double>(cc_, 1, "pbMetaD_origin_" + tag);
-  m.originGPU.upload(m.origin);
-  m.invSpacingGPU.initialize<double>(cc_, 1, "pbMetaD_invSp_" + tag);
-  m.invSpacingGPU.upload(m.invSpacing);
-  m.actualPointsGPU.initialize<int>(cc_, 1, "pbMetaD_npts_" + tag);
-  m.actualPointsGPU.upload(vector<int>(m.actualPoints.begin(), m.actualPoints.end()));
-  m.periodicGPU.initialize<int>(cc_, 1, "pbMetaD_periodic_" + tag);
-  m.periodicGPU.upload(vector<int>(m.isPeriodic.begin(), m.isPeriodic.end()));
-  m.sigmaGPU.initialize<double>(cc_, 1, "pbMetaD_sigma_" + tag);
-  m.sigmaGPU.upload(m.sigma);
-  m.centerGPU.initialize<double>(cc_, 1, "pbMetaD_center_" + tag);
-
-  // Sub-grid eval: writes V_i and dV_i/ds to localEnergy/localGrad[d].
-  m.evalKernel = pbProg->createKernel("pbmetaDSubgridEval");
-  m.evalKernel->addArg(plan_.cvValues);      // 0
-  m.evalKernel->addArg(m.cvIdxGPU);          // 1
-  m.evalKernel->addArg(m.grid);              // 2
-  m.evalKernel->addArg(m.originGPU);         // 3
-  m.evalKernel->addArg(m.invSpacingGPU);     // 4
-  m.evalKernel->addArg(m.actualPointsGPU);   // 5
-  m.evalKernel->addArg(m.periodicGPU);       // 6
-  m.evalKernel->addArg(pb.localEnergyGPU);   // 7
-  m.evalKernel->addArg(pb.localGradGPU);     // 8
-  m.evalKernel->addArg(d);                   // 9: subgridIdx
-
-  // Sub-grid deposit: uses localEnergy[d] and softmaxWeights[d].
-  m.depositKernel = pbProg->createKernel("pbmetaDDeposit");
-  m.depositKernel->addArg(m.grid);               // 0
-  m.depositKernel->addArg(m.originGPU);           // 1
-  m.depositKernel->addArg(m.invSpacingGPU);       // 2
-  m.depositKernel->addArg(m.actualPointsGPU);     // 3
-  m.depositKernel->addArg(m.periodicGPU);         // 4
-  m.depositKernel->addArg(m.totalGridPoints);     // 5
-  m.depositKernel->addArg(m.centerGPU);           // 6
-  m.depositKernel->addArg(m.sigmaGPU);            // 7
-  m.depositKernel->addArg(pb.localEnergyGPU);     // 8
-  m.depositKernel->addArg(d);                     // 9: subgridIdx
-  m.depositKernel->addArg(m.height0);             // 10
-  m.depositKernel->addArg(m.heightInvFactor);     // 11
-  m.depositKernel->addArg(pb.softmaxWeightsGPU);  // 12
-
-  m.gatherCVsKernel = mdProg->createKernel("metaDGatherCVs");
-  m.gatherCVsKernel->addArg(plan_.cvValues); // 0
-  m.gatherCVsKernel->addArg(m.cvIdxGPU);    // 1
-  m.gatherCVsKernel->addArg(m.centerGPU);   // 2
-  m.gatherCVsKernel->addArg(m.D);           // 3
- }
-
- // Combine kernel: log-sum-exp over localEnergy[0..N-1] → V_total in biasEnergies.
- pb.combineKernel = pbProg->createKernel("pbmetaDCombine");
- pb.combineKernel->addArg(pb.localEnergyGPU);          // 0
- pb.combineKernel->addArg(pb.localGradGPU);            // 1
- pb.combineKernel->addArg(pb.cvIdxListGPU);            // 2
- pb.combineKernel->addArg(N);                          // 3
- pb.combineKernel->addArg(kT);                         // 4
- pb.combineKernel->addArg(plan_.biasEnergies);         // 5
- pb.combineKernel->addArg(pb.combinedEnergySlot);      // 6
- pb.combineKernel->addArg(plan_.cvBiasGradients);      // 7
- pb.combineKernel->addArg(pb.softmaxWeightsGPU);       // 8
-
- } else if (bType == GluedForce::BIAS_EXTERNAL) {
- // External bias: user-supplied grid, no deposition.
- // params = [origin_0, ..., origin_{D-1}, max_0, ..., max_{D-1}, grid_vals...]
- // intParams = [numBins_0, ..., numBins_{D-1}, isPeriodic_0, ..., isPeriodic_{D-1}]
- externalGridBiases_.emplace_back();
- MetaDGridBias& m = externalGridBiases_.back();
- m.numCVsBias = (int)cvIndices.size();
- m.D = m.numCVsBias;
- m.cvIdxGlobal = cvIndices;
-
- for (int d = 0; d < m.D; d++) m.origin.push_back(bParams[d]);
- for (int d = 0; d < m.D; d++) m.maxVal.push_back(bParams[m.D + d]);
-
- for (int d = 0; d < m.D; d++) m.numBins.push_back(bIntParams[d]);
- for (int d = 0; d < m.D; d++) m.isPeriodic.push_back(bIntParams[m.D + d]);
-
- m.spacing.resize(m.D); m.invSpacing.resize(m.D);
- m.actualPoints.resize(m.D); m.strides.resize(m.D);
- for (int d = 0; d < m.D; d++) {
- m.spacing[d] = (m.maxVal[d] - m.origin[d]) / m.numBins[d];
- m.invSpacing[d] = m.numBins[d] / (m.maxVal[d] - m.origin[d]);
- m.actualPoints[d] = m.numBins[d] + (m.isPeriodic[d] ? 0 : 1);
- }
- m.strides[0] = 1;
- for (int d = 1; d < m.D; d++)
- m.strides[d] = m.strides[d-1] * m.actualPoints[d-1];
- m.totalGridPoints = m.strides[m.D-1] * m.actualPoints[m.D-1];
-
- int gridOffset = 2 * m.D;
- m.gridCPU.assign(bParams.begin() + gridOffset,
- bParams.begin() + gridOffset + m.totalGridPoints);
-
- m.cvIdxGPU.initialize<int>(cc_, m.D, "extBias_cvIdx_" + to_string(bIdx));
- m.cvIdxGPU.upload(vector<int>(cvIndices.begin(), cvIndices.end()));
- m.grid.initialize<double>(cc_, m.totalGridPoints, "extBias_grid_" + to_string(bIdx));
- m.grid.upload(m.gridCPU);
- m.originGPU.initialize<double>(cc_, m.D, "extBias_origin_" + to_string(bIdx));
- m.originGPU.upload(m.origin);
- m.invSpacingGPU.initialize<double>(cc_, m.D, "extBias_invSp_" + to_string(bIdx));
- m.invSpacingGPU.upload(m.invSpacing);
- m.actualPointsGPU.initialize<int>(cc_, m.D, "extBias_npts_" + to_string(bIdx));
- m.actualPointsGPU.upload(vector<int>(m.actualPoints.begin(), m.actualPoints.end()));
- m.stridesGPU.initialize<int>(cc_, m.D, "extBias_strides_" + to_string(bIdx));
- m.stridesGPU.upload(vector<int>(m.strides.begin(), m.strides.end()));
- m.periodicGPU.initialize<int>(cc_, m.D, "extBias_periodic_" + to_string(bIdx));
- m.periodicGPU.upload(vector<int>(m.isPeriodic.begin(), m.isPeriodic.end()));
- m.biasEnergyIdx = biasEnergyCounter++;
-
- ComputeProgram mdProg = cc_.compileProgram(kMetaDKernelSrc, {});
- m.evalKernel = mdProg->createKernel("metaDEvalBias");
- m.evalKernel->addArg(plan_.cvValues); // 0
- m.evalKernel->addArg(m.cvIdxGPU); // 1
- m.evalKernel->addArg(m.grid); // 2
- m.evalKernel->addArg(m.originGPU); // 3
- m.evalKernel->addArg(m.invSpacingGPU); // 4
- m.evalKernel->addArg(m.actualPointsGPU); // 5
- m.evalKernel->addArg(m.stridesGPU); // 6
- m.evalKernel->addArg(m.periodicGPU); // 7
- m.evalKernel->addArg(m.D); // 8
- m.evalKernel->addArg(plan_.cvBiasGradients); // 9
- m.evalKernel->addArg(plan_.biasEnergies); // 10
- m.evalKernel->addArg(m.biasEnergyIdx); // 11
- m.evalKernel->addArg(); // 12: spare
-
- } else if (bType == GluedForce::BIAS_OPES) {
- opesBiases_.emplace_back();
- OpesBias& o = opesBiases_.back();
- o.numCVsBias = (int)cvIndices.size();
- o.cvIdxGlobal = cvIndices;
- o.kT = bParams[0];
- o.gamma = bParams[1];
- for (int d = 0; d < o.numCVsBias; d++)
- o.sigma0.push_back(bParams[2 + d]);
- o.sigmaMin = bParams[2 + o.numCVsBias];
- o.variant = bIntParams.size() > 0 ? bIntParams[0] : 0;
- o.pace = bIntParams.size() > 1 ? bIntParams[1] : 500;
- o.maxKernels = bIntParams.size() > 2 ? bIntParams[2] : 100000;
- // sigma0 <= 0 signals fully-adaptive mode (no fixed sigma provided).
- // adaptiveSigmaStride may be overridden via bIntParams[3]; defaults to 10*pace.
- bool adaptiveMode = (o.sigma0[0] <= 0.0);
- o.adaptiveSigmaStride = adaptiveMode
- ? (bIntParams.size() > 3 ? bIntParams[3] : 10 * o.pace)
- : 0;
-
- // Staging buffers (for serialization only, not kept in sync during simulation).
- o.runningMean.assign(o.numCVsBias, 0.0);
- o.runningM2.assign(o.numCVsBias, 0.0);
-
- // Pre-allocate full CPU arrays for serialization downloads.
- o.kernelCentersCPU.assign(o.maxKernels * o.numCVsBias, 0.0f);
- o.kernelSigmasCPU.assign(o.maxKernels * o.numCVsBias, 1.0f);
- o.kernelLogWeightsCPU.assign(o.maxKernels, 0.0f);
-
- o.cvIdxGPU.initialize<int>(cc_, o.numCVsBias,
- "opesBias_cvIdx_" + to_string(bIdx));
- o.cvIdxGPU.upload(vector<int>(cvIndices.begin(), cvIndices.end()));
-
- int D = o.numCVsBias;
- // double storage for the OPES kernel table (centers/sigmas/logWeights) — float drifts
- // visibly over millions of steps and broke OPES energy agreement at ~1e-4. (M-OPESfloat)
- o.kernelCenters.initialize<double>(cc_, o.maxKernels * D,
- "opesBias_centers_" + to_string(bIdx));
- o.kernelSigmas.initialize<double>(cc_, o.maxKernels * D,
- "opesBias_sigmas_" + to_string(bIdx));
- o.kernelLogWeights.initialize<double>(cc_, o.maxKernels,
- "opesBias_logW_" + to_string(bIdx));
-
- // GPU-resident Welford state and logZ
- o.runningMeanGPU.initialize<double>(cc_, D, "opesBias_runMean_" + to_string(bIdx));
- o.runningMeanGPU.upload(o.runningMean);
- o.runningM2GPU.initialize<double>(cc_, D, "opesBias_runM2_" + to_string(bIdx));
- o.runningM2GPU.upload(o.runningM2);
- o.nSamplesGPU.initialize<int>(cc_, 1, "opesBias_nSamp_" + to_string(bIdx));
- o.nSamplesGPU.upload(vector<int>{0});
- o.sigma0GPU.initialize<double>(cc_, D, "opesBias_sigma0_" + to_string(bIdx));
- o.sigma0GPU.upload(o.sigma0);
- o.logZGPU.initialize<double>(cc_, 1, "opesBias_logZ_" + to_string(bIdx));
- o.logZGPU.upload(vector<double>{0.0}); // sum_uprob = 0 until first deposit
- // Linear weight accumulators {sum_w, sum_w2}.
- // Sentinel = exp(-gamma): ensures neff≈1 for early deposits.
- // sumW[0] = sum_w (Σ exp(V/kT)), sumW[1] = sum_w2 (Σ exp(2V/kT)).
- o.logSumWGPU.initialize<double>(cc_, 2, "opesBias_sumW_" + to_string(bIdx));
- o.logSumWGPU.upload(vector<double>{exp(-o.gamma), exp(-2.0*o.gamma)});
- o.stepCountGPU.initialize<int>(cc_, 1, "opesBias_stepCnt_" + to_string(bIdx));
- o.stepCountGPU.upload(vector<int>{0});
-
- o.biasEnergyIdx = biasEnergyCounter++;
-
- // Variant-dependent bias coefficients.
- //   variant=0 METAD:    invGF=(γ-1)/γ,  cutoff²=2γ²/(γ-1),       eps=exp(-1/(invGF(1-invGF)))
- //   variant=1 uniform:  invGF=1,        cutoff²=2γ,               eps=0
- //   variant=2 EXPLORE:  invGF=γ-1,      cutoff²=2γ (=2·barrier/kT),
- //                       eps=exp(-γ/(γ-1)) = exp(-barrier/((γ-1)kT))
- // barrier_kJ = γ·kT for all variants (passed to eval kernel for the
- // pre-deposit zero-kernel branch).
- double invGF, cutoff2, eps, barrier_kJ;
- if (o.variant == 1) {
-  invGF      = 1.0;
-  cutoff2    = 2.0 * o.gamma;
-  eps        = 0.0;
-  barrier_kJ = o.gamma * o.kT;
- } else if (o.variant == 2) {
-  // OPES_METAD_EXPLORE — Invernizzi, Piaggi & Parrinello, JCTC 18:3988 (2022).
-  if (!std::isfinite(o.gamma) || o.gamma <= 1.0)
-   throw OpenMM::OpenMMException(
-       "OPES_METAD_EXPLORE (variant=2) requires finite gamma > 1");
-  invGF      = o.gamma - 1.0;
-  cutoff2    = 2.0 * o.gamma;
-  eps        = std::exp(-o.gamma / (o.gamma - 1.0));
-  barrier_kJ = o.gamma * o.kT;
-  // Broaden user-supplied σ₀ by √γ so kernels target the wider WT distribution.
-  // Skip when in fully-adaptive mode (sigma0 ≤ 0 sentinel).
-  if (!adaptiveMode) {
-   for (int d = 0; d < o.numCVsBias; d++)
-    o.sigma0[d] *= std::sqrt(o.gamma);
-   o.sigma0GPU.upload(o.sigma0);   // re-upload broadened sigma0
-  }
- } else {
-  // variant=0 (default OPES_METAD)
-  invGF      = (o.gamma - 1.0) / o.gamma;
-  cutoff2    = 2.0 * o.gamma / invGF;
-  eps        = std::exp(-1.0 / (invGF * (1.0 - invGF)));
-  barrier_kJ = o.kT / (1.0 - invGF);   // == γ·kT
- }
-
- ComputeProgram oProg = cc_.compileProgram(kOPESKernelSrc, {});
- o.evalKernel = oProg->createKernel("opesEvalBias");
- o.numKernelsGPU.initialize<int>(cc_, 1, "numKernelsGPU_" + to_string(bIdx));
- o.numKernelsGPU.upload(vector<int>(1, 0));
- // B2 multiwalker slot-claim counter (must be initialized alongside numKernelsGPU).
- o.numAllocatedGPU.initialize<int>(cc_, 1, "numAllocatedGPU_" + to_string(bIdx));
- o.numAllocatedGPU.upload(vector<int>{0});
- // KDNorm initial value = exp(-gamma) sentinel (ensures no zero-division before first deposit).
- o.sumWeightsGPU.initialize<double>(cc_, 1, "opesBias_sumW_" + to_string(bIdx));
- o.sumWeightsGPU.upload(vector<double>{exp(-o.gamma)});
- o.evalKernel->addArg(plan_.cvValues); // 0
- o.evalKernel->addArg(o.cvIdxGPU); // 1
- o.evalKernel->addArg(o.kernelCenters); // 2
- o.evalKernel->addArg(o.kernelSigmas); // 3
- o.evalKernel->addArg(o.kernelLogWeights); // 4
- o.evalKernel->addArg(o.numKernelsGPU); // 5
- o.evalKernel->addArg(D); // 6: numCVsBias
- o.evalKernel->addArg(invGF); // 7: invGammaFactor
- o.evalKernel->addArg(o.kT); // 8: kT
- o.evalKernel->addArg(o.logZGPU); // 9: sum_uprob (linear despite name)
- o.evalKernel->addArg(o.sumWeightsGPU); // 10: KDNorm (Σ h_k)
- o.evalKernel->addArg(cutoff2); // 11: 2γ²/(γ-1) for METAD, 2γ for EXPLORE/uniform
- o.evalKernel->addArg(eps); // 12: variant-dependent ε
- o.evalKernel->addArg(barrier_kJ); // 13: γ·kT (used in zero-kernel branch)
- o.evalKernel->addArg(plan_.cvBiasGradients); // 14
- o.evalKernel->addArg(plan_.biasEnergies); // 15
- o.evalKernel->addArg(o.biasEnergyIdx); // 16
-
- o.gatherDepositKernel = oProg->createKernel("opesGatherDeposit");
- o.gatherDepositKernel->addArg(plan_.cvValues); // 0
- o.gatherDepositKernel->addArg(o.cvIdxGPU); // 1
- o.gatherDepositKernel->addArg(o.runningMeanGPU); // 2
- o.gatherDepositKernel->addArg(o.runningM2GPU); // 3
- o.gatherDepositKernel->addArg(o.nSamplesGPU); // 4
- o.gatherDepositKernel->addArg(o.sigma0GPU); // 5
- o.gatherDepositKernel->addArg(o.sigmaMin); // 6
- o.gatherDepositKernel->addArg(o.kernelCenters); // 7
- o.gatherDepositKernel->addArg(o.kernelSigmas); // 8
- o.gatherDepositKernel->addArg(o.kernelLogWeights); // 9
- o.gatherDepositKernel->addArg(o.logZGPU); // 10: logSumPairwiseGPU
- o.gatherDepositKernel->addArg(o.numKernelsGPU); // 11
- o.gatherDepositKernel->addArg(D); // 12
- o.gatherDepositKernel->addArg(o.variant); // 13
- o.gatherDepositKernel->addArg(o.adaptiveSigmaStride); // 14
- o.gatherDepositKernel->addArg(plan_.biasEnergies); // 15
- o.gatherDepositKernel->addArg(o.biasEnergyIdx); // 16
- o.gatherDepositKernel->addArg(1.0 / o.kT); // 17: 1/kT — weight = exp(V/kT)
- o.gatherDepositKernel->addArg(o.sumWeightsGPU); // 18: KDNorm
- o.gatherDepositKernel->addArg(cutoff2); // 19: 2*gamma/(gamma-1)
- o.gatherDepositKernel->addArg(o.logSumWGPU); // 20: {sum_w, sum_w2} linear accumulators
- o.gatherDepositKernel->addArg(o.stepCountGPU); // 21: step count for neff
- o.gatherDepositKernel->addArg(o.numAllocatedGPU); // 22: B2 multiwalker slot-claim counter
- o.gatherDepositKernel->addArg(o.maxKernels); // 23: buffer capacity limit
- o.gatherDepositKernel->addArg(o.gamma); // 24: γ (adaptive-σ factor in EXPLORE/METAD)
- o.gatherDepositKernel->addArg(barrier_kJ); // 25: γ·kT (kept for symmetry / future use)
-
- // In fully-adaptive mode, compile the every-step Welford accumulator kernel.
- // It runs in execute() (after CV kernels) and manages nSamples/runningMean/runningM2;
- // gatherDepositKernel then reads the pre-built variance at deposition time.
- if (adaptiveMode) {
- o.welfordKernel = oProg->createKernel("opesAccumulateWelford");
- o.welfordKernel->addArg(plan_.cvValues); // 0
- o.welfordKernel->addArg(o.cvIdxGPU); // 1
- o.welfordKernel->addArg(o.runningMeanGPU); // 2
- o.welfordKernel->addArg(o.runningM2GPU); // 3
- o.welfordKernel->addArg(o.nSamplesGPU); // 4
- o.welfordKernel->addArg(D); // 5
- }
-
- o.neffKernel = oProg->createKernel("opesUpdateNeff");
- o.neffKernel->addArg(plan_.biasEnergies); // 0
- o.neffKernel->addArg(o.biasEnergyIdx); // 1
- o.neffKernel->addArg(1.0 / o.kT); // 2: invKT
- o.neffKernel->addArg(o.logSumWGPU); // 3
- o.neffKernel->addArg(o.stepCountGPU); // 4
-
- } else if (bType == GluedForce::BIAS_LINEAR) {
- linearBiases_.emplace_back();
- LinearBias& lin = linearBiases_.back();
- lin.numCVsBias = (int)cvIndices.size();
- lin.cvIdxGlobal = cvIndices;
- int D = lin.numCVsBias;
- lin.cvIdxGPU.initialize<int>(cc_, D, "linBias_cvIdx_" + to_string(bIdx));
- lin.cvIdxGPU.upload(vector<int>(cvIndices.begin(), cvIndices.end()));
- vector<float> kVec;
- for (int d = 0; d < D; d++) kVec.push_back((float)bParams[d]);
- lin.params.initialize<float>(cc_, D, "linBias_params_" + to_string(bIdx));
- lin.params.upload(kVec);
- lin.biasEnergyIdx = biasEnergyCounter++;
- ComputeProgram linProg = cc_.compileProgram(kLinearKernelSrc, {});
- lin.evalKernel = linProg->createKernel("linearEvalBias");
- lin.evalKernel->addArg(plan_.cvValues); // 0
- lin.evalKernel->addArg(lin.cvIdxGPU); // 1
- lin.evalKernel->addArg(lin.params); // 2
- lin.evalKernel->addArg(D); // 3
- lin.evalKernel->addArg(plan_.cvBiasGradients); // 4
- lin.evalKernel->addArg(plan_.biasEnergies); // 5
- lin.evalKernel->addArg(lin.biasEnergyIdx); // 6
- lin.evalKernel->addArg(); // 7: spare (8.5.1 fix)
-
- } else if (bType == GluedForce::BIAS_UPPER_WALL ||
- bType == GluedForce::BIAS_LOWER_WALL) {
- wallBiases_.emplace_back();
- WallBias& wall = wallBiases_.back();
- wall.numCVsBias = (int)cvIndices.size();
- wall.wallType = (bType == GluedForce::BIAS_UPPER_WALL) ? 0 : 1;
- wall.cvIdxGlobal = cvIndices;
- int D = wall.numCVsBias;
- wall.cvIdxGPU.initialize<int>(cc_, D, "wallBias_cvIdx_" + to_string(bIdx));
- wall.cvIdxGPU.upload(vector<int>(cvIndices.begin(), cvIndices.end()));
- // params = [at_0, kappa_0, eps_0, n_0, at_1, ...] (4 per dim)
- vector<float> pVec;
- for (int d = 0; d < D; d++) {
- pVec.push_back((float)bParams[4*d]);
- pVec.push_back((float)bParams[4*d + 1]);
- pVec.push_back((float)bParams[4*d + 2]);
- pVec.push_back((float)bParams[4*d + 3]);
- }
- wall.params.initialize<float>(cc_, 4*D, "wallBias_params_" + to_string(bIdx));
- wall.params.upload(pVec);
- wall.biasEnergyIdx = biasEnergyCounter++;
- ComputeProgram wallProg = cc_.compileProgram(kWallKernelSrc, {});
- wall.evalKernel = wallProg->createKernel("wallEvalBias");
- wall.evalKernel->addArg(plan_.cvValues); // 0
- wall.evalKernel->addArg(wall.cvIdxGPU); // 1
- wall.evalKernel->addArg(wall.params); // 2
- wall.evalKernel->addArg(D); // 3
- wall.evalKernel->addArg(wall.wallType); // 4
- wall.evalKernel->addArg(plan_.cvBiasGradients); // 5
- wall.evalKernel->addArg(plan_.biasEnergies); // 6
- wall.evalKernel->addArg(wall.biasEnergyIdx); // 7
- wall.evalKernel->addArg(); // 8: spare (8.5.1 fix)
-
- } else if (bType == GluedForce::BIAS_OPES_EXPANDED) {
- opesExpandedBiases_.emplace_back();
- OpesExpandedBias& oe = opesExpandedBiases_.back();
- int D = (int)cvIndices.size();
- oe.numStates = D;
- oe.cvIdxGlobal = cvIndices;
- oe.kT = bParams[0];
- oe.invKT = 1.0 / oe.kT;
- oe.pace = (bIntParams.size() > 0) ? bIntParams[0] : 500;
-
- // Normalize weights and convert to log space
- double wSum = 0.0;
- for (int l = 0; l < D; l++) wSum += bParams[1 + l];
- if (wSum <= 0.0) wSum = D; // fallback: uniform
- oe.logWeightsCPU.resize(D);
- for (int l = 0; l < D; l++)
- oe.logWeightsCPU[l] = std::log(bParams[1 + l] / wSum);
-
- oe.cvIdxGPU.initialize<int>(cc_, D,
- "opesExpBias_cvIdx_" + to_string(bIdx));
- oe.cvIdxGPU.upload(vector<int>(cvIndices.begin(), cvIndices.end()));
- oe.logWeightsGPU.initialize<double>(cc_, D,
- "opesExpBias_logW_" + to_string(bIdx));
- oe.logWeightsGPU.upload(oe.logWeightsCPU);
- oe.logZGPU.initialize<double>(cc_, 1,
- "opesExpBias_logZ_" + to_string(bIdx));
- oe.logZGPU.upload(vector<double>{0.0});
- oe.numUpdatesGPU.initialize<int>(cc_, 1,
- "opesExpBias_nUpd_" + to_string(bIdx));
- oe.numUpdatesGPU.upload(vector<int>{0});
- oe.biasEnergyIdx = biasEnergyCounter++;
-
- ComputeProgram oeProg = cc_.compileProgram(kOPESExpandedKernelSrc, {});
- oe.evalKernel = oeProg->createKernel("opesExpandedEvalBias");
- oe.evalKernel->addArg(plan_.cvValues); // 0
- oe.evalKernel->addArg(oe.cvIdxGPU); // 1
- oe.evalKernel->addArg(oe.logWeightsGPU); // 2
- oe.evalKernel->addArg(D); // 3: numStates
- oe.evalKernel->addArg(oe.invKT); // 4: invKT
- oe.evalKernel->addArg(oe.logZGPU); // 5: logZGPU (updated by updateLogZKernel)
- oe.evalKernel->addArg(plan_.cvBiasGradients); // 6
- oe.evalKernel->addArg(plan_.biasEnergies); // 7
- oe.evalKernel->addArg(oe.biasEnergyIdx); // 8
- oe.evalKernel->addArg(); // 9: spare (8.5.1 fix)
-
- oe.updateLogZKernel = oeProg->createKernel("opesExpandedUpdateLogZ");
- oe.updateLogZKernel->addArg(plan_.cvValues); // 0
- oe.updateLogZKernel->addArg(oe.cvIdxGPU); // 1
- oe.updateLogZKernel->addArg(oe.logWeightsGPU); // 2
- oe.updateLogZKernel->addArg(oe.logZGPU); // 3
- oe.updateLogZKernel->addArg(oe.numUpdatesGPU); // 4
- oe.updateLogZKernel->addArg(D); // 5: numStates
- oe.updateLogZKernel->addArg(oe.invKT); // 6
-
- } else if (bType == GluedForce::BIAS_OPES_MULTITHERMAL) {
- // OPES multithermal: expand one CV_ENERGY over an inverse-temperature ladder.
- // cvIndices = [energy CV value index]; params = [kT0, β_0, ..., β_{N-1}] (β in 1/(kJ/mol));
- // intParams = [pace]. Fully GPU-resident: eval + ΔF-learning run as device kernels.
- multithermalBiases_.emplace_back();
- MultithermalBias& mt = multithermalBiases_.back();
- mt.energyCvIdx = cvIndices.empty() ? -1 : cvIndices[0];
- mt.energyLocalIdx = mt.energyCvIdx - plan_.energyFirstCVIndex;
- if (plan_.numEnergyCVs == 0 || mt.energyLocalIdx < 0 ||
-     mt.energyLocalIdx >= plan_.numEnergyCVs)
- throw OpenMM::OpenMMException("BIAS_OPES_MULTITHERMAL: cvIndices[0] must reference a "
- "CV_ENERGY value index");
- mt.kT0 = bParams[0];
- mt.beta0 = 1.0 / mt.kT0;
- mt.pace = (bIntParams.size() > 0) ? bIntParams[0] : 500;
- int Nstates = (int)bParams.size() - 1;   // β_0 .. β_{N-1}
- if (Nstates < 1)
- throw OpenMM::OpenMMException("BIAS_OPES_MULTITHERMAL needs at least one temperature "
- "(params = [kT0, beta_0, ...])");
- mt.betaMinusBeta0.resize(Nstates);
- for (int l = 0; l < Nstates; l++)
- mt.betaMinusBeta0[l] = bParams[1 + l] - mt.beta0;
- mt.deltaF.assign(Nstates, 0.0);   // learned on the fly (init flat)
- mt.rct = 0.0;
- mt.counter = 1;
- mt.biasEnergyIdx = biasEnergyCounter++;
-
- mt.betaMinusBeta0GPU.initialize<double>(cc_, Nstates,
- "mtBias_dbeta_" + to_string(bIdx));
- mt.betaMinusBeta0GPU.upload(mt.betaMinusBeta0);
- mt.deltaFGPU.initialize<double>(cc_, Nstates,
- "mtBias_deltaF_" + to_string(bIdx));
- mt.deltaFGPU.upload(mt.deltaF);                    // zeros
- mt.rctGPU.initialize<double>(cc_, 1, "mtBias_rct_" + to_string(bIdx));
- mt.rctGPU.upload(vector<double>{0.0});
- mt.counterGPU.initialize<double>(cc_, 1, "mtBias_counter_" + to_string(bIdx));
- mt.counterGPU.upload(vector<double>{1.0});
-
- ComputeProgram mtProg = cc_.compileProgram(kMultithermalKernelSrc, {});
- mt.evalKernel = mtProg->createKernel("multithermalEvalBias");
- mt.evalKernel->addArg(plan_.cvValues);          // 0
- mt.evalKernel->addArg(mt.energyCvIdx);          // 1
- mt.evalKernel->addArg(mt.betaMinusBeta0GPU);    // 2
- mt.evalKernel->addArg(mt.deltaFGPU);            // 3
- mt.evalKernel->addArg(Nstates);                 // 4
- mt.evalKernel->addArg(mt.kT0);                  // 5
- mt.evalKernel->addArg(plan_.cvBiasGradients);   // 6
- mt.evalKernel->addArg(plan_.biasEnergies);      // 7
- mt.evalKernel->addArg(mt.biasEnergyIdx);        // 8
- mt.evalKernel->addArg();                        // 9: spare (8.5.1 fix)
-
- mt.updateDeltaFKernel = mtProg->createKernel("multithermalUpdateDeltaF");
- mt.updateDeltaFKernel->addArg(plan_.cvValues);        // 0
- mt.updateDeltaFKernel->addArg(mt.energyCvIdx);        // 1
- mt.updateDeltaFKernel->addArg(mt.betaMinusBeta0GPU);  // 2
- mt.updateDeltaFKernel->addArg(mt.deltaFGPU);          // 3
- mt.updateDeltaFKernel->addArg(mt.rctGPU);             // 4
- mt.updateDeltaFKernel->addArg(mt.counterGPU);         // 5
- mt.updateDeltaFKernel->addArg(plan_.biasEnergies);    // 6
- mt.updateDeltaFKernel->addArg(mt.biasEnergyIdx);      // 7
- mt.updateDeltaFKernel->addArg(Nstates);               // 8
- mt.updateDeltaFKernel->addArg(mt.kT0);                // 9
- mt.updateDeltaFKernel->addArg();                      // 10: spare (8.5.1 fix)
-
- } else if (bType == GluedForce::BIAS_EXT_LAGRANGIAN) {
- // Extended Lagrangian / AFED
- extLagBiases_.emplace_back();
- ExtLagBias& el = extLagBiases_.back();
- int D = (int)cvIndices.size();
- el.cvIndices.assign(cvIndices.begin(), cvIndices.end());
- for (int i = 0; i < D; i++) {
- el.kappa.push_back(bParams[2*i]);
- el.massS.push_back(bParams[2*i + 1]);
- }
- el.s.assign(D, 0.0);
- el.p.assign(D, 0.0);
- el.initialized = false;
-
- el.cvIdxGPU.initialize<int>(cc_, D,
- "elBias_cvIdx_" + to_string(bIdx));
- el.cvIdxGPU.upload(vector<int>(cvIndices.begin(), cvIndices.end()));
- el.kappaGPU.initialize<double>(cc_, D,
- "elBias_kappa_" + to_string(bIdx));
- el.kappaGPU.upload(el.kappa);
- el.massSGPU.initialize<double>(cc_, D,
- "elBias_massS_" + to_string(bIdx));
- el.massSGPU.upload(el.massS);
- el.sGPUArr.initialize<double>(cc_, D,
- "elBias_s_" + to_string(bIdx));
- el.sGPUArr.upload(el.s); // zeros; initSKernel sets real values at step 0
- el.pGPUArr.initialize<double>(cc_, D,
- "elBias_p_" + to_string(bIdx));
- el.pGPUArr.upload(el.p); // zeros
- el.biasEnergyIdx = biasEnergyCounter++;
-
- ComputeProgram elProg = cc_.compileProgram(kExtLagKernelSrc, {});
-
- el.initSKernel = elProg->createKernel("extLagInitS");
- el.initSKernel->addArg(plan_.cvValues); // 0
- el.initSKernel->addArg(el.cvIdxGPU); // 1
- el.initSKernel->addArg(el.sGPUArr); // 2
- el.initSKernel->addArg(D); // 3
- el.initSKernel->addArg(); // 4: spare
-
- el.verletKernel = elProg->createKernel("extLagVerlet");
- el.verletKernel->addArg(plan_.cvValues); // 0
- el.verletKernel->addArg(el.cvIdxGPU); // 1
- el.verletKernel->addArg(el.kappaGPU); // 2
- el.verletKernel->addArg(el.massSGPU); // 3
- el.verletKernel->addArg(el.sGPUArr); // 4
- el.verletKernel->addArg(el.pGPUArr); // 5
- el.verletKernel->addArg(0.0); // 6: dt (setArg per step)
- el.verletKernel->addArg(D); // 7
- el.verletKernel->addArg(); // 8: spare
-
- el.evalKernel = elProg->createKernel("extLagEvalBias");
- el.evalKernel->addArg(plan_.cvValues); // 0
- el.evalKernel->addArg(el.cvIdxGPU); // 1
- el.evalKernel->addArg(el.kappaGPU); // 2
- el.evalKernel->addArg(el.sGPUArr); // 3
- el.evalKernel->addArg(D); // 4
- el.evalKernel->addArg(plan_.cvBiasGradients); // 5
- el.evalKernel->addArg(plan_.biasEnergies); // 6
- el.evalKernel->addArg(el.biasEnergyIdx); // 7
- el.evalKernel->addArg(); // 8: spare (8.5.1 fix)
-
- } else if (bType == GluedForce::BIAS_EDS) {
- // EDS White-Voth: bParams = [target_0, max_range_0, ..., kbt]
- // bIntParams = [pace]
- edsBiases_.emplace_back();
- EdsBias& eds = edsBiases_.back();
- int D = (int)cvIndices.size();
- eds.cvIndices.assign(cvIndices.begin(), cvIndices.end());
- // params layout: D pairs of (target, max_range), then kbt
- for (int i = 0; i < D; i++) {
- eds.target.push_back(bParams[2*i]);
- eds.max_range.push_back(bParams[2*i + 1]);
- }
- eds.kbt = (bParams.size() > (size_t)(2*D)) ? bParams[2*D] : 2.479;  // default ~300K
- eds.lambda.assign(D, 0.0);
- eds.pace = (bIntParams.size() > 0) ? bIntParams[0] : 1;
- eds.initialized = true;  // no init kernel needed
-
- vector<double> zeros(D, 0.0);
- vector<int> izeros(D, 0);
-
- eds.cvIdxGPU.initialize<int>(cc_, D, "edsBias_cvIdx_" + to_string(bIdx));
- eds.cvIdxGPU.upload(vector<int>(cvIndices.begin(), cvIndices.end()));
- eds.lambdaGPU.initialize<double>(cc_, D, "edsBias_lambda_" + to_string(bIdx));
- eds.lambdaGPU.upload(zeros);
- eds.meanGPU.initialize<double>(cc_, D, "edsBias_mean_" + to_string(bIdx));
- eds.meanGPU.upload(zeros);
- eds.ssdGPU.initialize<double>(cc_, D, "edsBias_ssd_" + to_string(bIdx));
- eds.ssdGPU.upload(zeros);
- eds.accumGPU.initialize<double>(cc_, D, "edsBias_accum_" + to_string(bIdx));
- eds.accumGPU.upload(zeros);
- eds.countGPU.initialize<int>(cc_, D, "edsBias_count_" + to_string(bIdx));
- eds.countGPU.upload(izeros);
- eds.targetGPU.initialize<double>(cc_, D, "edsBias_target_" + to_string(bIdx));
- eds.targetGPU.upload(eds.target);
- eds.maxRangeGPU.initialize<double>(cc_, D, "edsBias_maxRange_" + to_string(bIdx));
- eds.maxRangeGPU.upload(eds.max_range);
- eds.biasEnergyIdx = biasEnergyCounter++;
-
- ComputeProgram edsProg = cc_.compileProgram(kEdsKernelSrc, {});
-
- eds.updateStateKernel = edsProg->createKernel("edsWVUpdateState");
- eds.updateStateKernel->addArg(plan_.cvValues);   // 0
- eds.updateStateKernel->addArg(eds.cvIdxGPU);     // 1
- eds.updateStateKernel->addArg(eds.meanGPU);      // 2
- eds.updateStateKernel->addArg(eds.ssdGPU);       // 3
- eds.updateStateKernel->addArg(eds.lambdaGPU);    // 4
- eds.updateStateKernel->addArg(eds.accumGPU);     // 5
- eds.updateStateKernel->addArg(eds.countGPU);     // 6
- eds.updateStateKernel->addArg(eds.targetGPU);    // 7
- eds.updateStateKernel->addArg(eds.maxRangeGPU);  // 8
- eds.updateStateKernel->addArg(eds.kbt);          // 9: constant double
- eds.updateStateKernel->addArg(0);                // 10: doUpdate (setArg per step)
- eds.updateStateKernel->addArg(D);                // 11
- eds.updateStateKernel->addArg();                 // 12: spare
-
- eds.evalKernel = edsProg->createKernel("edsEvalBias");
- eds.evalKernel->addArg(plan_.cvValues);          // 0
- eds.evalKernel->addArg(eds.cvIdxGPU);            // 1
- eds.evalKernel->addArg(eds.lambdaGPU);           // 2
- eds.evalKernel->addArg(D);                       // 3
- eds.evalKernel->addArg(plan_.cvBiasGradients);   // 4
- eds.evalKernel->addArg(plan_.biasEnergies);      // 5
- eds.evalKernel->addArg(eds.biasEnergyIdx);       // 6
- eds.evalKernel->addArg();                        // 7: spare
-
- } else if (bType == GluedForce::BIAS_MAXENT) {
- // MaxEnt: params = [kbt, sigma, alpha, at_0, kappa_0, tau_0, at_1, ...]
- //         intParams = [pace, type, errorType]
- // type: 0=EQUAL, 1=INEQUAL_GT, 2=INEQUAL_LT
- // errorType: 0=GAUSSIAN, 1=LAPLACE
- maxentBiases_.emplace_back();
- MaxentBias& mx = maxentBiases_.back();
- int D = (int)cvIndices.size();
- mx.cvIndices.assign(cvIndices.begin(), cvIndices.end());
- mx.kbt   = (bParams.size() > 0) ? bParams[0] : 2.479;
- mx.sigma = (bParams.size() > 1) ? bParams[1] : 0.0;
- mx.alpha = (bParams.size() > 2) ? bParams[2] : 1.0;
- // Per-CV params: groups of 3 starting at offset 3
- for (int i = 0; i < D; i++) {
-  int base = 3 + 3 * i;
-  mx.at.push_back   ((bParams.size() > (size_t)(base+0)) ? bParams[base+0] : 0.0);
-  mx.kappa.push_back((bParams.size() > (size_t)(base+1)) ? bParams[base+1] : 0.01);
-  mx.tau.push_back  ((bParams.size() > (size_t)(base+2)) ? bParams[base+2] : 1.0);
- }
- mx.lambda.assign(D, 0.0);
- mx.pace      = (bIntParams.size() > 0) ? bIntParams[0] : 1;
- mx.type      = (bIntParams.size() > 1) ? bIntParams[1] : 0;
- mx.errorType = (bIntParams.size() > 2) ? bIntParams[2] : 0;
- mx.biasEnergyIdx = biasEnergyCounter++;
-
- vector<double> zeros(D, 0.0);
- mx.cvIdxGPU.initialize<int>   (cc_, D, "maxent_cvIdx_"  + to_string(bIdx));
- mx.cvIdxGPU.upload(vector<int>(cvIndices.begin(), cvIndices.end()));
- mx.lambdaGPU.initialize<double>(cc_, D, "maxent_lambda_" + to_string(bIdx));
- mx.lambdaGPU.upload(zeros);
- mx.atGPU.initialize<double>   (cc_, D, "maxent_at_"     + to_string(bIdx));
- mx.atGPU.upload(mx.at);
- mx.kappaGPU.initialize<double>(cc_, D, "maxent_kappa_"  + to_string(bIdx));
- mx.kappaGPU.upload(mx.kappa);
- mx.tauGPU.initialize<double>  (cc_, D, "maxent_tau_"    + to_string(bIdx));
- mx.tauGPU.upload(mx.tau);
-
- ComputeProgram mxProg = cc_.compileProgram(kMaxEntKernelSrc, {});
-
- mx.updateKernel = mxProg->createKernel("maxentUpdateLambda");
- mx.updateKernel->addArg(plan_.cvValues);  // 0
- mx.updateKernel->addArg(mx.cvIdxGPU);    // 1
- mx.updateKernel->addArg(mx.lambdaGPU);   // 2
- mx.updateKernel->addArg(mx.atGPU);       // 3
- mx.updateKernel->addArg(mx.kappaGPU);    // 4
- mx.updateKernel->addArg(mx.tauGPU);      // 5
- mx.updateKernel->addArg(mx.sigma);       // 6: constant double
- mx.updateKernel->addArg(mx.alpha);       // 7: constant double
- mx.updateKernel->addArg(D);              // 8
- mx.updateKernel->addArg(mx.type);        // 9
- mx.updateKernel->addArg(mx.errorType);   // 10
- mx.updateKernel->addArg(0);              // 11: updateCount (setArg per update)
- mx.updateKernel->addArg();               // 12: spare
-
- mx.evalKernel = mxProg->createKernel("maxentEvalBias");
- mx.evalKernel->addArg(plan_.cvValues);         // 0
- mx.evalKernel->addArg(mx.cvIdxGPU);            // 1
- mx.evalKernel->addArg(mx.lambdaGPU);           // 2
- mx.evalKernel->addArg(mx.kbt);                 // 3: constant double
- mx.evalKernel->addArg(D);                      // 4
- mx.evalKernel->addArg(mx.type);                // 5
- mx.evalKernel->addArg(plan_.cvBiasGradients);  // 6
- mx.evalKernel->addArg(plan_.biasEnergies);     // 7
- mx.evalKernel->addArg(mx.biasEnergyIdx);       // 8
- mx.evalKernel->addArg();                       // 9: spare
- }
- }
-
- // Chain-rule scatter kernel
- if (plan_.numJacEntries > 0) {
- ComputeProgram scatProg = cc_.compileProgram(kScatterKernelSrc, {});
- scatterKernel_ = scatProg->createKernel("chainRuleScatter");
- scatterKernel_->addArg(plan_.cvBiasGradients); // 0
- scatterKernel_->addArg(plan_.jacobianAtomIdx); // 1
- scatterKernel_->addArg(plan_.jacobianGradsX); // 2
- scatterKernel_->addArg(plan_.jacobianGradsY); // 3
- scatterKernel_->addArg(plan_.jacobianGradsZ); // 4
- scatterKernel_->addArg(plan_.jacobianCvIdx); // 5
- scatterKernel_->addArg(cc_.getLongForceBuffer()); // 6
- scatterKernel_->addArg(cc_.getPaddedNumAtoms()); // 7
- scatterKernel_->addArg(plan_.numJacEntries); // 8 (constant)
- scatterKernel_->addArg(); // 9: spare (8.5.1 primitiveArgs/arrayArgs realignment)
- }
-}
+namespace GluedPlugin {
+
+class CommonCalcGluedForceKernel : public CalcGluedForceKernel {
+public:
+    CommonCalcGluedForceKernel(std::string name,
+                                    const OpenMM::Platform& platform,
+                                    OpenMM::ComputeContext& cc)
+        : CalcGluedForceKernel(name, platform), cc_(cc) {}
+
+    void initialize(const OpenMM::System& system,
+                    const GluedForce& force) override;
+
+    double execute(OpenMM::ContextImpl& context,
+                   bool includeForces, bool includeEnergy) override;
+
+    void updateState(OpenMM::ContextImpl& context, int step) override;
+
+    // Linked inner context (System minus this GluedForce) for the CV_ENERGY value
+    // and forces (OPES multithermal). The device path drives it through the
+    // ContextImpl* (calcForcesAndEnergy + getInnerComputeContext on its PlatformData).
+    void setInnerContext(OpenMM::Context* inner,
+                         OpenMM::ContextImpl* innerImpl) override {
+        innerContext_ = inner;
+        innerContextImpl_ = innerImpl;
+    }
+
+    void getCurrentCVs(OpenMM::ContextImpl& context,
+                       std::vector<double>& values) override;
+
+    std::vector<double> downloadCVValues() override;
+    double downloadLastBias() override;
+
+    std::vector<char> getBiasStateBytes() override;
+    void setBiasStateBytes(const std::vector<char>& bytes) override;
+
+    // Returns [zed, rct, nker, neff] for the biasIndex-th OPES bias.
+    std::vector<double> getOPESMetrics(int biasIndex) override;
+
+    // Flat per-kernel σ buffer (numKernels * numCVsBias floats).
+    std::vector<float> getKernelSigmas(int biasIndex) override;
+
+    // Multiwalker B2: redirect this walker's bias kernels to use primary's shared GPU arrays.
+    // ptrs are raw device pointers cast to long long, bias-type-specific.
+    void redirectToPrimaryBias(int biasType, int localIdx, const std::vector<long long>& ptrs) override;
+
+protected:
+    OpenMM::ComputeContext& cc_;
+    OpenMM::Context* innerContext_ = nullptr;   // CV_ENERGY linked inner context (unbiased U/F)
+    OpenMM::ContextImpl* innerContextImpl_ = nullptr;  // its ContextImpl (device path driver)
+    int forceGroupFlag_ = 1;
+
+    // CUDA-specific virtual accessors — overridden by CudaCalcGluedForceKernel.
+    // Default implementations return nullptr (non-CUDA platforms).
+    virtual void* getNativeCudaStream() const { return nullptr; }
+    virtual void* getComputeArrayDevPtr(OpenMM::ComputeArray& arr) const { return nullptr; }
+
+    // Returns the ComputeContext backing a linked inner Context. Reads the
+    // platform-specific PlatformData, so it is overridden in the Cuda/OpenCL
+    // kernel subclasses; the common-layer default throws (see .cpp). Used by the
+    // CV_ENERGY device path to reach the inner context's posq/force buffers.
+    virtual OpenMM::ComputeContext& getInnerComputeContext(OpenMM::ContextImpl& innerContext);
+
+private:
+    // test kernel
+    OpenMM::ComputeKernel testForceKernel_;
+    int testForceMode_ = 0;
+    double testForceScale_ = 0.0;
+
+    // on-GPU data layout for CV evaluation and force scatter
+    struct GpuPlan {
+        int numCVs = 0;
+        int numJacEntries = 0;
+
+        OpenMM::ComputeArray cvValues;          // double[numCVs]
+        OpenMM::ComputeArray cvBiasGradients;   // double[numCVs]
+
+        // Shared bias energy buffer — one slot per bias eval kernel instance.
+        // All eval kernels write to biasEnergies[biasEnergyIdx]; execute()
+        // downloads once at the end; updateState() reads from the CPU mirror.
+        OpenMM::ComputeArray biasEnergies;        // double[numBiasEnergySlots]
+        std::vector<double>  biasEnergiesCPU;     // CPU mirror, downloaded once per execute()
+
+        // Jacobian table: one row per (atom, CV) pair
+        OpenMM::ComputeArray jacobianAtomIdx;   // int[numJacEntries]  GPU atom idx
+        OpenMM::ComputeArray jacobianGradsX;    // float[numJacEntries]
+        OpenMM::ComputeArray jacobianGradsY;    // float[numJacEntries]
+        OpenMM::ComputeArray jacobianGradsZ;    // float[numJacEntries]
+        OpenMM::ComputeArray jacobianCvIdx;     // int[numJacEntries]  which CV
+
+        // Distance CV sub-plan (3.1)
+        int numDistanceCVs = 0;
+        int distanceFirstCVIndex = 0;
+        int distanceFirstJacEntry = 0;
+        OpenMM::ComputeArray distanceAtoms;     // int[2*numDistanceCVs] GPU atom pairs
+
+        // Angle CV sub-plan (3.2)
+        int numAngleCVs = 0;
+        int angleFirstCVIndex = 0;
+        int angleFirstJacEntry = 0;
+        OpenMM::ComputeArray angleAtoms;        // int[3*numAngleCVs] GPU atom triplets
+
+        // Dihedral CV sub-plan (3.3)
+        int numDihedralCVs = 0;
+        int dihedralFirstCVIndex = 0;
+        int dihedralFirstJacEntry = 0;
+        OpenMM::ComputeArray dihedralAtoms;     // int[4*numDihedralCVs] GPU atom quads
+
+        // COM-distance CV sub-plan (3.4)
+        // API: atoms[0]=n_group1, atoms[1..n_group1]=g1, atoms[n_group1+1..]=g2
+        //      params = masses in same order as the atoms (after n_group1)
+        // atomOffsets: int[2*N+1], interleaved group boundaries (g1Start,g2Start,g2End per CV)
+        int numCOMDistanceCVs = 0;
+        int comDistanceFirstCVIndex = 0;
+        int comDistanceFirstJacEntry = 0;
+        OpenMM::ComputeArray comDistanceAtomOffsets; // int[2*N+1]
+        OpenMM::ComputeArray comDistanceAtoms;       // int[total_com_atoms] GPU idx
+        OpenMM::ComputeArray comDistanceMasses;      // float[total_com_atoms]
+        OpenMM::ComputeArray comDistanceTotalMasses; // float[2*N]
+
+        // Gyration (Rg) CV sub-plan (3.5)
+        // API: atoms = atom list, params = masses in same order
+        int numGyrationCVs = 0;
+        int gyrationFirstCVIndex = 0;
+        int gyrationFirstJacEntry = 0;
+        OpenMM::ComputeArray gyrationAtomOffsets;    // int[N+1]
+        OpenMM::ComputeArray gyrationAtoms;          // int[total_rg_atoms] GPU idx
+        OpenMM::ComputeArray gyrationMasses;         // float[total_rg_atoms]
+        OpenMM::ComputeArray gyrationTotalMasses;    // float[N]
+
+        // Coordination number CV sub-plan (3.6)
+        // API: atoms[0]=nA, atoms[1..nA]=group A, rest=group B; params=[r0,n,m]
+        // atomOffsets: int[2*N+1] interleaved (g1Start,g2Start,g2End per CV)
+        int numCoordCVs = 0;
+        int coordFirstCVIndex = 0;
+        int coordFirstJacEntry = 0;
+        OpenMM::ComputeArray coordAtomOffsets;       // int[2*N+1]
+        OpenMM::ComputeArray coordAtoms;             // int[total_coord_atoms] GPU idx
+        OpenMM::ComputeArray coordParams;            // float[3*N]: [r0,n,m] per CV
+
+        // RMSD CV sub-plan (3.7) — no-fit (TYPE=SIMPLE) positional RMSD
+        // API: atoms = atom list; params = [x0,y0,z0, x1,y1,z1, ...] reference nm
+        int numRMSDCVs = 0;
+        int rmsdFirstCVIndex = 0;
+        int rmsdFirstJacEntry = 0;
+        OpenMM::ComputeArray rmsdAtomOffsets;        // int[N+1]
+        OpenMM::ComputeArray rmsdAtoms;              // int[total_rmsd_atoms] GPU idx
+        OpenMM::ComputeArray rmsdRefPos;             // float[3*total_rmsd_atoms]
+
+        // Path CV sub-plan (3.8) — produces 2 CV values: s (progress), z (dist)
+        // API: atoms = atom list (M atoms, shared by all frames);
+        //      params = [lambda, N_frames, frame0_x0, frame0_y0, frame0_z0, ...]
+        // firstCVIndex = s; z is at firstCVIndex+1 per path CV.
+        // Jacobian: 2*M entries per path CV (M for s, M for z).
+        int numPathCVs = 0;
+        int pathFirstCVIndex = 0;
+        int pathFirstJacEntry = 0;
+        OpenMM::ComputeArray pathAtomOffsets;        // int[N_pathCVs+1]
+        OpenMM::ComputeArray pathAtoms;              // int[sum(M_i)] GPU idx
+        OpenMM::ComputeArray pathRefOffsets;         // int[N_pathCVs+1] prefix sum of N_i*M_i
+        OpenMM::ComputeArray pathRefPos;             // float[3*sum(N_i*M_i)]
+        OpenMM::ComputeArray pathParams;             // float[2*N_pathCVs]: [lambda, N_frames]
+
+        // PyTorch CV Jacobian layout
+        // Jacobian entries immediately follow path entries: pytorchFirstJacEntry atoms total.
+        int pytorchFirstJacEntry = 0;
+
+        // Position CV (3.10): single atom, single Cartesian component.
+        // atoms[0]=atom idx, params[0]=component (0=x,1=y,2=z).
+        int numPositionCVs = 0;
+        int positionFirstCVIndex = 0;
+        int positionFirstJacEntry = 0;
+        OpenMM::ComputeArray positionAtoms;       // int[N] GPU atom idx
+        OpenMM::ComputeArray positionComponents;  // int[N] component 0/1/2
+
+        // DRMSD (3.11): distance RMSD from reference pair distances.
+        // atoms = flat pair list [a0,b0,a1,b1,...]; params = ref distances.
+        int numDRMSDCVs = 0;
+        int drmsdFirstCVIndex = 0;
+        int drmsdFirstJacEntry = 0;
+        OpenMM::ComputeArray drmsdPairOffsets;  // int[N+1] prefix sum of pair counts
+        OpenMM::ComputeArray drmsdAtomPairs;    // int[2*total] GPU atom indices
+        OpenMM::ComputeArray drmsdRefDists;     // float[total] reference distances
+
+        // Contact map (3.12): weighted sum of rational switching functions.
+        // atoms = flat pair list; params per pair = [r0, nn, mm, w] (4 floats).
+        int numContactMapCVs = 0;
+        int contactMapFirstCVIndex = 0;
+        int contactMapFirstJacEntry = 0;
+        OpenMM::ComputeArray contactMapPairOffsets; // int[N+1] prefix sum
+        OpenMM::ComputeArray contactMapAtomPairs;   // int[2*total] GPU atom indices
+        OpenMM::ComputeArray contactMapParams;      // float[4*total]: [r0,nn,mm,w] per pair
+
+        // Plane CV (3.13): component of normalized normal to a 3-atom plane.
+        // atoms=[a,b,c]; params=[component 0/1/2].
+        // n = (b-a) × (c-a), CV = n_hat[component]; 3 Jacobian entries per CV.
+        int numPlaneCVs = 0;
+        int planeFirstCVIndex = 0;
+        int planeFirstJacEntry = 0;
+        OpenMM::ComputeArray planeAtoms;      // int[3*N] GPU atom indices
+        OpenMM::ComputeArray planeComponents; // int[N] component 0/1/2
+
+        // Projection CV (3.14): dot product of displacement with a fixed direction.
+        // atoms=[a,b]; params=[nx,ny,nz] (unit-length direction stored pre-normalized).
+        // CV = dot(r_b - r_a, d_hat); 2 Jacobian entries per CV.
+        int numProjectionCVs = 0;
+        int projectionFirstCVIndex = 0;
+        int projectionFirstJacEntry = 0;
+        OpenMM::ComputeArray projectionAtoms; // int[2*N] GPU atom indices
+        OpenMM::ComputeArray projectionDirs;  // float[3*N] normalized direction vectors
+
+        // Volume CV (3.15): simulation box volume. No atoms. Periodic only.
+        // CV = boxVecX.x * boxVecY.y * boxVecZ.z. 0 Jacobian entries.
+        int numVolumeCVs = 0;
+        int volumeFirstCVIndex = 0;
+
+        // Cell CV (3.16): box cell length. No atoms. Periodic only.
+        // params=[component]: 0=|a|, 1=|b|, 2=|c|. 0 Jacobian entries.
+        int numCellCVs = 0;
+        int cellFirstCVIndex = 0;
+        OpenMM::ComputeArray cellComponents; // int[max(N,1)] component per CV
+
+        // Dipole CV (3.17): component or magnitude of Σ q_i r_i.
+        // atoms=[a0..aN-1]; params=[q0..qN-1, component] (0=x,1=y,2=z,3=|μ|).
+        // N Jacobian entries per CV.
+        int numDipoleCVs = 0;
+        int dipoleFirstCVIndex = 0;
+        int dipoleFirstJacEntry = 0;
+        OpenMM::ComputeArray dipoleAtomOffsets;  // int[N+1] prefix sum
+        OpenMM::ComputeArray dipoleAtoms;        // int[total] GPU atom indices
+        OpenMM::ComputeArray dipoleCharges;      // float[total] per-atom charges
+        OpenMM::ComputeArray dipoleComponents;   // int[N] component 0/1/2/3
+
+        // PCA CV (3.18): projection onto a principal component vector.
+        // atoms=[a0..aN-1]; params=[mean_x0,mean_y0,mean_z0,...,ev_x0,ev_y0,ev_z0,...].
+        // CV = dot(r_flat - mean_flat, eigvec); N Jacobian entries per CV.
+        int numPCACVs = 0;
+        int pcaFirstCVIndex = 0;
+        int pcaFirstJacEntry = 0;
+        OpenMM::ComputeArray pcaAtomOffsets;     // int[N+1] prefix sum
+        OpenMM::ComputeArray pcaAtoms;           // int[total] GPU atom indices
+        OpenMM::ComputeArray pcaRefPos;          // float[3*total] reference mean positions
+        OpenMM::ComputeArray pcaEigvec;          // float[3*total] eigenvector components
+
+        // Secondary structure CV (3.20) (ALPHARMSD, ANTIBETARMSD, PARABETARMSD)
+        // atoms[]: Cα atoms; params[0]=subtype (0=alpha,1=antibeta,2=parabeta), params[1]=r0(nm)
+        int numSecStrCVs = 0;
+        int secStrFirstCVIndex = 0;
+        int secStrFirstJacEntry = 0;
+        int secStrTotalWindows = 0;
+        OpenMM::ComputeArray secStrAtomOffsets;   // int[numSsCVs+1]
+        OpenMM::ComputeArray secStrWindowOffsets; // int[numSsCVs+1] prefix sum of numWindows
+        OpenMM::ComputeArray secStrAtoms;         // int[totalAtoms]
+        OpenMM::ComputeArray secStrParams;        // float[2*numSsCVs]
+
+        // Cremer-Pople ring puckering CV (3.16).
+        // atoms: ring atoms in sequential order (exactly 5 or 6)
+        // params: [ring_size (5.0 or 6.0), component (0.0/1.0/2.0)]
+        // N Jacobian entries per CV (one per ring atom).
+        int numPuckeringCVs    = 0;
+        int puckerFirstCVIndex = 0;
+        int puckerFirstJacEntry = 0;
+        OpenMM::ComputeArray puckerAtomOffsets;  // int[numPuckeringCVs+1]
+        OpenMM::ComputeArray puckerAtoms;        // int[totalRingAtoms]
+        OpenMM::ComputeArray puckerParams;       // float[2*numPuckeringCVs]
+
+        // eRMSD for RNA structure comparison (3.19) (Bottaro 2014).
+        // atoms: [P1_0,P2_0,P3_0, P1_1,P2_1,P3_1, ..., P1_{N-1},P2_{N-1},P3_{N-1}]
+        //        (3*N_residues atoms, grouped by residue)
+        // params: [N_residues, ax, ay, az, G_ref_0_x, G_ref_0_y, G_ref_0_z, ...]
+        //         length = 4 + 3*N*(N-1)/2
+        // Supports up to N=64 residues per CV (local array limit in kernel).
+        // 6*N*(N-1)/2 Jacobian entries per CV (3 for residue i + 3 for residue j per pair).
+        int numErmsdCVs        = 0;
+        int ermsdFirstCVIndex  = 0;
+        int ermsdFirstJacEntry = 0;
+        OpenMM::ComputeArray ermsdAtomOffsets;  // int[numErmsdCVs+1] prefix-sum of 3*N
+        OpenMM::ComputeArray ermsdJacOffsets;   // int[numErmsdCVs+1] prefix-sum of 6*N*(N-1)
+        OpenMM::ComputeArray ermsdRefGOffsets;  // int[numErmsdCVs+1] prefix-sum of 4*N*(N-1)
+        OpenMM::ComputeArray ermsdNRes;         // int[numErmsdCVs]
+        OpenMM::ComputeArray ermsdAtoms;        // int[total3N] GPU atom indices
+        OpenMM::ComputeArray ermsdRefG;         // float[totalRefG] 4D Bottaro G-vectors
+        OpenMM::ComputeArray ermsdCutoffs;      // float[numErmsdCVs]
+
+        // Total potential energy CV (OPES multithermal). No atoms/params. The CV value is
+        // the system's UNBIASED potential energy U (evaluated in a linked inner context that
+        // omits this GluedForce), and its per-atom Jacobian is dU/dx = -F (the unbiased forces).
+        // numParticles Jacobian entries per energy CV (one per atom): entry energyFirstJacEntry+a
+        // corresponds to user atom a, with jacobianAtomIdx = userToGpu[a] (set in
+        // rebuildGpuAtomIndices) and grads = -F[a] (refreshed each execute()). Evaluated fully
+        // device-to-device: the inner context's positions are written by a GPU copy kernel, U/F
+        // computed on the GPU (ContextImpl::calcForcesAndEnergy), and the inner force buffer copied
+        // straight into these grads — no posq/force host round-trip (see execute()).
+        int numEnergyCVs       = 0;
+        int energyFirstCVIndex = 0;
+        int energyFirstJacEntry = 0;
+
+        bool periodic = false;
+    } plan_;
+
+    OpenMM::ComputeKernel distanceKernel_;
+    OpenMM::ComputeKernel angleKernel_;
+    OpenMM::ComputeKernel dihedralKernel_;
+    OpenMM::ComputeKernel comDistanceKernel_;
+    OpenMM::ComputeKernel gyrationKernel_;
+    OpenMM::ComputeKernel coordKernel_;
+    OpenMM::ComputeKernel rmsdKernel_;
+    OpenMM::ComputeKernel pathKernel_;
+    OpenMM::ComputeKernel positionKernel_;
+    OpenMM::ComputeKernel drmsdKernel_;
+    OpenMM::ComputeKernel contactMapKernel_;
+    OpenMM::ComputeKernel planeKernel_;
+    OpenMM::ComputeKernel projectionKernel_;
+    OpenMM::ComputeKernel volumeCellKernel_;  // handles both volume and cell CVs
+    OpenMM::ComputeKernel dipoleKernel_;
+    OpenMM::ComputeKernel pcaKernel_;
+    OpenMM::ComputeKernel secStrKernel_;
+    OpenMM::ComputeKernel puckerKernel_;
+    OpenMM::ComputeKernel ermsdKernel_;
+    OpenMM::ComputeKernel scatterKernel_;
+
+    // CV_ENERGY device-to-device path (OPES multithermal). The inner context's
+    // positions are copied in with energyCopyStateKernel_, evaluated on the GPU via
+    // ContextImpl::calcForcesAndEnergy, and its long force buffer copied straight into
+    // the energy CV Jacobian (grads = -F) with energyCopyForcesKernel_ — no host
+    // round-trip. innerInvAtomOrder_ maps inner user atom -> inner GPU slot, kept in
+    // sync by a ReorderListener on the inner ComputeContext (see execute()).
+    OpenMM::ComputeKernel energyCopyStateKernel_;
+    OpenMM::ComputeKernel energyCopyForcesKernel_;
+    OpenMM::ComputeArray  innerInvAtomOrder_;
+    bool energyDeviceInitialized_ = false;
+
+    // PyTorch (TorchScript) CV plan.
+    // GPU-native path (primary): posq → extractKernel → posBufGPU → torch (CUDA tensor,
+    //   stream-shared) → output.item() → cvValues, grad D2D → gradBufGPU →
+    //   deinterleavKernel → jacobianGradsXYZ.
+    // CPU-intermediary fallback: posq download → torch CPU forward/backward → upload.
+    // model holds a torch::jit::script::Module* via type-erased shared_ptr when HAS_TORCH.
+    struct PyTorchCVPlan {
+        int outputCVIndex = 0;
+        int jacOffset = 0;
+        int numAtoms = 0;
+        std::vector<int> userAtoms;
+        std::vector<int> gpuAtomIdx;         // CPU-side GPU-space indices; uploaded to atomIdxGPU
+        std::shared_ptr<void> model;          // torch::jit::script::Module*
+
+        // GPU-native inference buffers (initialized only when CUDA stream is available)
+        OpenMM::ComputeArray atomIdxGPU;      // int[numAtoms]   GPU-space atom indices
+        OpenMM::ComputeArray posBufGPU;       // float[numAtoms*3] interleaved positions
+        OpenMM::ComputeArray gradBufGPU;      // float[numAtoms*3] interleaved grad from torch
+        OpenMM::ComputeKernel extractKernel;  // posq → posBufGPU
+        OpenMM::ComputeKernel deinterleavKernel; // gradBufGPU → jacGradsXYZ
+    };
+
+    // Linear coupling bias: V = sum_d k_d * cv_d.
+    // params = [k_0, k_1, ...] (1 float per CV dim)
+    struct LinearBias {
+        int numCVsBias = 0;
+        std::vector<int> cvIdxGlobal;
+        OpenMM::ComputeArray cvIdxGPU;
+        OpenMM::ComputeArray params;      // float[D]
+        int biasEnergyIdx = -1;
+        OpenMM::ComputeKernel evalKernel;
+    };
+
+    // One-sided polynomial wall bias.
+    // wallType=0: UPPER_WALL (activates when s > at)
+    // wallType=1: LOWER_WALL (activates when s < at)
+    // V = kappa * max(0, delta)^n * exp(eps * delta)
+    //   where delta = (s-at) for upper, (at-s) for lower
+    // params per dim: [at, kappa, eps, n]  (4 floats)
+    struct WallBias {
+        int numCVsBias = 0;
+        int wallType = 0;
+        std::vector<int> cvIdxGlobal;
+        OpenMM::ComputeArray cvIdxGPU;
+        OpenMM::ComputeArray params;      // float[4*D]
+        int biasEnergyIdx = -1;
+        OpenMM::ComputeKernel evalKernel;
+    };
+
+    // bias state — one entry per addBias call
+
+    struct HarmonicBias {
+        int numCVsBias = 0;
+        std::vector<int> cvIdxGlobal;
+        OpenMM::ComputeArray cvIdxGPU;    // int[numCVsBias]
+        OpenMM::ComputeArray params;      // float[2*numCVsBias]: [k, s0] per CV
+        int biasEnergyIdx = -1;
+        OpenMM::ComputeKernel evalKernel;
+    };
+
+    // OPES variants:
+    //   variant=0 OPES_METAD     : adaptive sigma, finite gamma (biasfactor)
+    //   variant=1 OPES_EXPLORE   : fixed sigma0, invGammaFactor=1 (gamma→∞)
+    struct OpesBias {
+        int numCVsBias = 0;
+        std::vector<int> cvIdxGlobal;
+        double kT = 2.479;     // kJ/mol at 298 K
+        double gamma = 10.0;
+        double sigmaMin = 1e-4;
+        std::vector<double> sigma0;
+        int pace = 500;
+        int variant = 0;
+        int maxKernels = 100000;
+        int numKernels = 0;
+        // 0 = mixed-adaptive (Welford at deposition, sigma0 as fallback).
+        // >0 = fully adaptive: opesAccumulateWelford runs every step; deposit
+        //      skips until nSamples reaches this threshold
+        //      (default = 10*PACE).
+        int adaptiveSigmaStride = 0;
+        // CPU mirror of GPU nSamples; only used when adaptiveSigmaStride > 0.
+        // Incremented in execute() each time welfordKernel fires.  Used in
+        // updateState() to decide whether the GPU deposit kernel will actually
+        // write a kernel (and so whether numKernels should be incremented).
+        int nSamplesCPU = 0;
+
+        // CPU mirrors for serialization — populated on demand via GPU downloads.
+        // Not kept in sync during simulation; download happens only in getBiasStateBytes().
+        double logZCPU = 0.0;
+        std::vector<double> runningMean, runningM2;  // staging buffers
+        int nSamples = 0;                            // staging counter
+        std::vector<double> kernelCentersCPU;
+        std::vector<double> kernelSigmasCPU;
+        std::vector<double> kernelLogWeightsCPU;
+
+        OpenMM::ComputeArray cvIdxGPU;
+        OpenMM::ComputeArray kernelCenters;      // double[maxKernels*numCVsBias] (M-OPESfloat)
+        OpenMM::ComputeArray kernelSigmas;       // double[maxKernels*numCVsBias]
+        OpenMM::ComputeArray kernelLogWeights;   // double[maxKernels]
+        // Welford + logZ — maintained by opesGatherDeposit on GPU
+        OpenMM::ComputeArray runningMeanGPU;     // double[D]
+        OpenMM::ComputeArray runningM2GPU;       // double[D]
+        OpenMM::ComputeArray nSamplesGPU;        // int[1]
+        OpenMM::ComputeArray sigma0GPU;          // double[D]
+        OpenMM::ComputeArray logZGPU;            // double[1]
+        OpenMM::ComputeArray numKernelsGPU;      // int[1] — committed kernel count (shared by evalKernel and gatherDepositKernel)
+        OpenMM::ComputeArray numAllocatedGPU;    // int[1] — slot-claim counter for B2 multiwalker atomic deposits
+        OpenMM::ComputeArray sumWeightsGPU;      // double[1] — KDNorm = Σ h_k (uncorrected weight sum)
+
+        // Multiwalker B2 shared pointers (0 = use own arrays, non-zero = borrowed from primary)
+        unsigned long long sharedCentersPtr    = 0;
+        unsigned long long sharedSigmasPtr     = 0;
+        unsigned long long sharedLogWeightsPtr = 0;
+        unsigned long long sharedNumKernelsPtr = 0;
+        unsigned long long sharedNumAllocPtr   = 0;
+        // neff accumulation — maintained by opesUpdateNeff on GPU
+        OpenMM::ComputeArray logSumWGPU;         // double[2]: {logSumW, logSumW2}
+        OpenMM::ComputeArray stepCountGPU;       // int[1]
+        int biasEnergyIdx = -1;
+        OpenMM::ComputeKernel evalKernel;
+        OpenMM::ComputeKernel gatherDepositKernel;
+        OpenMM::ComputeKernel neffKernel;
+        OpenMM::ComputeKernel welfordKernel;  // non-null only when adaptiveSigmaStride > 0
+    };
+
+    // Expression CV eval and prop plans
+    struct ExpressionCVPlan {
+        int numInputs = 0;
+        int outputCVIndex = 0;
+        OpenMM::ComputeArray inputCVIdx;   // int[max(numInputs,1)]
+        OpenMM::ComputeArray partials;     // double[max(numInputs,1)]
+        OpenMM::ComputeKernel evalKernel;
+        OpenMM::ComputeKernel propKernel;  // invalid if numInputs==0
+    };
+
+    // Moving restraint bias (time-dependent harmonic).
+    // schedule: double[M*(1+2*D)]: [step_0, k_0_cv0, at_0_cv0, ..., step_1, ...]
+    // integerParameters[0] = M (number of schedule entries)
+    struct MovingRestraintBias {
+        int numCVsBias = 0;
+        int numScheduleSteps = 0;
+        std::vector<int> cvIdxGlobal;
+        OpenMM::ComputeArray cvIdxGPU;   // int[D]
+        OpenMM::ComputeArray schedule;   // double[M*(1+2*D)]
+        int biasEnergyIdx = -1;
+        double lastStep = -1.0;          // cache: avoid redundant setArg when step unchanged
+        OpenMM::ComputeKernel evalKernel;
+    };
+
+    // ABMD ratchet bias: V = 0.5*k*max(0, maxCv-cv)^2.
+    // parameters: [kappa_0, initial_max_0, kappa_1, initial_max_1, ...]
+    // maxCv is tracked on the GPU every step by updateMaxKernel.
+    // maxCvCPU is a serialization-only staging buffer; filled on demand.
+    struct AbmdBias {
+        int numCVsBias = 0;
+        std::vector<int> cvIdxGlobal;
+        std::vector<double> rhoMinCPU;      // staging buffer for serialization (rhoMin per dim)
+        OpenMM::ComputeArray cvIdxGPU;      // int[D]
+        OpenMM::ComputeArray rhoMin;        // double[D] — running min of (cv-TO)^2
+        OpenMM::ComputeArray toGPU;         // double[D] — target values
+        OpenMM::ComputeArray kappa;         // float[D]
+        int biasEnergyIdx = -1;
+        OpenMM::ComputeKernel evalKernel;
+    };
+
+    // Well-tempered metadynamics (grid-based).
+    // parameters: [height0, sigma_0, ..., sigma_{D-1}, gamma, kT,
+    //              origin_0, ..., origin_{D-1}, max_0, ..., max_{D-1}]
+    // integerParameters: [pace, numBins_0, ..., numBins_{D-1},
+    //                     periodic_0, ..., periodic_{D-1}]
+    struct MetaDGridBias {
+        int numCVsBias = 0;
+        int D = 0;
+        std::vector<int>    cvIdxGlobal;
+        std::vector<int>    numBins;       // user-specified bins per dim
+        std::vector<int>    actualPoints;  // numBins + (periodic?0:1)
+        std::vector<double> origin;
+        std::vector<double> spacing;
+        std::vector<double> invSpacing;
+        std::vector<double> maxVal;
+        std::vector<int>    strides;
+        std::vector<int>    isPeriodic;
+        int    totalGridPoints = 0;
+        double height0 = 0.0;
+        std::vector<double> sigma;
+        double gamma = 10.0;
+        double kT    = 2.479;
+        int    pace  = 500;
+        int    numDeposited = 0;
+        std::vector<double> gridCPU;       // staging buffer for serialization only
+        OpenMM::ComputeArray cvIdxGPU;
+        OpenMM::ComputeArray grid;          // double[totalGridPoints]
+        OpenMM::ComputeArray originGPU;     // double[D]
+        OpenMM::ComputeArray invSpacingGPU; // double[D]
+        OpenMM::ComputeArray actualPointsGPU; // int[D]
+        OpenMM::ComputeArray stridesGPU;    // int[D]
+        OpenMM::ComputeArray periodicGPU;   // int[D]
+        OpenMM::ComputeArray sigmaGPU;      // double[D]
+        OpenMM::ComputeArray centerGPU;     // double[D] scratch for deposition
+        double heightInvFactor = 0.0;       // 0 → flat height; else 1/((γ-1)*kT)
+        int biasEnergyIdx = -1;
+        OpenMM::ComputeKernel evalKernel;
+        OpenMM::ComputeKernel depositKernel;
+        OpenMM::ComputeKernel gatherCVsKernel; // gathers cvValues → centerGPU before deposit
+
+        // Multiwalker B2: if non-zero, grid is borrowed from primary walker (do not free)
+        unsigned long long sharedGridPtr = 0;  // raw CUDA device ptr of primary's grid (0 = use own)
+    };
+
+    // Parallel-bias MetaD: N independent 1-D MetaD grids, one per CV.
+    // parameters: [height0, gamma, kT, sigma_0, origin_0, max_0,
+    //              sigma_1, origin_1, max_1, ...] (stride 3 per CV after the 3 shared)
+    // integerParameters: [pace, numBins_0, periodic_0, numBins_1, periodic_1, ...]
+    struct PBMetaDGridBias {
+        int pace = 500;
+        double kT = 2.479;
+        std::vector<MetaDGridBias> subGrids;  // one per CV, each D=1
+        OpenMM::ComputeArray localEnergyGPU;     // double[N]: V_i per sub-grid
+        OpenMM::ComputeArray localGradGPU;       // double[N]: dV_i/ds per sub-grid
+        OpenMM::ComputeArray softmaxWeightsGPU;  // double[N]: w_i (updated by combineKernel)
+        OpenMM::ComputeArray cvIdxListGPU;       // int[N]: global CV index per sub-grid
+        int combinedEnergySlot = -1;             // one slot in plan_.biasEnergies for V_total
+        OpenMM::ComputeKernel combineKernel;
+    };
+
+    // OPES Expanded ensemble bias.
+    // Each CV index is an ECV (energy collective variable).
+    // V(x) = -kT * (log Σ_λ w_λ exp(-ecv_λ/kT) − logZ)
+    // params: [kT, w_0, ..., w_{D-1}]  (weights normalized internally)
+    // intParams: [pace]
+    struct OpesExpandedBias {
+        int numStates = 0;
+        double kT = 2.479;
+        double invKT;
+        int pace = 500;
+        // logZ and numUpdates live on GPU; CPU copies are serialization-only staging.
+        double logZCPU = 0.0;
+        std::vector<int>    cvIdxGlobal;
+        std::vector<double> logWeightsCPU;  // log(w_λ), pre-normalized
+        OpenMM::ComputeArray cvIdxGPU;      // int[D]
+        OpenMM::ComputeArray logWeightsGPU; // double[D]
+        OpenMM::ComputeArray logZGPU;       // double[1]
+        OpenMM::ComputeArray numUpdatesGPU; // int[1]
+        int biasEnergyIdx = -1;
+        OpenMM::ComputeKernel evalKernel;
+        OpenMM::ComputeKernel updateLogZKernel;
+    };
+
+    // Extended Lagrangian / AFED.
+    // Auxiliary coordinates s and momenta p are now integrated fully on the GPU
+    // via extLagVerlet (velocity Verlet) called from updateState().
+    // s/p CPU vectors are serialization-only staging buffers; filled on demand.
+    // params = [kappa_0, mass_0, kappa_1, mass_1, ...]  (2*D values)
+    struct ExtLagBias {
+        std::vector<int>    cvIndices;
+        std::vector<double> kappa;
+        std::vector<double> massS;
+        std::vector<double> s;            // staging buffer for serialization
+        std::vector<double> p;            // staging buffer for serialization
+        bool                initialized = false;
+        double              lastDt = -1.0; // cache: avoid redundant setArg when dt unchanged
+        OpenMM::ComputeArray cvIdxGPU;    // int[D]
+        OpenMM::ComputeArray kappaGPU;    // double[D]
+        OpenMM::ComputeArray massSGPU;    // double[D]
+        OpenMM::ComputeArray sGPUArr;     // double[D] — maintained by verletKernel
+        OpenMM::ComputeArray pGPUArr;     // double[D] — maintained by verletKernel
+        int biasEnergyIdx = -1;
+        OpenMM::ComputeKernel evalKernel;
+        OpenMM::ComputeKernel initSKernel;
+        OpenMM::ComputeKernel verletKernel;
+    };
+
+    // Error Diffusion Sampling (EDS).
+    // Running average and lambda are maintained on the GPU by updateStateKernel.
+    // lambda/runAvg CPU vectors are serialization-only staging buffers.
+    // params = [target_0, sigma_0, target_1, sigma_1, ...]  (2*D values)
+    // int_params = [pace, tau]
+    struct EdsBias {
+        std::vector<int>    cvIndices;
+        std::vector<double> target;
+        std::vector<double> max_range;  // max coupling range in kJ/mol (= RANGE * kbt)
+        std::vector<double> lambda;     // staging buffer for serialization
+        double kbt = 1.0;               // kB*T in kJ/mol
+        int pace = 1;
+        bool initialized = false;
+        int lastDoUpdate = -1;  // cache: avoid redundant setArg on non-transition steps
+        OpenMM::ComputeArray cvIdxGPU;     // int[D]
+        OpenMM::ComputeArray lambdaGPU;    // double[D]
+        OpenMM::ComputeArray meanGPU;      // double[D] — Welford running mean
+        OpenMM::ComputeArray ssdGPU;       // double[D] — Welford sum of squared deviations
+        OpenMM::ComputeArray accumGPU;     // double[D] — AdaGrad coupling accumulator
+        OpenMM::ComputeArray countGPU;     // int[D] — step count within period
+        OpenMM::ComputeArray targetGPU;    // double[D]
+        OpenMM::ComputeArray maxRangeGPU;  // double[D]
+        int biasEnergyIdx = -1;
+        OpenMM::ComputeKernel evalKernel;
+        OpenMM::ComputeKernel updateStateKernel;
+    };
+
+    // OPES multithermal (Invernizzi/Parrinello expanded ensemble over temperature).
+    // Expands a single CV_ENERGY (value = unbiased PE U) over an inverse-temperature
+    // ladder {β_l}. Bias V = -kT0·(diffMax + log(Σ_l exp(diff_l - diffMax)/N)),
+    // diff_l = -(β_l-β0)·U + ΔF_l/kT0; dV/dU = kT0·Σ_l p_l·(β_l-β0). The per-state ΔF_l
+    // are learned on the fly via the OPES expanded-ensemble recursion. Fully GPU-resident:
+    // multithermalEvalBias fills biasEnergies[biasEnergyIdx] (V) and cvBiasGradients (dV/dU)
+    // every step; multithermalUpdateDeltaF advances ΔF_l/rct/counter every PACE steps in
+    // updateState(). The energy CV's U (cvValues) and the scatter (dV/dU·F through the single
+    // energy Jacobian) are already on the GPU. CPU mirrors below are serialization staging only.
+    struct MultithermalBias {
+        int energyCvIdx = 0;                 // global cvValues index of the CV_ENERGY
+        int energyLocalIdx = 0;              // energyCvIdx - energyFirstCVIndex (validation only)
+        double kT0 = 2.479;                  // reference kT (kJ/mol)
+        double beta0 = 0.0;                  // 1/kT0
+        int pace = 500;
+        int biasEnergyIdx = -1;
+        std::vector<double> betaMinusBeta0;  // β_l - β0   (length N) — uploaded to betaMinusBeta0GPU
+        std::vector<double> deltaF;          // ΔF_l staging buffer (download on demand for serialization)
+        double rct = 0.0;                    // c(t) staging (download on demand)
+        long long counter = 1;               // update-counter staging (download on demand)
+        OpenMM::ComputeArray betaMinusBeta0GPU;  // double[N]
+        OpenMM::ComputeArray deltaFGPU;          // double[N] — learned on the GPU
+        OpenMM::ComputeArray rctGPU;             // double[1]
+        OpenMM::ComputeArray counterGPU;         // double[1] (init 1.0)
+        OpenMM::ComputeKernel evalKernel;
+        OpenMM::ComputeKernel updateDeltaFKernel;
+    };
+
+protected:
+    // Bias state vectors — protected so CudaCalcGluedForceKernel can read
+    // device pointers for B2 multiwalker sharing via getSharedBiasPtrs().
+    std::vector<PyTorchCVPlan>        pytorchCVPlans_;
+    std::vector<HarmonicBias>         harmonicBiases_;
+    std::vector<OpesBias>             opesBiases_;
+    std::vector<OpesExpandedBias>     opesExpandedBiases_;
+    std::vector<MovingRestraintBias>  movingRestraintBiases_;
+    std::vector<AbmdBias>             abmdBiases_;
+    std::vector<MetaDGridBias>        metaDGridBiases_;
+    std::vector<PBMetaDGridBias>      pbmetaDGridBiases_;
+    std::vector<LinearBias>           linearBiases_;
+    std::vector<WallBias>             wallBiases_;
+    // External bias: fixed precomputed grid (no deposition).
+    // Reuses MetaDGridBias for grid geometry/GPU arrays; deposit fields unused.
+    // params = [origin_0, ..., origin_{D-1}, max_0, ..., max_{D-1}, grid_val_0, ...]
+    // integerParameters = [numBins_0, ..., numBins_{D-1}, isPeriodic_0, ..., isPeriodic_{D-1}]
+    std::vector<MetaDGridBias>        externalGridBiases_;
+    std::vector<ExtLagBias>           extLagBiases_;
+    std::vector<EdsBias>              edsBiases_;
+    std::vector<MultithermalBias>     multithermalBiases_;
+
+private:
+
+    // MaxEnt (Cesari et al. JCTC 2016): linear bias with adaptive Lagrange multiplier.
+    // params    = [kT, sigma, alpha, at_0, kappa_0, tau_0, at_1, kappa_1, tau_1, ...]
+    //             3 global scalars + 3 values per CV
+    // intParams = [pace, type, errorType]
+    //             type:      0=EQUAL, 1=INEQUAL_GT (CV>=at), 2=INEQUAL_LT (CV<=at)
+    //             errorType: 0=GAUSSIAN (or no noise if sigma=0), 1=LAPLACE
+    struct MaxentBias {
+        std::vector<int>    cvIndices;
+        std::vector<double> at;      // target values per CV
+        std::vector<double> kappa;   // initial learning rate per CV
+        std::vector<double> tau;     // decay time (in steps) per CV
+        std::vector<double> lambda;  // staging buffer for serialization
+        double kbt   = 2.479;        // kB*T in kJ/mol
+        double sigma = 0.0;          // noise level (Gaussian or Laplace sigma)
+        double alpha = 1.0;          // Laplace shape parameter
+        int pace      = 100;
+        int type      = 0;           // 0=EQUAL, 1=INEQUAL_GT, 2=INEQUAL_LT
+        int errorType = 0;           // 0=GAUSSIAN, 1=LAPLACE
+        int biasEnergyIdx = -1;
+        OpenMM::ComputeArray cvIdxGPU;    // int[D]
+        OpenMM::ComputeArray lambdaGPU;   // double[D]
+        OpenMM::ComputeArray atGPU;       // double[D]
+        OpenMM::ComputeArray kappaGPU;    // double[D]
+        OpenMM::ComputeArray tauGPU;      // double[D]
+        OpenMM::ComputeKernel evalKernel;
+        OpenMM::ComputeKernel updateKernel;
+    };
+    std::vector<MaxentBias>           maxentBiases_;
+    std::vector<ExpressionCVPlan>     expressionCVPlans_;
+    int lastUpdateStep_ = -1;  // guards duplicate deposition in updateState()
+    int lastKnownStep_ = 0;  // tracked every updateState(); read by moving restraint in execute()
+    bool cvValuesReady_ = false;  // set by execute(); guards updateState() on step 0
+    // Box-change cache: setPeriodicBoxArgs only fires when box differs from last step.
+    OpenMM::Vec3 lastBoxA_, lastBoxB_, lastBoxC_;
+    bool boxArgsNeedUpdate_ = true;
+
+    std::vector<int>    distanceUserAtoms_;
+    std::vector<int>    angleUserAtoms_;
+    std::vector<int>    dihedralUserAtoms_;
+    // COM-distance: flat [g1_cv0..., g2_cv0..., g1_cv1..., g2_cv1..., ...]
+    std::vector<int>    comDistanceUserAtoms_;
+    std::vector<int>    comDistanceNGroup1_;       // n_group1 for each CV
+    std::vector<int>    comDistanceCVAtomCount_;   // ng1+ng2 for each CV
+    std::vector<float>  comDistanceMassData_;      // masses in same order as userAtoms
+    // Gyration: flat atom list per CV, appended in CV order
+    std::vector<int>    gyrationUserAtoms_;
+    std::vector<int>    gyrationNAtoms_;        // atom count for each CV
+    std::vector<float>  gyrationMassData_;
+    // Coordination number: flat atom list per CV, appended in CV order
+    std::vector<int>    coordUserAtoms_;
+    std::vector<int>    coordNGroup1_;          // nA for each CV
+    std::vector<int>    coordCVAtomCount_;      // nA+nB for each CV
+    std::vector<float>  coordParamData_;        // [r0,n,m] per CV (3 floats each)
+    // RMSD: flat atom list per CV, appended in CV order
+    std::vector<int>    rmsdUserAtoms_;
+    std::vector<int>    rmsdNAtoms_;            // atom count per CV
+    std::vector<float>  rmsdRefPosData_;        // [x,y,z] per atom (3 floats each)
+    // Path CV: flat atom and reference data, appended in CV order
+    std::vector<int>    pathUserAtoms_;
+    std::vector<int>    pathNAtoms_;            // M atoms per CV
+    std::vector<int>    pathNFrames_;           // N frames per CV
+    std::vector<float>  pathLambdaData_;        // lambda per CV
+    std::vector<float>  pathRefPosData_;        // [x,y,z] per (frame,atom), N*M*3 per CV
+    // PyTorch CV: per-CV atom counts (used to compute Jacobian offsets in buildPlan)
+    std::vector<int>    pytorchNAtoms_;         // numAtoms for each PyTorch CV
+    // Position CV data
+    std::vector<int>    positionUserAtoms_;
+    std::vector<int>    positionComponentData_; // 0/1/2 per CV
+    // DRMSD CV data
+    std::vector<int>    drmsdUserPairAtoms_;    // flat [a0,b0,a1,b1,...] user idx
+    std::vector<int>    drmsdNPairs_;           // pair count per CV
+    std::vector<float>  drmsdRefDistData_;      // reference distances
+    // ContactMap CV data
+    std::vector<int>    contactMapUserPairAtoms_; // flat [a0,b0,...] user idx
+    std::vector<int>    contactMapNPairs_;        // pair count per CV
+    std::vector<float>  contactMapParamData_;     // [r0,nn,mm,w] per pair
+    // Plane CV data
+    std::vector<int>    planeUserAtoms_;          // flat [a0,b0,c0,...] user idx
+    std::vector<int>    planeComponentData_;      // component 0/1/2 per CV
+    // Projection CV data
+    std::vector<int>    projectionUserAtoms_;     // flat [a0,b0,...] user idx
+    std::vector<float>  projectionDirData_;       // [nx,ny,nz] normalized per CV
+    // Cell CV data
+    std::vector<int>    cellComponentData_;       // component 0/1/2 per CV
+    // Dipole CV data
+    std::vector<int>    dipoleUserAtoms_;         // flat atom list (user idx)
+    std::vector<int>    dipoleNAtoms_;            // atom count per CV
+    std::vector<float>  dipoleChargeData_;        // charge per atom (same order)
+    std::vector<int>    dipoleComponentData_;     // 0=x,1=y,2=z,3=|μ| per CV
+    // PCA CV data
+    std::vector<int>    pcaUserAtoms_;            // flat atom list (user idx)
+    std::vector<int>    pcaNAtoms_;               // atom count per CV
+    std::vector<float>  pcaRefPosData_;           // [x0,y0,z0,...] reference mean
+    std::vector<float>  pcaEigvecData_;           // [x0,y0,z0,...] eigenvector
+    // Secondary structure CV (3.20) data
+    std::vector<int>    secStrUserAtoms_;
+    std::vector<int>    secStrNAtoms_;            // atom count per CV
+    std::vector<float>  secStrParamData_;         // [subtype, r0] per CV
+    // Puckering CV data
+    std::vector<int>    puckerUserAtoms_;         // flat ring atom list (user idx)
+    std::vector<int>    puckerNAtoms_;            // ring size (5 or 6) per CV
+    std::vector<float>  puckerParamData_;         // [ring_size, component] per CV
+    // ERMSD CV data
+    std::vector<int>   ermsdUserAtoms_;           // flat [P1,P2,P3,...] user idx
+    std::vector<int>   ermsdNRes_;                // N residues per CV
+    std::vector<float> ermsdRefGData_;            // reference G-vectors (4D Bottaro, all ordered pairs)
+    std::vector<float> ermsdCutoffData_;          // cutoff per CV
+    std::vector<double> testBiasGradients_;
+
+    void buildPlan(const OpenMM::System& system, const GluedForce& force);
+    void compileCVKernels(const GluedForce& force);
+    void setupBiases(const GluedForce& force);
+    void rebuildGpuAtomIndices();
+};
+
+} // namespace GluedPlugin
+
+#endif // COMMON_GLUED_KERNELS_H_
