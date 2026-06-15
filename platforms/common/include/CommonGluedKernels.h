@@ -390,14 +390,14 @@ private:
         double logZCPU = 0.0;
         std::vector<double> runningMean, runningM2;  // staging buffers
         int nSamples = 0;                            // staging counter
-        std::vector<float> kernelCentersCPU;
-        std::vector<float> kernelSigmasCPU;
-        std::vector<float> kernelLogWeightsCPU;
+        std::vector<double> kernelCentersCPU;
+        std::vector<double> kernelSigmasCPU;
+        std::vector<double> kernelLogWeightsCPU;
 
         OpenMM::ComputeArray cvIdxGPU;
-        OpenMM::ComputeArray kernelCenters;      // float[maxKernels*numCVsBias]
-        OpenMM::ComputeArray kernelSigmas;       // float[maxKernels*numCVsBias]
-        OpenMM::ComputeArray kernelLogWeights;   // float[maxKernels]
+        OpenMM::ComputeArray kernelCenters;      // double[maxKernels*numCVsBias] (M-OPESfloat)
+        OpenMM::ComputeArray kernelSigmas;       // double[maxKernels*numCVsBias]
+        OpenMM::ComputeArray kernelLogWeights;   // double[maxKernels]
         // Welford + logZ — maintained by opesGatherDeposit on GPU
         OpenMM::ComputeArray runningMeanGPU;     // double[D]
         OpenMM::ComputeArray runningM2GPU;       // double[D]
