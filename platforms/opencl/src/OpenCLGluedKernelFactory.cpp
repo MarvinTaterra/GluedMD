@@ -11,13 +11,22 @@
 using namespace GluedPlugin;
 using namespace OpenMM;
 
-// Thin OpenCL subclass — type-distinguished only; all logic is in Common layer.
+// Thin OpenCL subclass — adds the CV_ENERGY device path's inner-context accessor;
+// all other logic is in the Common layer.
 class OpenCLCalcGluedForceKernel : public CommonCalcGluedForceKernel {
 public:
     OpenCLCalcGluedForceKernel(std::string name,
                                     const Platform& platform,
                                     ComputeContext& cc)
         : CommonCalcGluedForceKernel(name, platform, cc) {}
+
+protected:
+    // CV_ENERGY device path: the linked inner Context's OpenCLContext, read from its
+    // PlatformData. Mirrors OpenCLCalcCustomCVForceKernel::getInnerComputeContext.
+    ComputeContext& getInnerComputeContext(ContextImpl& innerContext) override {
+        return *reinterpret_cast<OpenCLPlatform::PlatformData*>(
+            innerContext.getPlatformData())->contexts[0];
+    }
 };
 
 extern "C" OPENMM_EXPORT_GLUED void registerKernelFactories() {
