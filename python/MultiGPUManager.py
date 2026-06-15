@@ -101,7 +101,7 @@ def _bias_type_name(btype: int) -> str:
 #   per OPES bias (D = numCVs for that bias):
 #     int32 nk, double logZ, int32 nSamples
 #     double[D] runningMean, double[D] runningM2
-#     float[nk*D] centers, float[nk*D] sigmas, float[nk] logWeights
+#     double[nk*D] centers, double[nk*D] sigmas, double[nk] logWeights
 #   int32  n_abmd
 #   per ABMD bias (D = numCVs):
 #     double[D] rhoMin
@@ -374,7 +374,7 @@ class BiasStateMerger:
             # Reconcile logZ over the unioned kernel weights:
             #   logZ = log Σ_k exp(logWeight_k)   (log-sum-exp for stability)
             if nk_total > 0:
-                lw_all = np.frombuffer(lw_cat, dtype="<f4").astype("<f8")
+                lw_all = np.frombuffer(lw_cat, dtype="<f8")
                 m = float(lw_all.max())
                 logZ_merged = m + float(np.log(np.exp(lw_all - m).sum()))
             else:
@@ -517,9 +517,9 @@ class BiasStateMerger:
                     "cannot parse OPES bias without force config (need D=numCVs)")
             mean_bytes = read_bytes(D * 8)
             m2_bytes   = read_bytes(D * 8)
-            centers_bytes    = read_bytes(nk * D * 4)
-            sigmas_bytes     = read_bytes(nk * D * 4)
-            logweights_bytes = read_bytes(nk * 4)
+            centers_bytes    = read_bytes(nk * D * 8)   # double (M-OPESfloat)
+            sigmas_bytes     = read_bytes(nk * D * 8)
+            logweights_bytes = read_bytes(nk * 8)
             opes.append((nk, logZ, ns, mean_bytes, m2_bytes,
                          centers_bytes, sigmas_bytes, logweights_bytes))
 
