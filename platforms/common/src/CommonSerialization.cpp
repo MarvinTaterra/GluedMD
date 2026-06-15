@@ -67,9 +67,9 @@ vector<char> CommonCalcGluedForceKernel::getBiasStateBytes() {
  write(&ns, 4);
  write(o.runningMean.data(), D * 8);
  write(o.runningM2.data(), D * 8);
- write(o.kernelCentersCPU.data(), nk * D * 4);
- write(o.kernelSigmasCPU.data(), nk * D * 4);
- write(o.kernelLogWeightsCPU.data(), nk * 4);
+ write(o.kernelCentersCPU.data(), (size_t)nk * D * 8);   // double (M-OPESfloat)
+ write(o.kernelSigmasCPU.data(), (size_t)nk * D * 8);
+ write(o.kernelLogWeightsCPU.data(), (size_t)nk * 8);
  }
  int32_t na = (int32_t)abmdBiases_.size();
  write(&na, 4);
@@ -218,8 +218,8 @@ void CommonCalcGluedForceKernel::setBiasStateBytes(
  const size_t Dsz = (size_t)D;
  const size_t nksz = (size_t)nk;
  // Bytes still needed for this OPES bias: runningMean+runningM2 (D*8 each),
- // centers+sigmas (nk*D*4 each), logWeights (nk*4).
- const size_t needBytes = Dsz * 8 * 2 + nksz * Dsz * 4 * 2 + nksz * 4;
+ // centers+sigmas (nk*D*8 each, double), logWeights (nk*8, double). (M-OPESfloat)
+ const size_t needBytes = Dsz * 8 * 2 + nksz * Dsz * 8 * 2 + nksz * 8;
  if ((size_t)(end - p) < needBytes)
  throw OpenMMException("GLUED bias-state: truncated/corrupt blob");
  read(o.runningMean.data(), Dsz * 8);
@@ -227,9 +227,9 @@ void CommonCalcGluedForceKernel::setBiasStateBytes(
  o.kernelCentersCPU.resize(nksz * Dsz);
  o.kernelSigmasCPU.resize(nksz * Dsz);
  o.kernelLogWeightsCPU.resize(nksz);
- read(o.kernelCentersCPU.data(), nksz * Dsz * 4);
- read(o.kernelSigmasCPU.data(), nksz * Dsz * 4);
- read(o.kernelLogWeightsCPU.data(), nksz * 4);
+ read(o.kernelCentersCPU.data(), nksz * Dsz * 8);
+ read(o.kernelSigmasCPU.data(), nksz * Dsz * 8);
+ read(o.kernelLogWeightsCPU.data(), nksz * 8);
  o.numKernels = nk;
  o.numKernelsGPU.upload(vector<int>{nk});
  if (nk > 0) {
