@@ -296,6 +296,24 @@ void CommonCalcGluedForceKernel::rebuildGpuAtomIndices() {
  gpuAtoms[j] = userToGpu[ermsdUserAtoms_[j]];
  plan_.ermsdAtoms.upload(gpuAtoms);
  }
+
+ // Energy CV (OPES multithermal): one Jacobian entry per atom. Entry
+ // energyFirstJacEntry + e*N + a corresponds to user atom a (jacobianAtomIdx =
+ // userToGpu[a], jacobianCvIdx = energyFirstCVIndex + e). Only the static index
+ // arrays are set here (and re-set on reorder, since userToGpu changes); the grads
+ // (-F) are refreshed every execute() from the inner-context forces.
+ if (plan_.numEnergyCVs > 0) {
+ vector<int> aidx(plan_.numEnergyCVs * N), cidx(plan_.numEnergyCVs * N);
+ for (int e = 0; e < plan_.numEnergyCVs; e++)
+ for (int u = 0; u < N; u++) {
+ aidx[e*N + u] = userToGpu[u];
+ cidx[e*N + u] = plan_.energyFirstCVIndex + e;
+ }
+ plan_.jacobianAtomIdx.uploadSubArray(aidx.data(), plan_.energyFirstJacEntry,
+ plan_.numEnergyCVs * N);
+ plan_.jacobianCvIdx.uploadSubArray(cidx.data(), plan_.energyFirstJacEntry,
+ plan_.numEnergyCVs * N);
+ }
 }
 
 // ---------------------------------------------------------------------------
