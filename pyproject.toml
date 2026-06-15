@@ -20,6 +20,5 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["F811", "F841"]          # redefined fixtures and unused vars fine in pytest
-"tests_plumed_parity/*" = ["F811", "F841"]
 "python/glued.py" = ["F401"]          # re-exports from gluedplugin are intentional
 "benchmarks/*" = ["F841"]            # benchmark timing vars sometimes unused
