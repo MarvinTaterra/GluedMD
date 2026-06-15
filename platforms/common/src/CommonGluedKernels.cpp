@@ -2592,9 +2592,9 @@ extern const string kOPESKernelSrc = kAtomicAddShim + R"(
 KERNEL void opesEvalBias(
  GLOBAL const double* RESTRICT cvValues,         // 0
  GLOBAL const int* RESTRICT cvIdxList,           // 1
- GLOBAL const float* RESTRICT centers,           // 2
- GLOBAL const float* RESTRICT sigmas,            // 3
- GLOBAL const float* RESTRICT logWeights,        // 4
+ GLOBAL const double* RESTRICT centers,          // 2  (double: bias-storage precision, M-OPESfloat)
+ GLOBAL const double* RESTRICT sigmas,           // 3
+ GLOBAL const double* RESTRICT logWeights,       // 4
  GLOBAL const int* RESTRICT numKernelsGPU,       // 5
  int numCVsBias,                                 // 6
  double invGammaFactor,                          // 7
@@ -2707,9 +2707,9 @@ KERNEL void opesGatherDeposit(
  GLOBAL int* RESTRICT nSamples,                  // 4
  GLOBAL const double* RESTRICT sigma0,           // 5
  double sigmaMin,                                // 6
- GLOBAL float* RESTRICT kCenters,               // 7
- GLOBAL float* RESTRICT kSigmas,                // 8
- GLOBAL float* RESTRICT kLogWeights,            // 9
+ GLOBAL double* RESTRICT kCenters,              // 7  (double: bias-storage precision, M-OPESfloat)
+ GLOBAL double* RESTRICT kSigmas,               // 8
+ GLOBAL double* RESTRICT kLogWeights,           // 9
  GLOBAL double* RESTRICT logSumPairwiseGPU,     // 10: sum_uprob (direct, not log)
  GLOBAL int* RESTRICT numKernelsGPU,            // 11: committed kernel count (read by eval)
  int D,                                         // 12
@@ -2851,10 +2851,10 @@ KERNEL void opesGatherDeposit(
    if (ss < 0.0) ss = 0.0;
    double sm = sqrt(ss);
    if (sm < sigmaMin) sm = sigmaMin;   // a degenerate merge can give ss->0; never store sigma=0
-   kCenters[merge_k*D+d] = (float)cm;
-   kSigmas[merge_k*D+d]  = (float)sm;
+   kCenters[merge_k*D+d] = cm;
+   kSigmas[merge_k*D+d]  = sm;
   }
-  kLogWeights[merge_k] = (float)lw_mrg;
+  kLogWeights[merge_k] = lw_mrg;
   nAfter = nBefore;
  } else {
   // B2 multiwalker: claim a slot atomically so concurrent walkers don't collide.
@@ -2863,10 +2863,10 @@ KERNEL void opesGatherDeposit(
   if (k < maxKernels) {
    // Write kernel data into the claimed slot.
    for (int d = 0; d < D; d++) {
-    kCenters[k*D+d] = (float)c_new[d];
-    kSigmas[k*D+d]  = (float)sig_new[d];
+    kCenters[k*D+d] = c_new[d];
+    kSigmas[k*D+d]  = sig_new[d];
    }
-   kLogWeights[k] = (float)lw_new;
+   kLogWeights[k] = lw_new;
    // Atomically increment committed count; eval kernel reads numKernelsGPU[0].
    // NOTE: In B2 multiwalker mode there is a small window where the eval kernel on
    // another context might read this slot before data is fully visible. This is an
@@ -4978,10 +4978,13 @@ vector<float> CommonCalcGluedForceKernel::getKernelSigmas(int biasIndex) {
         return {};
     // The GPU sigma buffer is sized for maxKernels; download only the used
     // portion. ComputeArray.download fills a host vector to its full GPU
-    // capacity, so we resize back to the live count afterwards.
-    vector<float> sigmas(o.kernelSigmas.getSize());
-    o.kernelSigmas.download(sigmas);
-    sigmas.resize((size_t)nk * (size_t)o.numCVsBias);
+    // capacity, so we resize back to the live count afterwards. The GPU array is
+    // double (M-OPESfloat); download as double, then narrow to the float return type.
+    vector<double> sigmasD(o.kernelSigmas.getSize());
+    o.kernelSigmas.download(sigmasD);
+    size_t used = (size_t)nk * (size_t)o.numCVsBias;
+    vector<float> sigmas(used);
+    for (size_t i = 0; i < used; i++) sigmas[i] = (float)sigmasD[i];
     return sigmas;
 }
 
