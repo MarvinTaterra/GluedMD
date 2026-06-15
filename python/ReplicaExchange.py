@@ -206,6 +206,12 @@ class ReplicaExchange:
         x_j = sj.getPositions(asNumpy=True)
         v_i = si.getVelocities(asNumpy=True)
         v_j = sj.getVelocities(asNumpy=True)
+        # Snapshot periodic box vectors. Under NPT each replica has its own box
+        # (the barostat changes it independently), so a configuration swap must
+        # carry its box along — otherwise foreign-energy evals and the swapped
+        # state use the wrong volume and corrupt the simulation.
+        box_i = si.getPeriodicBoxVectors(asNumpy=True)
+        box_j = sj.getPeriodicBoxVectors(asNumpy=True)
 
         beta_i, beta_j = self._betas[i], self._betas[j]
 
@@ -214,13 +220,25 @@ class ReplicaExchange:
             E_ii = si.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
             E_jj = sj.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
 
-            ctx_i.setPositions(x_j)
-            E_ij = _total_energy_kJ(ctx_i)
-            ctx_i.setPositions(x_i)  # restore
+            # Evaluate U_i(x_j): place replica j's configuration (positions AND
+            # box) into context i, then always restore i's own state — even if
+            # the energy evaluation raises.
+            try:
+                ctx_i.setPeriodicBoxVectors(*box_j)
+                ctx_i.setPositions(x_j)
+                E_ij = _total_energy_kJ(ctx_i)
+            finally:
+                ctx_i.setPeriodicBoxVectors(*box_i)
+                ctx_i.setPositions(x_i)  # restore
 
-            ctx_j.setPositions(x_i)
-            E_ji = _total_energy_kJ(ctx_j)
-            ctx_j.setPositions(x_j)  # restore
+            # Evaluate U_j(x_i): same pattern for context j.
+            try:
+                ctx_j.setPeriodicBoxVectors(*box_i)
+                ctx_j.setPositions(x_i)
+                E_ji = _total_energy_kJ(ctx_j)
+            finally:
+                ctx_j.setPeriodicBoxVectors(*box_j)
+                ctx_j.setPositions(x_j)  # restore
 
             delta = -beta_i * (E_ij + E_ji - E_ii - E_jj)
             v_i_new, v_j_new = v_j, v_i   # no scaling (same T)
@@ -254,8 +272,12 @@ class ReplicaExchange:
         if accepted:
             self._n_accepted += 1
             self._pair_accepted[key] = self._pair_accepted.get(key, 0) + 1
+            # Swap full configurations, including periodic box vectors so the
+            # exchanged volume travels with the positions (required for NPT).
+            ctx_i.setPeriodicBoxVectors(*box_j)
             ctx_i.setPositions(x_j)
             ctx_i.setVelocities(v_i_new)
+            ctx_j.setPeriodicBoxVectors(*box_i)
             ctx_j.setPositions(x_i)
             ctx_j.setVelocities(v_j_new)
 
