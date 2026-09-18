@@ -204,9 +204,9 @@ Convergence diagnostics for the `biasIndex`-th OPES bias:
 
 ### Bias state (checkpoint / restore)
 
-#### `getBiasState() → bytes`
+#### `getBiasState(context=None) → bytes`
 
-Serialize all stateful bias data (MetaD grids, OPES kernels, ABMD floors, EDS λ, ExtLag s, MaxEnt λ) to a bytes object.
+Serialize all stateful bias data (MetaD grids, OPES kernels and statistics, ABMD floors, EDS λ, ExtLag s/p, MaxEnt λ, multithermal ΔF) to a bytes object.
 
 ```python
 blob = force.getBiasState()
@@ -214,11 +214,11 @@ with open("checkpoint.bin", "wb") as f:
     f.write(blob)
 ```
 
-The binary format starts with a magic header (`GLUED`) and a version integer.
+Pass the Context explicitly when the same System is used by several Contexts; without it the force must be bound to exactly one Context. The blob starts with the magic `GPUS` and a version integer (currently 2) followed by a hash of the force configuration.
 
-#### `setBiasState(blob: bytes)`
+#### `setBiasState(blob: bytes, context=None)`
 
-Restore a previously saved bias state. The current bias configuration (number and type of biases) must match what was saved.
+Restore a previously saved bias state. The force must be configured exactly as the one that wrote the blob (the OPES kernel capacity may be raised); truncated, extended or mismatched blobs raise and leave the current state untouched. Save an OpenMM checkpoint alongside the bias state: the blob holds no positions, velocities, box or step count.
 
 ```python
 with open("checkpoint.bin", "rb") as f:
@@ -254,32 +254,16 @@ for i in range(system2.getNumForces()):
 
 ---
 
-### Multi-walker shared GPU arrays
+### Multi-walker sharing
 
-These methods allow multiple OpenMM Contexts on the same GPU to share a single bias grid (MetaD) or kernel list (OPES). All deposits are atomic on the GPU — no CPU merge step, no periodic synchronization.
-
-> Requires CUDA platform.
-
-#### `getMultiWalkerPtrs(context, biasIdx) → [long long]`
-
-Get raw device pointers for the primary walker's bias GPU arrays.
-
-- `BIAS_METAD`: returns `[grid_ptr]`
-- `BIAS_OPES`: returns `[centers, sigmas, logweights, numKernels, numAllocated]`
-
-#### `setMultiWalkerPtrs(context, biasIdx, ptrs)`
-
-Wire this (secondary) walker's bias kernels to use the primary's GPU arrays. Must be called **after** the secondary's Context is created.
+Walkers share a bias through `MultiWalkerPool`, which moves bias-state checkpoints between their Contexts (see the [Multi-GPU guide](multi_gpu.md)). The earlier `getMultiWalkerPtrs`/`setMultiWalkerPtrs` methods, which aliased raw device arrays between Contexts, have been removed.
 
 ```python
-# Primary deposits into its own grid
-ptrs = f_primary.getMultiWalkerPtrs(ctx_primary, bias_idx=0)
-
-# Secondary reads from the same grid
-f_secondary.setMultiWalkerPtrs(ctx_secondary, bias_idx=0, ptrs=ptrs)
+from MultiGPUManager import MultiWalkerPool
+pool = MultiWalkerPool([[ctx0, ctx1]], [[f0, f1]], bias_index=0, sync_interval=500)
+pool.run(10000)
+pool.close()
 ```
-
-See [Examples — Multi-walker MetaD](examples.md#multi-walker-metadynamics) for a full recipe.
 
 ---
 

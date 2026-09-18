@@ -74,14 +74,13 @@ Distance between the centres of mass of two atom groups.
 
 | Argument | Value |
 |---|---|
-| `atoms` | `[n1, a0, a1, ..., a_{n1-1}, b0, b1, ..., b_{n2-1}]` — first element is the count of group-1 atoms; remainder are group-1 then group-2 atom indices |
-| `parameters` | `[m0, m1, ..., m_{n1+n2-1}]` — masses in the same order as the non-count atoms |
+| `atoms` | `[a0, ..., a_{n1-1}, b0, ..., b_{n2-1}]` — group-1 then group-2 atom indices |
+| `parameters` | `[n1]` — group-1 size; masses are obtained from the OpenMM System |
 
 ```python
 # Group 1: atoms 0,1,2 (mass 12 each); Group 2: atoms 5,6 (mass 14 each)
-atoms  = [3, 0, 1, 2, 5, 6]
-masses = [12.0, 12.0, 12.0, 14.0, 14.0]
-com_d = force.addCollectiveVariable(gp.GluedForce.CV_COM_DISTANCE, atoms, masses)
+atoms = [0, 1, 2, 5, 6]
+com_d = force.addCollectiveVariable(gp.GluedForce.CV_COM_DISTANCE, atoms, [3])
 ```
 
 ---
@@ -93,12 +92,11 @@ Mass-weighted radius of gyration of an atom group.
 | Argument | Value |
 |---|---|
 | `atoms` | `[atom_0, atom_1, ..., atom_{N-1}]` |
-| `parameters` | `[m_0, m_1, ..., m_{N-1}]` — atomic masses |
+| `parameters` | `[]` — masses are obtained from the OpenMM System |
 
 ```python
 atoms  = list(range(10))
-masses = [12.0] * 10
-rg = force.addCollectiveVariable(gp.GluedForce.CV_GYRATION, atoms, masses)
+rg = force.addCollectiveVariable(gp.GluedForce.CV_GYRATION, atoms, [])
 ```
 
 ---
@@ -111,7 +109,7 @@ Smooth coordination number between two groups using a switching function:
 
 | Argument | Value |
 |---|---|
-| `atoms` | `[n1, a0...a_{n1-1}, b0...b_{n2-1}]` — same layout as COM_DISTANCE but no masses |
+| `atoms` | `[n1, a0...a_{n1-1}, b0...b_{n2-1}]` — group-size header followed by atom indices (different from COM_DISTANCE) |
 | `parameters` | `[r0, n, m]` — cutoff distance (nm), numerator exponent, denominator exponent |
 
 ```python
@@ -124,18 +122,17 @@ cn = force.addCollectiveVariable(gp.GluedForce.CV_COORDINATION, atoms, [0.35, 6.
 
 ## CV_RMSD (7)
 
-RMSD from a reference structure, computed over a selected set of atoms (mass-weighted if masses are provided; equal-weight if all masses are 1).
+Unweighted positional RMSD from reference coordinates, with no rotational or translational fit. Supply coordinates in the same frame and unwrap/image molecules before using this CV or a path CV; their raw-coordinate definitions do not apply minimum-image distances.
 
 | Argument | Value |
 |---|---|
 | `atoms` | `[atom_0, ..., atom_{N-1}]` |
-| `parameters` | `[m_0, ..., m_{N-1}, x0_0, y0_0, z0_0, x0_1, y0_1, z0_1, ...]` — masses first, then reference positions in nm (row-major, xyz per atom) |
+| `parameters` | `[x0_0, y0_0, z0_0, x0_1, y0_1, z0_1, ...]` — reference positions in nm (row-major, xyz per atom) |
 
 ```python
 ref_pos = [0.1, 0.2, 0.3,  0.4, 0.5, 0.6]  # 2 atoms × xyz
 atoms   = [0, 1]
-masses  = [12.0, 14.0]
-rmsd = force.addCollectiveVariable(gp.GluedForce.CV_RMSD, atoms, masses + ref_pos)
+rmsd = force.addCollectiveVariable(gp.GluedForce.CV_RMSD, atoms, ref_pos)
 ```
 
 ---

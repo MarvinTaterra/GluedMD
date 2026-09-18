@@ -30,7 +30,8 @@ _ADP  = os.path.join(_REPO, "adp", "charmm-gui-7782503285", "openmm")
 
 if not os.path.isdir(_ADP):
     print(f"SKIP: ADP CHARMM-GUI directory not found: {_ADP}")
-    sys.exit(0)
+    import pytest
+    pytest.skip("Optional CHARMM-GUI ADP dataset is unavailable", allow_module_level=True)
 
 # ── Import CHARMM-GUI utilities ────────────────────────────────────────────
 sys.path.insert(0, _ADP)

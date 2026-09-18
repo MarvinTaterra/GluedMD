@@ -20,12 +20,8 @@ GluedForceImpl::GluedForceImpl(const GluedForce& owner)
     : owner_(owner) {}
 
 GluedForceImpl::~GluedForceImpl() {
-    // H27: owner_.impl_ was set to point at this impl in initialize(). If we are
-    // that impl, clear the back-pointer so getBiasStateBytes()/setBiasStateBytes()
-    // on the owning Force after Context destruction throw cleanly instead of
-    // dereferencing a dangling pointer (use-after-free).
-    if (owner_.impl_ == this)
-        owner_.impl_ = nullptr;
+    // Unregister so the owning Force never dereferences a destroyed impl.
+    owner_.impls_.erase(this);
     // Tear down the CV_ENERGY inner context (context first; it references the
     // integrator + system we own).
     delete innerContext_;
@@ -34,19 +30,19 @@ GluedForceImpl::~GluedForceImpl() {
 }
 
 void GluedForceImpl::initialize(ContextImpl& context) {
+    context_ = &context;
     kernel_ = context.getPlatform().createKernel(
         CalcGluedForceKernel::Name(), context);
     kernel_.getAs<CalcGluedForceKernel>().initialize(
         context.getSystem(), owner_);
-    // Register this impl so getBiasStateBytes() / setBiasStateBytes() can
-    // delegate without requiring a Context at call time.
-    owner_.impl_ = this;
+    // Register this impl so the Context-free checkpoint calls can delegate to it.
+    owner_.impls_.insert(this);
 
     // CV_ENERGY (OPES multithermal): if any CV is a total-energy CV, build a linked
-    // inner Context holding all of the System's forces EXCEPT this GluedForce. The
-    // inner context then yields the UNBIASED potential energy U (and forces F) — the
-    // GluedForce's own bias is absent by construction, so U excludes it (ATMForce
-    // pattern). Skipped entirely when no energy CV is present (zero overhead).
+    // inner Context holding all of the System's forces EXCEPT GluedForces. The
+    // inner context then yields the UNBIASED potential energy U (and forces F):
+    // every GLUED bias is absent by construction (ATMForce pattern). Skipped
+    // entirely when no energy CV is present (zero overhead).
     bool hasEnergyCV = false;
     for (int i = 0; i < owner_.getNumCollectiveVariableSpecs(); i++) {
         int type; std::vector<int> atoms; std::vector<double> params;
@@ -79,7 +75,7 @@ void GluedForceImpl::initialize(ContextImpl& context) {
         //    Caveat: assumes a standard integrator that recomputes vsite positions each step.
         for (int i = 0; i < sys.getNumForces(); i++) {
             const Force& f = sys.getForce(i);
-            if (&f == &owner_)
+            if (dynamic_cast<const GluedForce*>(&f) != nullptr)
                 continue;
             innerSystem_->addForce(XmlSerializer::clone<Force>(f));
         }
@@ -99,13 +95,14 @@ void GluedForceImpl::initialize(ContextImpl& context) {
 
 void GluedForceImpl::updateContextState(ContextImpl& context,
                                              bool& forcesInvalid) {
-    // Guard: bias deposition must fire exactly once per step, even when
+    // Guard: bias history must be committed exactly once per step, even when
     // execute() is called multiple times (minimization, constraint iteration).
-    int step = context.getStepCount();
-    if (step != lastStepIndex_) {
-        kernel_.getAs<CalcGluedForceKernel>().updateState(context, step);
-        lastStepIndex_ = step;
-    }
+    long long step = context.getStepCount();
+    if (step == lastStepIndex_)
+        return;
+    lastStepIndex_ = step;
+    if (kernel_.getAs<CalcGluedForceKernel>().updateState(context, step))
+        forcesInvalid = true;
 }
 
 double GluedForceImpl::calcForcesAndEnergy(ContextImpl& context,
@@ -133,6 +130,8 @@ vector<char> GluedForceImpl::getBiasStateBytes() const {
 
 void GluedForceImpl::setBiasStateBytes(const vector<char>& bytes) {
     kernel_.getAs<CalcGluedForceKernel>().setBiasStateBytes(bytes);
+    // The restored bias is a different potential: drop any cached forces.
+    context_->systemChanged();
 }
 
 void GluedForceImpl::getCurrentCVs(vector<double>& values) {
@@ -153,13 +152,4 @@ vector<double> GluedForceImpl::getOPESMetrics(int biasIndex) {
 
 vector<float> GluedForceImpl::getKernelSigmas(int biasIndex) {
     return kernel_.getAs<CalcGluedForceKernel>().getKernelSigmas(biasIndex);
-}
-
-vector<long long> GluedForceImpl::getMultiWalkerPtrs(int biasType, int localIdx) {
-    return kernel_.getAs<CalcGluedForceKernel>().getMultiWalkerPtrs(biasType, localIdx);
-}
-
-void GluedForceImpl::redirectToPrimaryBias(int biasType, int localIdx,
-                                                const vector<long long>& ptrs) {
-    kernel_.getAs<CalcGluedForceKernel>().redirectToPrimaryBias(biasType, localIdx, ptrs);
 }

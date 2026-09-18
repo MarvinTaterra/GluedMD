@@ -4,12 +4,13 @@
 #include "openmm/Context.h"
 #include "openmm/Force.h"
 #include <vector>
+#include <set>
 #include <string>
 #include "internal/windowsExportGlued.h"
 
 namespace GluedPlugin {
 
-class GluedForceImpl;  // forward-declared so Force can hold impl_ pointer
+class GluedForceImpl;  // forward-declared so Force can track its live impls
 
 /**
  * GluedForce is an OpenMM Force that provides GPU-resident enhanced sampling.
@@ -97,12 +98,10 @@ public:
     GluedForce();
     ~GluedForce() override;
 
-    // L24: impl_ is a non-owning back-pointer set by a per-Context GluedForceImpl.
-    // The default (shallow) copy would alias it, so a copy could end up pointing
-    // at an impl owned by another Force's Context — a dangling pointer once that
-    // Context is destroyed. We therefore copy all CV/bias/config data but reset
-    // impl_ to nullptr on any copy; a copied Force is simply "not yet bound to a
-    // Context" until createImpl() runs for it.
+    // A Force tracks the impls of the Contexts it is bound to (impls_, see
+    // below). Copies take all CV/bias/config data but none of those bindings; a
+    // copied Force is simply "not yet bound to a Context" until createImpl()
+    // runs for it.
     GluedForce(const GluedForce& other);
     GluedForce& operator=(const GluedForce& other);
 
@@ -155,9 +154,13 @@ public:
     void setUsesPeriodicBoundaryConditions(bool yes) { usesPBC_ = yes; }
 
     // --- Bias state checkpoint/restore (Stage 6) ---
+    // The Context-free overloads are a convenience for the common case of one
+    // Context per Force; they throw when zero or several Contexts are live.
 
     std::vector<char> getBiasStateBytes() const;
     void setBiasStateBytes(const std::vector<char>& bytes);
+    std::vector<char> getBiasStateBytes(OpenMM::Context& context) const;
+    void setBiasStateBytes(OpenMM::Context& context, const std::vector<char>& bytes);
 
     // --- Live CV query (Stage 6) ---
 
@@ -217,27 +220,6 @@ public:
     // force evaluation — for OPES reweighting. Cached read-back; autograd-safe.
     double getLastBias(OpenMM::Context& context) const;
 
-    // --- Multiwalker B2: shared GPU bias arrays ---
-    // These methods enable multiple OpenMM Contexts (walkers) on the same GPU to
-    // share a single bias grid (MetaD) or kernel list (OPES), with all deposits
-    // going to the shared GPU arrays atomically — no CPU roundtrip, no periodic merge.
-    // Requires CUDA platform; biasIdx is 0-based index of the bias (order of addBias calls).
-
-    /**
-     * Get raw device pointers for the specified bias's shared GPU arrays (primary walker).
-     * biasType=BIAS_METAD: returns [grid_ptr]
-     * biasType=BIAS_OPES:  returns [centers, sigmas, logweights, numKernels, numAllocated]
-     * Returns empty vector on non-CUDA platforms or unsupported bias types.
-     */
-    std::vector<long long> getMultiWalkerPtrs(OpenMM::Context& context, int biasIdx) const;
-
-    /**
-     * Set up this walker to share bias arrays with a primary walker (secondary walker).
-     * Must be called AFTER context creation. ptrs comes from primary's getMultiWalkerPtrs().
-     * biasIdx: 0-based index of the bias in this walker's force (same bias type and order).
-     */
-    void setMultiWalkerPtrs(OpenMM::Context& context, int biasIdx, const std::vector<long long>& ptrs);
-
 protected:
     OpenMM::ForceImpl* createImpl() const override;
 
@@ -259,17 +241,15 @@ private:
     std::vector<CV> cvs_;
     int numCVValues_ = 0;   // total CV output values (PATH counts as 2)
     std::vector<Bias> biases_;
-    double temperature_ = -1.0;
+    double temperature_ = 300.0;
     bool usesPBC_ = false;
     int testForceMode_ = 0;
     double testForceScale_ = 0.0;
     std::vector<double> testBiasGradients_;
-    // Set during Context creation; points to the most-recently-created impl.
-    // Non-owning back-pointer: the impl is owned by the Context and clears this
-    // (in ~GluedForceImpl) when destroyed. Reset to nullptr on copy (see the
-    // copy constructor / assignment operator above) so a copied Force never
-    // aliases another's impl.
-    mutable GluedForceImpl* impl_ = nullptr;
+    // Live impls, one per Context created from a System containing this Force.
+    // Non-owning: each impl registers itself in initialize() and unregisters in
+    // its destructor. Not copied, so a copied Force is never bound to a Context.
+    mutable std::set<GluedForceImpl*> impls_;
 };
 
 } // namespace GluedPlugin

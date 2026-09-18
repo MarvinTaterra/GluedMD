@@ -5,19 +5,18 @@ Supports two modes:
 
   H-REUS  (Hamiltonian Replica Exchange Umbrella Sampling)
       All replicas run at the *same* temperature but with different bias
-      parameters (e.g. different harmonic restraint centres).  Metropolis
-      criterion uses total potential energy; the identical MM contributions
-      cancel, leaving only the bias-energy difference.
+      parameters (e.g. different harmonic restraint centres).
 
   T-REMD  (Temperature Replica Exchange MD)
       All replicas share the same Hamiltonian / bias but run at different
-      temperatures.  Criterion uses MM-only energy (total minus bias).
-      The user must place GluedForce in a non-default force group so the
-      bias energy can be isolated:
-          f.setForceGroup(1)        # before context creation
+      temperatures:
           re = ReplicaExchange(..., mode="T-REMD",
-                                   temperatures=[300, 320, 340, 360],
-                                   bias_force_group=1)
+                                   temperatures=[300, 320, 340, 360])
+
+Both modes use the same Metropolis criterion on the complete reduced potentials
+of the four (replica, configuration) combinations, including every bias and,
+under an isotropic barostat, the pressure-volume term. A bias therefore never
+needs to be isolated in its own force group for the exchange to be correct.
 
 Usage:
     from ReplicaExchange import ReplicaExchange
@@ -31,6 +30,10 @@ Usage:
 
 import math
 import random
+import warnings
+
+import numpy as np
+import openmm as mm
 from openmm import unit
 
 
@@ -40,17 +43,63 @@ def _total_energy_kJ(ctx):
     return s.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
 
 
-def _group_energy_kJ(ctx, groups_mask):
-    """Return potential energy restricted to the given force-group mask, kJ/mol."""
-    s = ctx.getState(getEnergy=True, groups=groups_mask)
-    return s.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+def _pressure_kJ_per_nm3(ctx):
+    """Reference pressure of an isotropic MonteCarloBarostat, or 0 without one."""
+    barostats = [f for f in ctx.getSystem().getForces() if "Barostat" in type(f).__name__]
+    if not barostats:
+        return 0.0
+    if len(barostats) != 1 or type(barostats[0]) is not mm.MonteCarloBarostat:
+        raise ValueError("replica exchange supports NVT or an isotropic MonteCarloBarostat")
+    pressure_bar = ctx.getParameter(mm.MonteCarloBarostat.Pressure())
+    return pressure_bar * _BAR_TO_KJ_PER_MOL_NM3
 
 
-def _mm_energy_kJ(ctx, bias_group):
-    """MM-only energy: total minus bias group, kJ/mol."""
-    total = _total_energy_kJ(ctx)
-    bias  = _group_energy_kJ(ctx, 1 << bias_group)
-    return total - bias
+_BAR_TO_KJ_PER_MOL_NM3 = 0.0602214076   # 1 bar = 1e5 J/m^3 = 6.02214076e-2 kJ/mol/nm^3
+
+
+def _volume_nm3(state):
+    box = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.nanometer)
+    return abs(float(np.linalg.det(box)))
+
+
+def exchange_log_acceptance(ctx_i, ctx_j, state_i, state_j, beta_i, beta_j):
+    """Log of the Metropolis acceptance ratio for swapping the configurations of
+    replicas i and j.
+
+    ``state_i``/``state_j`` are the replicas' current States (positions,
+    energy, box). Each Context evaluates the other's configuration with its own
+    Hamiltonian, so replica-specific biases are handled exactly:
+
+        Δ = β_i [U_i(x_i) − U_i(x_j) + p_i (V_i − V_j)]
+          + β_j [U_j(x_j) − U_j(x_i) + p_j (V_j − V_i)]
+
+    Both Contexts are restored to their own configuration before returning.
+    """
+    pressure_i, pressure_j = _pressure_kJ_per_nm3(ctx_i), _pressure_kJ_per_nm3(ctx_j)
+    box_i, box_j = state_i.getPeriodicBoxVectors(), state_j.getPeriodicBoxVectors()
+    x_i, x_j = state_i.getPositions(), state_j.getPositions()
+    volume_i, volume_j = _volume_nm3(state_i), _volume_nm3(state_j)
+    e_ii = state_i.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+    e_jj = state_j.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
+    try:
+        ctx_i.setPeriodicBoxVectors(*box_j)
+        ctx_i.setPositions(x_j)
+        e_ij = _total_energy_kJ(ctx_i)
+    finally:
+        ctx_i.setPeriodicBoxVectors(*box_i)
+        ctx_i.setPositions(x_i)
+    try:
+        ctx_j.setPeriodicBoxVectors(*box_i)
+        ctx_j.setPositions(x_i)
+        e_ji = _total_energy_kJ(ctx_j)
+    finally:
+        ctx_j.setPeriodicBoxVectors(*box_j)
+        ctx_j.setPositions(x_j)
+    delta = (beta_i * (e_ii - e_ij + pressure_i * (volume_i - volume_j))
+             + beta_j * (e_jj - e_ji + pressure_j * (volume_j - volume_i)))
+    if not math.isfinite(delta):
+        raise ValueError("nonfinite replica-exchange reduced potential")
+    return delta
 
 
 class ReplicaExchange:
@@ -70,9 +119,8 @@ class ReplicaExchange:
     temperatures : list of float
         Temperatures in Kelvin, one per replica.  Required for T-REMD.
     bias_force_group : int or None
-        Force group index of GluedForce.  Required for T-REMD when a bias
-        is present so the MM energy can be isolated.  Set None if no bias (all
-        energy is MM energy).
+        Accepted for backward compatibility and not used: the acceptance test
+        always uses the complete potential energy.
     scheme : str
         "neighbor" — try only adjacent (i, i+1) pairs each cycle (fast, standard).
         "all"      — try every unique pair each cycle.
@@ -101,7 +149,7 @@ class ReplicaExchange:
         self._pair_accepted = {}
 
         if self._mode == "H-REUS":
-            if kT is None:
+            if kT is None or not math.isfinite(kT) or kT <= 0:
                 raise ValueError("H-REUS requires kT")
             self._betas = [1.0 / kT] * self._n
 
@@ -109,6 +157,8 @@ class ReplicaExchange:
             if temperatures is None or len(temperatures) != self._n:
                 raise ValueError("T-REMD requires temperatures list, one per replica")
             self._temperatures = list(temperatures)
+            if any(not math.isfinite(t) or t <= 0 for t in self._temperatures):
+                raise ValueError("replica temperatures must be finite and positive")
             self._betas = [1.0 / (self._GAS_CONSTANT_kJmol * T)
                            for T in temperatures]
             # Verify integrator temperatures match
@@ -117,7 +167,6 @@ class ReplicaExchange:
                 if hasattr(integ, "getTemperature"):
                     T_integ = integ.getTemperature().value_in_unit(unit.kelvin)
                     if abs(T_integ - temperatures[i]) > 1.0:
-                        import warnings
                         warnings.warn(
                             f"Replica {i}: integrator temperature {T_integ:.1f} K "
                             f"does not match RE temperature {temperatures[i]:.1f} K. "
@@ -165,13 +214,13 @@ class ReplicaExchange:
         secondaries.  Pass ``target_indices=None`` to broadcast to every other
         replica.
         """
-        _, f_src = self._replicas[source_idx]
-        blob = f_src.getBiasState()
+        ctx_src, f_src = self._replicas[source_idx]
+        blob = f_src.getBiasState(ctx_src)
         if target_indices is None:
             target_indices = [i for i in range(self._n) if i != source_idx]
         for i in target_indices:
-            _, f_tgt = self._replicas[i]
-            f_tgt.setBiasState(blob)
+            ctx_tgt, f_tgt = self._replicas[i]
+            f_tgt.setBiasState(blob, ctx_tgt)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -215,54 +264,11 @@ class ReplicaExchange:
 
         beta_i, beta_j = self._betas[i], self._betas[j]
 
-        if self._mode == "H-REUS":
-            # Total energy: MM terms cancel in criterion (same T).
-            E_ii = si.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-            E_jj = sj.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-
-            # Evaluate U_i(x_j): place replica j's configuration (positions AND
-            # box) into context i, then always restore i's own state — even if
-            # the energy evaluation raises.
-            try:
-                ctx_i.setPeriodicBoxVectors(*box_j)
-                ctx_i.setPositions(x_j)
-                E_ij = _total_energy_kJ(ctx_i)
-            finally:
-                ctx_i.setPeriodicBoxVectors(*box_i)
-                ctx_i.setPositions(x_i)  # restore
-
-            # Evaluate U_j(x_i): same pattern for context j.
-            try:
-                ctx_j.setPeriodicBoxVectors(*box_i)
-                ctx_j.setPositions(x_i)
-                E_ji = _total_energy_kJ(ctx_j)
-            finally:
-                ctx_j.setPeriodicBoxVectors(*box_j)
-                ctx_j.setPositions(x_j)  # restore
-
-            delta = -beta_i * (E_ij + E_ji - E_ii - E_jj)
-            v_i_new, v_j_new = v_j, v_i   # no scaling (same T)
-
-        else:  # T-REMD
-            # Only U(x_i) and U(x_j) are needed — no foreign-position evaluations.
-            if self._bias_group is not None:
-                U_ii = _mm_energy_kJ(ctx_i, self._bias_group)
-                U_jj = _mm_energy_kJ(ctx_j, self._bias_group)
-            else:
-                # No bias: total energy equals MM energy.
-                U_ii = si.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-                U_jj = sj.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-
-            # Sugita-Okamoto criterion: Δ = (β_i − β_j)(U(x_i) − U(x_j))
-            # β_i > β_j when T_i < T_j; U(x_i) < U(x_j) typically →  Δ < 0 → P_acc < 1
-            delta = (beta_i - beta_j) * (U_ii - U_jj)
-
-            # Velocity rescaling for T-REMD.
-            Ti, Tj = self._temperatures[i], self._temperatures[j]
-            scale_i = math.sqrt(Ti / Tj)   # velocities going from j→i context
-            scale_j = math.sqrt(Tj / Ti)   # velocities going from i→j context
-            v_i_new = v_j * scale_i
-            v_j_new = v_i * scale_j
+        delta = exchange_log_acceptance(ctx_i, ctx_j, si, sj, beta_i, beta_j)
+        # Velocities are rescaled to the receiving replica's temperature
+        # (no-op for H-REUS where all betas are equal).
+        scale = math.sqrt(beta_j / beta_i)
+        v_i_new, v_j_new = v_j * scale, v_i / scale
 
         key = (min(i, j), max(i, j))
         self._pair_attempts[key] = self._pair_attempts.get(key, 0) + 1

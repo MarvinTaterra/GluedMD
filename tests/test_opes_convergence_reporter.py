@@ -406,8 +406,8 @@ def _make_opes_simulation(platform):
     bv = mm.vectord()
     iv = mm.vectori()
     # OPES params: kT, sigma0, gamma, pace, nkerMax
-    for x in [2.479, 0.05, 10.0]: bv.append(x)
-    for x in [10, 1000]: iv.append(x)
+    for x in [2.479, 10.0, 0.05, 0.001]: bv.append(x)
+    for x in [0, 10, 1000]: iv.append(x)
     f.addBias(gp.GluedForce.BIAS_OPES, civ, bv, iv)
 
     sys_.addForce(f)

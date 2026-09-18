@@ -114,11 +114,13 @@ def test_abmd_approach_then_retreat(platform):
     ctx, _ = make_system(pos_1,
                          [(gp.GluedForce.CV_DISTANCE, [0, 1], [])],
                          [([0], [k, TO])], platform)
+    ctx.getIntegrator().step(1)
     E1 = get_energy(ctx)
     assert abs(E1) < TOL_E
 
     # Step 2: move closer (cv=0.9) → rhoMin updates
     ctx.setPositions([mm.Vec3(0, 0, 0), mm.Vec3(0.9, 0, 0), mm.Vec3(5, 5, 5)])
+    ctx.getIntegrator().step(1)
     E2 = get_energy(ctx)
     assert abs(E2) < TOL_E, f"Moving closer should give V=0, got {E2:.6f}"
 
@@ -142,7 +144,7 @@ def test_abmd_force_toward_target(platform):
     ctx, _ = make_system(pos_prime,
                          [(gp.GluedForce.CV_DISTANCE, [0, 1], [])],
                          [([0], [k, TO])], platform)
-    get_energy(ctx)  # prime rhoMin
+    ctx.getIntegrator().step(1)  # commit rhoMin
 
     cv_far = 0.5
     ctx.setPositions([mm.Vec3(0, 0, 0), mm.Vec3(cv_far, 0, 0), mm.Vec3(5, 5, 5)])
@@ -173,7 +175,7 @@ def test_abmd_rhomin_only_decreases(platform):
     ctx, _ = make_system(pos_0,
                          [(gp.GluedForce.CV_DISTANCE, [0, 1], [])],
                          [([0], [k, TO])], platform)
-    get_energy(ctx)  # prime rhoMin = (0.8-1.0)^2 = 0.04
+    ctx.getIntegrator().step(1)  # commit rhoMin = (0.8-1.0)^2 = 0.04
 
     pos_far = [(0, 0, 0), (0.5, 0, 0), (5, 5, 5)]
     ctx.setPositions([mm.Vec3(*p) for p in pos_far])

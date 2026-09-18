@@ -13,7 +13,7 @@ GLUED is built from source using CMake and conda. All three major operating syst
 | macOS Intel | ✓ | ✓ | — |
 | macOS Apple Silicon (M1/M2/M3) | ✓ | — | — |
 
-CUDA on macOS is not supported by Apple (dropped in 2019). OpenCL on Apple Silicon is not available. The Reference platform works on every OS and is fully functional for development and small systems.
+CUDA on macOS is not supported by Apple (dropped in 2019). OpenCL on Apple Silicon is not available. The Reference plugin supports empty-force API smoke checks only: it rejects nonempty CV/bias configurations. Numerical GLUED simulations require CUDA or OpenCL. This checkout has no HIP backend. Apple Silicon therefore has no supported numerical GLUED backend in this release.
 
 ---
 

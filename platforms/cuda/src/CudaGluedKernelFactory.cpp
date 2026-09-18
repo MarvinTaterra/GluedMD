@@ -16,34 +16,12 @@ using namespace OpenMM;
 // the common layer's GPU-native PyTorch path can share OpenMM's CUDA stream
 // with torch (via c10::cuda::CUDAStreamGuard) and access raw device pointers
 // for zero-copy CUDA tensor creation and D2D gradient copies.
-// Also provides getSharedBiasPtrs() for multiwalker B2 support.
 class CudaCalcGluedForceKernel : public CommonCalcGluedForceKernel {
 public:
     CudaCalcGluedForceKernel(std::string name,
                                    const Platform& platform,
                                    ComputeContext& cc)
         : CommonCalcGluedForceKernel(name, platform, cc) {}
-
-    // Returns raw device pointers for the specified bias's shared arrays.
-    // biasType=BIAS_METAD: returns [grid_ptr]
-    // biasType=BIAS_OPES:  returns [centers, sigmas, logweights, numKernels, numAllocated]
-    std::vector<long long> getMultiWalkerPtrs(int biasType, int localIdx) override {
-        std::vector<long long> ptrs;
-        CudaContext& cu = static_cast<CudaContext&>(cc_);
-        if (biasType == GluedForce::BIAS_METAD && localIdx < (int)metaDGridBiases_.size()) {
-            auto& m = metaDGridBiases_[localIdx];
-            CudaArray& arr = cu.unwrap(m.grid.getArray());
-            ptrs.push_back((long long)arr.getDevicePointer());
-        } else if (biasType == GluedForce::BIAS_OPES && localIdx < (int)opesBiases_.size()) {
-            auto& o = opesBiases_[localIdx];
-            ptrs.push_back((long long)cu.unwrap(o.kernelCenters.getArray()).getDevicePointer());
-            ptrs.push_back((long long)cu.unwrap(o.kernelSigmas.getArray()).getDevicePointer());
-            ptrs.push_back((long long)cu.unwrap(o.kernelLogWeights.getArray()).getDevicePointer());
-            ptrs.push_back((long long)cu.unwrap(o.numKernelsGPU.getArray()).getDevicePointer());
-            ptrs.push_back((long long)cu.unwrap(o.numAllocatedGPU.getArray()).getDevicePointer());
-        }
-        return ptrs;
-    }
 
 protected:
     // Returns OpenMM's CUstream cast to void* so the common layer can pass it

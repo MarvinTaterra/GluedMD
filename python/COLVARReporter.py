@@ -40,6 +40,18 @@ class COLVARReporter:
     """
 
     def __init__(self, file, reportInterval, force, cvNames=None, append=False):
+        self._out = None   # set first so __del__ is safe if validation raises
+        if not isinstance(reportInterval, int) or reportInterval <= 0:
+            raise ValueError("reportInterval must be a positive integer")
+        if cvNames is not None:
+            cvNames = list(cvNames)
+            if len(cvNames) != force.getNumCollectiveVariables():
+                raise ValueError("cvNames must match the number of CV values")
+            # Names become whitespace-separated column headers.
+            valid = all(isinstance(n, str) and n and not any(c.isspace() for c in n)
+                        for n in cvNames)
+            if not valid or len(set(cvNames)) != len(cvNames):
+                raise ValueError("CV names must be unique, nonempty and contain no whitespace")
         self._interval = reportInterval
         self._force = force
         self._cv_names = cvNames
@@ -94,7 +106,7 @@ class COLVARReporter:
         self._header_written = True
 
     def __del__(self):
-        if self._out is not None and isinstance(self._file, str):
+        if getattr(self, '_out', None) is not None and isinstance(self._file, str):
             try:
                 self._out.close()
             except (OSError, ValueError) as exc:

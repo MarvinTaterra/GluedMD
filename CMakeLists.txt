@@ -32,7 +32,7 @@ link_directories(
     "${OPENMM_DIR}/lib/plugins"
 )
 
-set(GLUED_VERSION "${PROJECT_VERSION}")
+set(GLUED_VERSION "${PROJECT_VERSION}" CACHE STRING "Python package version (may include a local build suffix)")
 
 # macOS rpath
 if(APPLE)

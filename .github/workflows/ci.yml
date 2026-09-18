@@ -104,3 +104,7 @@ jobs:
       - name: Smoke test
         shell: bash -l {0}
         run: python tests/test_api_smoke.py
+
+      - name: Audit and serialization regressions
+        shell: bash -l {0}
+        run: python -m pytest tests/test_audit_regressions.py tests/test_xml_serialization.py -q

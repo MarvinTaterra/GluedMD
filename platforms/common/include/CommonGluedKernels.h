@@ -25,7 +25,7 @@ public:
     double execute(OpenMM::ContextImpl& context,
                    bool includeForces, bool includeEnergy) override;
 
-    void updateState(OpenMM::ContextImpl& context, int step) override;
+    bool updateState(OpenMM::ContextImpl& context, long long step) override;
 
     // Linked inner context (System minus this GluedForce) for the CV_ENERGY value
     // and forces (OPES multithermal). The device path drives it through the
@@ -51,10 +51,6 @@ public:
     // Flat per-kernel σ buffer (numKernels * numCVsBias floats).
     std::vector<float> getKernelSigmas(int biasIndex) override;
 
-    // Multiwalker B2: redirect this walker's bias kernels to use primary's shared GPU arrays.
-    // ptrs are raw device pointers cast to long long, bias-type-specific.
-    void redirectToPrimaryBias(int biasType, int localIdx, const std::vector<long long>& ptrs) override;
-
 protected:
     OpenMM::ComputeContext& cc_;
     OpenMM::Context* innerContext_ = nullptr;   // CV_ENERGY linked inner context (unbiased U/F)
@@ -73,6 +69,21 @@ protected:
     virtual OpenMM::ComputeContext& getInnerComputeContext(OpenMM::ContextImpl& innerContext);
 
 private:
+    // Evaluate every CV (primitive, Torch, energy, expression) at the current
+    // coordinates into plan_.cvValues.
+    void evaluateCVs(OpenMM::ContextImpl& context);
+    // Evaluate every bias into biasEnergies/cvBiasGradients and return the total
+    // bias energy (only summed when includeEnergy). commitHistory lets biases
+    // that record history during evaluation (ABMD) do so; only updateState()
+    // passes true.
+    double evaluateBiases(OpenMM::ContextImpl& context, bool includeEnergy, bool commitHistory);
+    // True if any bias carries state that updateState() must advance.
+    bool hasHistory() const;
+    // Hash of the force configuration, stored in checkpoints so state is only
+    // restored into an identically configured force.
+    unsigned long long configurationHash_ = 0;
+    // Deserialize without the rollback wrapper in setBiasStateBytes().
+    void loadBiasState(const std::vector<char>& bytes);
     // test kernel
     OpenMM::ComputeKernel testForceKernel_;
     int testForceMode_ = 0;
@@ -420,12 +431,6 @@ private:
         //      skips until nSamples reaches this threshold
         //      (default = 10*PACE).
         int adaptiveSigmaStride = 0;
-        // CPU mirror of GPU nSamples; only used when adaptiveSigmaStride > 0.
-        // Incremented in execute() each time welfordKernel fires.  Used in
-        // updateState() to decide whether the GPU deposit kernel will actually
-        // write a kernel (and so whether numKernels should be incremented).
-        int nSamplesCPU = 0;
-
         // CPU mirrors for serialization — populated on demand via GPU downloads.
         // Not kept in sync during simulation; download happens only in getBiasStateBytes().
         double logZCPU = 0.0;
@@ -446,15 +451,9 @@ private:
         OpenMM::ComputeArray sigma0GPU;          // double[D]
         OpenMM::ComputeArray logZGPU;            // double[1]
         OpenMM::ComputeArray numKernelsGPU;      // int[1] — committed kernel count (shared by evalKernel and gatherDepositKernel)
-        OpenMM::ComputeArray numAllocatedGPU;    // int[1] — slot-claim counter for B2 multiwalker atomic deposits
+        OpenMM::ComputeArray numAllocatedGPU;    // int[1] — slot-claim counter; -1 signals a full table
         OpenMM::ComputeArray sumWeightsGPU;      // double[1] — KDNorm = Σ h_k (uncorrected weight sum)
 
-        // Multiwalker B2 shared pointers (0 = use own arrays, non-zero = borrowed from primary)
-        unsigned long long sharedCentersPtr    = 0;
-        unsigned long long sharedSigmasPtr     = 0;
-        unsigned long long sharedLogWeightsPtr = 0;
-        unsigned long long sharedNumKernelsPtr = 0;
-        unsigned long long sharedNumAllocPtr   = 0;
         // neff accumulation — maintained by opesUpdateNeff on GPU
         OpenMM::ComputeArray logSumWGPU;         // double[2]: {logSumW, logSumW2}
         OpenMM::ComputeArray stepCountGPU;       // int[1]
@@ -544,9 +543,6 @@ private:
         OpenMM::ComputeKernel evalKernel;
         OpenMM::ComputeKernel depositKernel;
         OpenMM::ComputeKernel gatherCVsKernel; // gathers cvValues → centerGPU before deposit
-
-        // Multiwalker B2: if non-zero, grid is borrowed from primary walker (do not free)
-        unsigned long long sharedGridPtr = 0;  // raw CUDA device ptr of primary's grid (0 = use own)
     };
 
     // Parallel-bias MetaD: N independent 1-D MetaD grids, one per CV.
@@ -668,8 +664,7 @@ private:
     };
 
 protected:
-    // Bias state vectors — protected so CudaCalcGluedForceKernel can read
-    // device pointers for B2 multiwalker sharing via getSharedBiasPtrs().
+    // Bias state vectors.
     std::vector<PyTorchCVPlan>        pytorchCVPlans_;
     std::vector<HarmonicBias>         harmonicBiases_;
     std::vector<OpesBias>             opesBiases_;
@@ -720,9 +715,8 @@ private:
     };
     std::vector<MaxentBias>           maxentBiases_;
     std::vector<ExpressionCVPlan>     expressionCVPlans_;
-    int lastUpdateStep_ = -1;  // guards duplicate deposition in updateState()
-    int lastKnownStep_ = 0;  // tracked every updateState(); read by moving restraint in execute()
-    bool cvValuesReady_ = false;  // set by execute(); guards updateState() on step 0
+    long long lastUpdateStep_ = -1;  // guards duplicate history commits in updateState()
+    long long lastKnownStep_ = 0;  // tracked every updateState(); read by moving restraint in execute()
     // Box-change cache: setPeriodicBoxArgs only fires when box differs from last step.
     OpenMM::Vec3 lastBoxA_, lastBoxB_, lastBoxC_;
     bool boxArgsNeedUpdate_ = true;

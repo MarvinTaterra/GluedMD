@@ -262,17 +262,16 @@ def test_scenario_c_intra_group_wiring():
     _set_pos(ctx0, 0.3)
     _set_pos(ctx1, 0.3)
 
-    # One group, two walkers — MultiWalkerPool wires sharing automatically.
+    # One group, two walkers; hills are merged after every deposit.
     pool = MultiWalkerPool(
         walker_groups=[[ctx0, ctx1]],
         force_groups=[[f0, f1]],
         bias_index=0,
-        sync_interval=0,  # no cross-GPU needed (single group)
+        sync_interval=PACE,
     )
-
-    # Run only the primary to deposit hills into the shared grid.
-    for _ in range(NSTEPS):
-        ctx0.getIntegrator().step(1)
+    pool.run(NSTEPS)
+    _set_pos(ctx0, 0.3)
+    _set_pos(ctx1, 0.3)
 
     # Secondary reads the same shared grid.
     E0 = ctx0.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
@@ -460,30 +459,18 @@ def test_scenario_c_with_hremd_between_groups():
 
 def _make_metad_blob(grid_values: list, n_deposited: int = 5) -> bytes:
     """
-    Craft a minimal GPUS blob with exactly one MetaD bias and no others.
+    Craft a minimal version-2 blob with exactly one MetaD bias and no others.
     Used to test BiasStateMerger without a running simulation.
     """
-    import struct
-    buf = bytearray()
-    buf.extend(b'GPUS')
-    buf.extend(struct.pack("<i", 1))   # version
-
-    buf.extend(struct.pack("<i", 0))   # n_opes = 0
-    buf.extend(struct.pack("<i", 0))   # n_abmd = 0
-
-    buf.extend(struct.pack("<i", 1))   # n_metad = 1
-    buf.extend(struct.pack("<i", n_deposited))
+    buf = bytearray(b'GPUS')
+    buf += struct.pack("<iQq", 2, 0, -1)         # version, config hash, last update step
+    buf += struct.pack("<ii", 0, 0)              # n_opes, n_abmd
+    buf += struct.pack("<ii", 1, n_deposited)    # n_metad, numDeposited
     for v in grid_values:
-        buf.extend(struct.pack("<d", v))
-
-    buf.extend(struct.pack("<i", 0))   # n_pbmetad = 0
-    buf.extend(struct.pack("<i", 0))   # n_external
-    buf.extend(struct.pack("<i", 0))   # n_linear
-    buf.extend(struct.pack("<i", 0))   # n_wall
-    buf.extend(struct.pack("<i", 0))   # n_opes_expanded
-    buf.extend(struct.pack("<i", 0))   # n_ext_lagrangian
-    buf.extend(struct.pack("<i", 0))   # n_eds
-    buf.extend(struct.pack("<i", 0))   # n_maxent
+        buf += struct.pack("<d", v)
+    buf += struct.pack("<i", 0)                  # n_pbmetad
+    buf += struct.pack("<iii", 0, 0, 0)          # n_external, n_linear, n_wall
+    buf += struct.pack("<iiiii", 0, 0, 0, 0, 0)  # expanded, ext-lag, eds, maxent, multithermal
     return bytes(buf)
 
 
@@ -512,7 +499,7 @@ def test_bias_state_merger_additive():
     merged = BiasStateMerger.merge_additive([blob_a, blob_b], fake_force)
 
     # Re-parse merged blob.
-    parsed = BiasStateMerger._parse(merged, fake_force)
+    parsed = BiasStateMerger.parse(merged, fake_force)
     assert len(parsed["metad"]) == 1
     nd, grid_bytes = parsed["metad"][0]
 
@@ -531,7 +518,7 @@ def test_bias_state_merger_single_blob():
     fake_force = _FakeForceMeta()
     merged = BiasStateMerger.merge_additive([blob], fake_force)
 
-    parsed = BiasStateMerger._parse(merged, fake_force)
+    parsed = BiasStateMerger.parse(merged, fake_force)
     nd, grid_bytes = parsed["metad"][0]
     import numpy as np
     grid_merged = np.frombuffer(grid_bytes, dtype="<f8")
@@ -546,22 +533,22 @@ def test_bias_state_merger_three_blobs():
     fake_force = _FakeForceMeta()
     merged = BiasStateMerger.merge_additive(blobs, fake_force)
 
-    parsed = BiasStateMerger._parse(merged, fake_force)
+    parsed = BiasStateMerger.parse(merged, fake_force)
     _, grid_bytes = parsed["metad"][0]
     grid_m = np.frombuffer(grid_bytes, dtype="<f8")
     np.testing.assert_allclose(grid_m, np.full(6, 6.0), rtol=1e-12)
 
 
 def test_bias_state_merger_repack_roundtrip():
-    """_parse → _pack → _parse produces identical data."""
+    """parse → pack → parse produces identical data."""
     import numpy as np
     grid = [0.1 * i for i in range(6)]
     blob = _make_metad_blob(grid, n_deposited=7)
     fake_force = _FakeForceMeta()
 
-    parsed = BiasStateMerger._parse(blob, fake_force)
-    repacked = BiasStateMerger._pack(parsed)
-    parsed2  = BiasStateMerger._parse(repacked, fake_force)
+    parsed = BiasStateMerger.parse(blob, fake_force)
+    repacked = BiasStateMerger.pack(parsed)
+    parsed2  = BiasStateMerger.parse(repacked, fake_force)
 
     assert parsed["metad"][0][0] == parsed2["metad"][0][0], "numDeposited should survive round-trip"
     np.testing.assert_array_equal(
@@ -578,8 +565,7 @@ def test_bias_state_merger_repack_roundtrip():
 def test_scenario_c_multi_walker_with_re_single_gpu():
     """
     Full Scenario C: 2 groups × 2 walkers (all on device 0) with:
-    - Intra-group GPU pointer sharing (MetaD grid)
-    - Cross-group bias merge every 20 steps
+    - MetaD grid merged across all walkers every 20 steps
     - H-REUS exchange every 50 steps
     """
     kT = 2.479

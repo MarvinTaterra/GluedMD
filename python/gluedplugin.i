@@ -4,6 +4,13 @@
 %include "swig/typemaps.i"
 %include "std_string.i"
 %include "std_vector.i"
+%include "exception.i"
+
+%exception {
+    try { $action }
+    catch (const std::exception& e) { SWIG_exception(SWIG_RuntimeError, e.what()); }
+    catch (...) { SWIG_exception(SWIG_RuntimeError, "Unknown GLUED native exception"); }
+}
 
 namespace std {
   %template(vectori) vector<int>;
@@ -119,18 +126,24 @@ public:
         // Python-friendly checkpoint API: returns/accepts Python bytes objects.
         // The raw C++ methods return a SWIG tuple, which SWIG won't accept back
         // as std::vector<char> without an explicit conversion.
-        PyObject* getBiasState() const {
-            std::vector<char> raw = self->getBiasStateBytes();
+        // The optional Context selects one of several Contexts sharing a System;
+        // without it the Force must be bound to exactly one Context.
+        PyObject* getBiasState(OpenMM::Context* context = nullptr) const {
+            std::vector<char> raw = context ? self->getBiasStateBytes(*context)
+                                            : self->getBiasStateBytes();
             return PyBytes_FromStringAndSize(raw.data(), raw.size());
         }
-        void setBiasState(PyObject* b) {
+        void setBiasState(PyObject* b, OpenMM::Context* context = nullptr) {
             if (!PyBytes_Check(b) && !PyByteArray_Check(b))
                 throw OpenMM::OpenMMException("setBiasState: expected bytes or bytearray");
             char* buf; Py_ssize_t len;
             if (PyBytes_Check(b)) { buf = PyBytes_AS_STRING(b); len = PyBytes_GET_SIZE(b); }
             else                  { buf = PyByteArray_AS_STRING(b); len = PyByteArray_GET_SIZE(b); }
             std::vector<char> vec(buf, buf + len);
-            self->setBiasStateBytes(vec);
+            if (context)
+                self->setBiasStateBytes(*context, vec);
+            else
+                self->setBiasStateBytes(vec);
         }
     }
     std::vector<char> getBiasStateBytes() const;
@@ -161,22 +174,6 @@ public:
         // Empty if no kernels have been deposited yet.
         std::vector<float> getKernelSigmas(OpenMM::Context& context, int biasIndex) const {
             return self->getKernelSigmas(context, biasIndex);
-        }
-    }
-
-    %extend {
-        // Multiwalker B2: get raw device pointers for sharing with secondary walkers.
-        // biasIdx: 0-based index of the bias (order of addBias calls).
-        // Returns platform-specific raw device pointers as a list of long long.
-        // biasType=BIAS_METAD: [grid_ptr]; biasType=BIAS_OPES: [centers, sigmas, logweights, numKernels, numAllocated].
-        // Only valid for CUDA platform.
-        std::vector<long long> getMultiWalkerPtrs(OpenMM::Context& context, int biasIdx) const {
-            return self->getMultiWalkerPtrs(context, biasIdx);
-        }
-        // Set up this walker to share bias arrays with a primary walker.
-        // Must be called AFTER context creation. ptrs comes from primary's getMultiWalkerPtrs().
-        void setMultiWalkerPtrs(OpenMM::Context& context, int biasIdx, const std::vector<long long>& ptrs) {
-            self->setMultiWalkerPtrs(context, biasIdx, ptrs);
         }
     }
 

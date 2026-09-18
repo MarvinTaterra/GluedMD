@@ -10,402 +10,369 @@ using namespace GluedPlugin;
 using namespace OpenMM;
 using namespace std;
 
-// Serialization format (little-endian):
-// int32 numOpesBiases
-// per bias: int32 numKernels, double logZ, int32 nSamples,
-// double[D] runningMean, double[D] runningM2,
-// float[K*D] centers, float[K*D] sigmas, float[K] logWeights
-// int32 numAbmdBiases
-// per bias: double[D] rhoMinCPU
-vector<char> CommonCalcGluedForceKernel::getBiasStateBytes() {
- ContextSelector selector(cc_);
- vector<char> buf;
- auto write = [&](const void* src, size_t n) {
- const char* p = reinterpret_cast<const char*>(src);
- buf.insert(buf.end(), p, p + n);
- };
- // Header: magic 'GPUS' (4 bytes) + version = 1 (int32 little-endian)
- const char magic[4] = {'G','P','U','S'};
- write(magic, 4);
- int32_t version = 1;
- write(&version, 4);
+// Bias-state checkpoint, version 2 (native little-endian; all sections mandatory).
+// The Python parser in python/MultiGPUManager.py mirrors this layout exactly.
+//
+//   char[4] 'GPUS', int32 version = 2
+//   uint64 configurationHash, int64 lastUpdateStep
+//   int32 numOpes; per bias (D = numCVs, K = numKernels):
+//       int32 K, double sumUprob, int32 numSamples, int32 depositCount
+//       double sumWeights, double[2] {sumW, sumW2}
+//       double[D] runningMean, double[D] runningM2, double[D] sigma0
+//       double[K*D] centers, double[K*D] sigmas, double[K] logWeights
+//   int32 numAbmd;         per bias: double[D] rhoMin
+//   int32 numMetaD;        per bias: int32 numDeposited, double[G] grid
+//   int32 numPBMetaD;      per bias: int32 numSubGrids, then per sub-grid as MetaD
+//   int32 numExternal, int32 numLinear, int32 numWall   (stateless: counts only)
+//   int32 numOpesExpanded; per bias: double logZ, int32 numUpdates
+//   int32 numExtLag;       per bias: int32 initialized, double[D] s, double[D] p
+//   int32 numEds;          per bias: double[D] lambda, mean, ssd, accum; int32[D] count
+//   int32 numMaxEnt;       per bias: double[D] lambda
+//   int32 numMultithermal; per bias: int32 N, double[N] deltaF, double rct, double counter
 
- int32_t nb = (int32_t)opesBiases_.size();
- write(&nb, 4);
- for (auto& o : opesBiases_) {
- int D = o.numCVsBias;
- // Use GPU-resident count (after compression) not CPU deposit counter.
- {
- vector<int> tmp(1);
- o.numKernelsGPU.download(tmp);
- o.numKernels = tmp[0]; // sync CPU mirror
- }
- int nk = o.numKernels;
- // Download GPU-resident Welford state and logZ on demand for serialization.
- {
- vector<double> tmp(1);
- o.logZGPU.download(tmp);
- o.logZCPU = tmp[0];
- }
- {
- vector<int> tmp(1);
- o.nSamplesGPU.download(tmp);
- o.nSamples = tmp[0];
- }
- o.runningMeanGPU.download(o.runningMean);
- o.runningM2GPU.download(o.runningM2);
- // Download kernel data (full buffer; write only nk rows).
- if (nk > 0) {
- o.kernelCenters.download(o.kernelCentersCPU);
- o.kernelSigmas.download(o.kernelSigmasCPU);
- o.kernelLogWeights.download(o.kernelLogWeightsCPU);
- }
- int32_t nk32 = nk;
- write(&nk32, 4);
- write(&o.logZCPU, 8);
- int32_t ns = o.nSamples;
- write(&ns, 4);
- write(o.runningMean.data(), D * 8);
- write(o.runningM2.data(), D * 8);
- write(o.kernelCentersCPU.data(), (size_t)nk * D * 8);   // double (M-OPESfloat)
- write(o.kernelSigmasCPU.data(), (size_t)nk * D * 8);
- write(o.kernelLogWeightsCPU.data(), (size_t)nk * 8);
- }
- int32_t na = (int32_t)abmdBiases_.size();
- write(&na, 4);
- for (auto& a : abmdBiases_) {
- a.rhoMin.download(a.rhoMinCPU);
- write(a.rhoMinCPU.data(), a.numCVsBias * 8);
- }
- int32_t nm = (int32_t)metaDGridBiases_.size();
- write(&nm, 4);
- for (auto& m : metaDGridBiases_) {
- // Grid lives on GPU; download into gridCPU buffer on demand for serialization.
- m.grid.download(m.gridCPU);
- int32_t nd = m.numDeposited;
- write(&nd, 4);
- write(m.gridCPU.data(), m.totalGridPoints * 8);
- }
- int32_t npb = (int32_t)pbmetaDGridBiases_.size();
- write(&npb, 4);
- for (auto& pb : pbmetaDGridBiases_) {
- int32_t nsub = (int32_t)pb.subGrids.size();
- write(&nsub, 4);
- for (auto& m : pb.subGrids) {
- m.grid.download(m.gridCPU);
- int32_t nd = m.numDeposited;
- write(&nd, 4);
- write(m.gridCPU.data(), m.totalGridPoints * 8);
- }
- }
- // External bias: grid is fixed at construction — write count only for version tagging.
- int32_t nex = (int32_t)externalGridBiases_.size();
- write(&nex, 4);
- // Linear and wall biases are stateless — write counts only for version tagging.
- int32_t nlin = (int32_t)linearBiases_.size();
- int32_t nwall = (int32_t)wallBiases_.size();
- write(&nlin, 4);
- write(&nwall, 4);
- // OPES_EXPANDED: logZ and numUpdates are the only mutable state (GPU-resident).
- int32_t noe = (int32_t)opesExpandedBiases_.size();
- write(&noe, 4);
- for (auto& oe : opesExpandedBiases_) {
- {
- vector<double> tmp(1);
- oe.logZGPU.download(tmp);
- oe.logZCPU = tmp[0];
- }
- write(&oe.logZCPU, 8);
- {
- vector<int> tmp(1);
- oe.numUpdatesGPU.download(tmp);
- int32_t nu = tmp[0];
- write(&nu, 4);
- }
- }
- // Extended Lagrangian: s[D] and p[D] per bias (GPU-resident, download on demand).
- int32_t nel = (int32_t)extLagBiases_.size();
- write(&nel, 4);
- for (auto& el : extLagBiases_) {
- int D = (int)el.cvIndices.size();
- if (el.initialized) {
- el.sGPUArr.download(el.s);
- el.pGPUArr.download(el.p);
- }
- write(el.s.data(), D * 8);
- write(el.p.data(), D * 8);
- }
- // EDS White-Voth: lambda, mean, ssd, accum per bias; count as int.
- int32_t neds = (int32_t)edsBiases_.size();
- write(&neds, 4);
- for (auto& eds : edsBiases_) {
- int D = (int)eds.cvIndices.size();
- eds.lambdaGPU.download(eds.lambda);
- vector<double> mean(D), ssd(D), accum(D);
- eds.meanGPU.download(mean);
- eds.ssdGPU.download(ssd);
- eds.accumGPU.download(accum);
- vector<int> cnt(D);
- eds.countGPU.download(cnt);
- write(eds.lambda.data(), D * 8);
- write(mean.data(), D * 8);
- write(ssd.data(), D * 8);
- write(accum.data(), D * 8);
- for (int k = 0; k < D; k++) { int32_t c = cnt[k]; write(&c, 4); }
- }
- // MaxEnt: lambda per bias.
- int32_t nmxe = (int32_t)maxentBiases_.size();
- write(&nmxe, 4);
- for (auto& mx : maxentBiases_) {
- int D = (int)mx.cvIndices.size();
- mx.lambdaGPU.download(mx.lambda);
- write(mx.lambda.data(), D * 8);
- }
- // OPES multithermal: per state ΔF[N], plus rct and the update counter (GPU-resident).
- int32_t nmt = (int32_t)multithermalBiases_.size();
- write(&nmt, 4);
- for (auto& mt : multithermalBiases_) {
- int N = (int)mt.betaMinusBeta0.size();
- mt.deltaFGPU.download(mt.deltaF);
- { vector<double> tmp(1); mt.rctGPU.download(tmp);     mt.rct     = tmp[0]; }
- { vector<double> tmp(1); mt.counterGPU.download(tmp); mt.counter = (long long)tmp[0]; }
- int32_t n32 = N; write(&n32, 4);
- write(mt.deltaF.data(), (size_t)N * 8);
- write(&mt.rct, 8);
- double cnt = (double)mt.counter; write(&cnt, 8);
- }
- return buf;
+static const int32_t kCheckpointVersion = 2;
+
+vector<char> CommonCalcGluedForceKernel::getBiasStateBytes() {
+    ContextSelector selector(cc_);
+    vector<char> buf;
+    auto write = [&](const void* src, size_t n) {
+        const char* p = reinterpret_cast<const char*>(src);
+        buf.insert(buf.end(), p, p + n);
+    };
+    auto writeInt = [&](int32_t v) { write(&v, 4); };
+    auto writeDouble = [&](double v) { write(&v, 8); };
+
+    write("GPUS", 4);
+    writeInt(kCheckpointVersion);
+    write(&configurationHash_, 8);
+    int64_t lastUpdateStep = lastUpdateStep_;
+    write(&lastUpdateStep, 8);
+
+    writeInt((int32_t)opesBiases_.size());
+    for (auto& o : opesBiases_) {
+        int D = o.numCVsBias;
+        vector<int> numKernels(1), numSamples(1), depositCount(1);
+        vector<double> sumUprob(1), sumWeights(1), sumW(2), sigma0(D);
+        o.numKernelsGPU.download(numKernels);
+        o.nSamplesGPU.download(numSamples);
+        o.stepCountGPU.download(depositCount);
+        o.logZGPU.download(sumUprob);
+        o.sumWeightsGPU.download(sumWeights);
+        o.logSumWGPU.download(sumW);
+        o.sigma0GPU.download(sigma0);
+        o.runningMeanGPU.download(o.runningMean);
+        o.runningM2GPU.download(o.runningM2);
+        int nk = numKernels[0];
+        o.numKernels = nk;
+        if (nk > 0) {
+            o.kernelCenters.download(o.kernelCentersCPU);
+            o.kernelSigmas.download(o.kernelSigmasCPU);
+            o.kernelLogWeights.download(o.kernelLogWeightsCPU);
+        }
+        writeInt(nk);
+        writeDouble(sumUprob[0]);
+        writeInt(numSamples[0]);
+        writeInt(depositCount[0]);
+        writeDouble(sumWeights[0]);
+        write(sumW.data(), 16);
+        write(o.runningMean.data(), (size_t)D * 8);
+        write(o.runningM2.data(), (size_t)D * 8);
+        write(sigma0.data(), (size_t)D * 8);
+        write(o.kernelCentersCPU.data(), (size_t)nk * D * 8);
+        write(o.kernelSigmasCPU.data(), (size_t)nk * D * 8);
+        write(o.kernelLogWeightsCPU.data(), (size_t)nk * 8);
+    }
+
+    writeInt((int32_t)abmdBiases_.size());
+    for (auto& a : abmdBiases_) {
+        a.rhoMin.download(a.rhoMinCPU);
+        write(a.rhoMinCPU.data(), (size_t)a.numCVsBias * 8);
+    }
+
+    writeInt((int32_t)metaDGridBiases_.size());
+    for (auto& m : metaDGridBiases_) {
+        m.grid.download(m.gridCPU);
+        writeInt(m.numDeposited);
+        write(m.gridCPU.data(), (size_t)m.totalGridPoints * 8);
+    }
+
+    writeInt((int32_t)pbmetaDGridBiases_.size());
+    for (auto& pb : pbmetaDGridBiases_) {
+        writeInt((int32_t)pb.subGrids.size());
+        for (auto& m : pb.subGrids) {
+            m.grid.download(m.gridCPU);
+            writeInt(m.numDeposited);
+            write(m.gridCPU.data(), (size_t)m.totalGridPoints * 8);
+        }
+    }
+
+    // Stateless biases: counts only, so a mismatched configuration is detected.
+    writeInt((int32_t)externalGridBiases_.size());
+    writeInt((int32_t)linearBiases_.size());
+    writeInt((int32_t)wallBiases_.size());
+
+    writeInt((int32_t)opesExpandedBiases_.size());
+    for (auto& oe : opesExpandedBiases_) {
+        vector<double> logZ(1);
+        vector<int> numUpdates(1);
+        oe.logZGPU.download(logZ);
+        oe.numUpdatesGPU.download(numUpdates);
+        oe.logZCPU = logZ[0];
+        writeDouble(logZ[0]);
+        writeInt(numUpdates[0]);
+    }
+
+    writeInt((int32_t)extLagBiases_.size());
+    for (auto& el : extLagBiases_) {
+        int D = (int)el.cvIndices.size();
+        if (el.initialized) {
+            el.sGPUArr.download(el.s);
+            el.pGPUArr.download(el.p);
+        }
+        writeInt(el.initialized ? 1 : 0);
+        write(el.s.data(), (size_t)D * 8);
+        write(el.p.data(), (size_t)D * 8);
+    }
+
+    writeInt((int32_t)edsBiases_.size());
+    for (auto& eds : edsBiases_) {
+        int D = (int)eds.cvIndices.size();
+        vector<double> mean(D), ssd(D), accum(D);
+        vector<int> count(D);
+        eds.lambdaGPU.download(eds.lambda);
+        eds.meanGPU.download(mean);
+        eds.ssdGPU.download(ssd);
+        eds.accumGPU.download(accum);
+        eds.countGPU.download(count);
+        write(eds.lambda.data(), (size_t)D * 8);
+        write(mean.data(), (size_t)D * 8);
+        write(ssd.data(), (size_t)D * 8);
+        write(accum.data(), (size_t)D * 8);
+        for (int c : count)
+            writeInt(c);
+    }
+
+    writeInt((int32_t)maxentBiases_.size());
+    for (auto& mx : maxentBiases_) {
+        mx.lambdaGPU.download(mx.lambda);
+        write(mx.lambda.data(), mx.cvIndices.size() * 8);
+    }
+
+    writeInt((int32_t)multithermalBiases_.size());
+    for (auto& mt : multithermalBiases_) {
+        int N = (int)mt.betaMinusBeta0.size();
+        vector<double> rct(1), counter(1);
+        mt.deltaFGPU.download(mt.deltaF);
+        mt.rctGPU.download(rct);
+        mt.counterGPU.download(counter);
+        mt.rct = rct[0];
+        mt.counter = (long long)counter[0];
+        writeInt(N);
+        write(mt.deltaF.data(), (size_t)N * 8);
+        writeDouble(rct[0]);
+        writeDouble(counter[0]);
+    }
+    return buf;
 }
 
-void CommonCalcGluedForceKernel::setBiasStateBytes(
- const vector<char>& bytes) {
- if (bytes.empty()) return;
- const char* p = bytes.data();
- const char* const end = bytes.data() + bytes.size();
- // Bounds-checked reader: every memcpy must fit in the remaining input or the
- // blob is rejected. (H31)
- auto read = [&](void* dst, size_t n) {
- if ((size_t)(end - p) < n)
- throw OpenMMException("GLUED bias-state: truncated/corrupt blob");
- std::memcpy(dst, p, n);
- p += n;
- };
- // Detect versioned header: magic 'GPUS' + int32 version.
- // Legacy blobs (no header) start with int32 numOpesBiases — typically a small
- // non-negative integer whose first byte is never 'G', so detection is safe.
- // Header autodetection is made unambiguous by requiring the full 8-byte
- // header (magic + version) to be present before a leading 'GPUS' is treated
- // as a magic. A legacy headerless blob begins with an int32 OPES count whose
- // first byte is a small non-negative value (never the ASCII 'G' = 0x47 unless
- // the count exceeds 0x47000000, far beyond any plausible bias count). (L25)
- const char expected[4] = {'G','P','U','S'};
- if ((size_t)(end - p) >= 8 && std::memcmp(p, expected, 4) == 0) {
- p += 4; // skip magic
- int32_t version; read(&version, 4);
- // Only version 1 is known; reject anything else. (M-Version)
- if (version != 1)
- throw OpenMMException("GLUED bias-state: unknown blob version");
- }
- int32_t nb;
- read(&nb, 4);
- // On any count mismatch the saved state came from a different system
- // configuration; abandoning silently would leave biases half-restored,
- // so throw naming the category and expected/actual counts. (H-Restore)
- if (nb != (int32_t)opesBiases_.size())
- throw OpenMMException("GLUED bias-state: OPES bias count mismatch (expected " +
- std::to_string(opesBiases_.size()) + ", got " + std::to_string((long long)nb) + ")");
- ContextSelector selector(cc_);
- for (auto& o : opesBiases_) {
- int32_t nk, ns;
- read(&nk, 4);
- read(&o.logZCPU, 8);
- read(&ns, 4);
- o.nSamples = ns;
- int D = o.numCVsBias;
- // Validate the kernel count before any resize/read: reject negatives, values
- // beyond the GPU buffer capacity, and counts whose byte footprint does not
- // fit in the remaining input. All arithmetic in size_t to avoid 32-bit
- // overflow. (H32, M-Serial32)
- if (nk < 0 || nk > o.maxKernels)
- throw OpenMMException("GLUED bias-state: OPES kernel count out of range");
- const size_t Dsz = (size_t)D;
- const size_t nksz = (size_t)nk;
- // Bytes still needed for this OPES bias: runningMean+runningM2 (D*8 each),
- // centers+sigmas (nk*D*8 each, double), logWeights (nk*8, double). (M-OPESfloat)
- const size_t needBytes = Dsz * 8 * 2 + nksz * Dsz * 8 * 2 + nksz * 8;
- if ((size_t)(end - p) < needBytes)
- throw OpenMMException("GLUED bias-state: truncated/corrupt blob");
- read(o.runningMean.data(), Dsz * 8);
- read(o.runningM2.data(), Dsz * 8);
- o.kernelCentersCPU.resize(nksz * Dsz);
- o.kernelSigmasCPU.resize(nksz * Dsz);
- o.kernelLogWeightsCPU.resize(nksz);
- read(o.kernelCentersCPU.data(), nksz * Dsz * 8);
- read(o.kernelSigmasCPU.data(), nksz * Dsz * 8);
- read(o.kernelLogWeightsCPU.data(), nksz * 8);
- o.numKernels = nk;
- o.numKernelsGPU.upload(vector<int>{nk});
- if (nk > 0) {
- o.kernelCenters.uploadSubArray(o.kernelCentersCPU.data(), 0, nk * D);
- o.kernelSigmas.uploadSubArray(o.kernelSigmasCPU.data(), 0, nk * D);
- o.kernelLogWeights.uploadSubArray(o.kernelLogWeightsCPU.data(), 0, nk);
- }
- // Restore GPU-resident Welford state and logZ.
- o.logZGPU.upload(vector<double>{o.logZCPU});
- o.runningMeanGPU.upload(o.runningMean);
- o.runningM2GPU.upload(o.runningM2);
- o.nSamplesGPU.upload(vector<int>{o.nSamples});
- // Recompute KDNorm from loaded kernels: each compressed kernel's logW equals the
- // sum of all merged heights, so Σ exp(lw_k) + exp(-gamma) = sum_weights_ exactly.
- {
- double sumW = exp(-o.gamma);
- for (int k = 0; k < nk; k++) sumW += exp((double)o.kernelLogWeightsCPU[k]);
- o.sumWeightsGPU.upload(vector<double>{sumW});
- }
- }
- // ABMD rhoMin state (may be absent in states saved before )
- if (p < bytes.data() + bytes.size()) {
- int32_t na;
- read(&na, 4);
- if (na != (int32_t)abmdBiases_.size())
- throw OpenMMException("GLUED bias-state: ABMD bias count mismatch (expected " +
- std::to_string(abmdBiases_.size()) + ", got " + std::to_string((long long)na) + ")");
- for (auto& a : abmdBiases_) {
- read(a.rhoMinCPU.data(), (size_t)a.numCVsBias * 8);
- a.rhoMin.upload(a.rhoMinCPU);
- }
- }
- // MetaD grid state (may be absent in states saved before )
- if (p < bytes.data() + bytes.size()) {
- int32_t nm;
- read(&nm, 4);
- if (nm != (int32_t)metaDGridBiases_.size())
- throw OpenMMException("GLUED bias-state: MetaD bias count mismatch (expected " +
- std::to_string(metaDGridBiases_.size()) + ", got " + std::to_string((long long)nm) + ")");
- for (auto& m : metaDGridBiases_) {
- int32_t nd;
- read(&nd, 4);
- m.numDeposited = nd;
- read(m.gridCPU.data(), (size_t)m.totalGridPoints * 8);
- m.grid.upload(m.gridCPU);
- }
- }
- // PBMetaD grid state (may be absent in states saved before )
- if (p < bytes.data() + bytes.size()) {
- int32_t npb;
- read(&npb, 4);
- if (npb != (int32_t)pbmetaDGridBiases_.size())
- throw OpenMMException("GLUED bias-state: PBMetaD bias count mismatch (expected " +
- std::to_string(pbmetaDGridBiases_.size()) + ", got " + std::to_string((long long)npb) + ")");
- for (auto& pb : pbmetaDGridBiases_) {
- int32_t nsub;
- read(&nsub, 4);
- if (nsub != (int32_t)pb.subGrids.size())
- throw OpenMMException("GLUED bias-state: PBMetaD sub-grid count mismatch (expected " +
- std::to_string(pb.subGrids.size()) + ", got " + std::to_string((long long)nsub) + ")");
- for (auto& m : pb.subGrids) {
- int32_t nd;
- read(&nd, 4);
- m.numDeposited = nd;
- read(m.gridCPU.data(), (size_t)m.totalGridPoints * 8);
- m.grid.upload(m.gridCPU);
- }
- }
- }
- // External bias count (may be absent in states saved before ).
- // Grid is fixed at construction — nothing to restore.
- if (p < bytes.data() + bytes.size()) {
- int32_t nex; read(&nex, 4); (void)nex;
- }
- // Linear and wall bias counts (stateless — nothing to restore).
- if (p < bytes.data() + bytes.size()) {
- int32_t nlin; read(&nlin, 4); (void)nlin;
- }
- if (p < bytes.data() + bytes.size()) {
- int32_t nwall; read(&nwall, 4); (void)nwall;
- }
- // OPES_EXPANDED logZ and numUpdates
- if (p < bytes.data() + bytes.size()) {
- int32_t noe; read(&noe, 4);
- if (noe != (int32_t)opesExpandedBiases_.size())
- throw OpenMMException("GLUED bias-state: OPES_EXPANDED bias count mismatch (expected " +
- std::to_string(opesExpandedBiases_.size()) + ", got " + std::to_string((long long)noe) + ")");
- for (auto& oe : opesExpandedBiases_) {
- read(&oe.logZCPU, 8);
- int32_t nu; read(&nu, 4);
- oe.logZGPU.upload(vector<double>{oe.logZCPU});
- oe.numUpdatesGPU.upload(vector<int>{(int)nu});
- }
- }
- // Extended Lagrangian: s and p state
- if (p < bytes.data() + bytes.size()) {
- int32_t nel; read(&nel, 4);
- if (nel != (int32_t)extLagBiases_.size())
- throw OpenMMException("GLUED bias-state: extended-Lagrangian bias count mismatch (expected " +
- std::to_string(extLagBiases_.size()) + ", got " + std::to_string((long long)nel) + ")");
- for (auto& el : extLagBiases_) {
- int D = (int)el.cvIndices.size();
- read(el.s.data(), (size_t)D * 8);
- read(el.p.data(), (size_t)D * 8);
- el.initialized = true;
- el.sGPUArr.upload(el.s);
- el.pGPUArr.upload(el.p);
- }
- }
- // EDS White-Voth state: lambda, mean, ssd, accum, count
- if (p < bytes.data() + bytes.size()) {
- int32_t neds; read(&neds, 4);
- if (neds != (int32_t)edsBiases_.size())
- throw OpenMMException("GLUED bias-state: EDS bias count mismatch (expected " +
- std::to_string(edsBiases_.size()) + ", got " + std::to_string((long long)neds) + ")");
- for (auto& eds : edsBiases_) {
- int D = (int)eds.cvIndices.size();
- vector<double> mean(D), ssd(D), accum(D);
- vector<int> cnt(D);
- read(eds.lambda.data(), (size_t)D * 8);
- read(mean.data(), (size_t)D * 8);
- read(ssd.data(), (size_t)D * 8);
- read(accum.data(), (size_t)D * 8);
- for (int k = 0; k < D; k++) { int32_t c; read(&c, 4); cnt[k] = c; }
- eds.lambdaGPU.upload(eds.lambda);
- eds.meanGPU.upload(mean);
- eds.ssdGPU.upload(ssd);
- eds.accumGPU.upload(accum);
- eds.countGPU.upload(cnt);
- }
- }
- // MaxEnt: lambda state
- if (p < bytes.data() + bytes.size()) {
- int32_t nmxe; read(&nmxe, 4);
- if (nmxe == (int32_t)maxentBiases_.size()) {
- ContextSelector selector(cc_);
- for (auto& mx : maxentBiases_) {
- int D = (int)mx.cvIndices.size();
- read(mx.lambda.data(), D * 8);
- mx.lambdaGPU.upload(mx.lambda);
- }
- }
- }
- // OPES multithermal: ΔF[N], rct, counter (may be absent in states saved before this).
- if (p < bytes.data() + bytes.size()) {
- int32_t nmt; read(&nmt, 4);
- if (nmt != (int32_t)multithermalBiases_.size())
- throw OpenMMException("GLUED bias-state: OPES multithermal bias count mismatch (expected " +
- std::to_string(multithermalBiases_.size()) + ", got " + std::to_string((long long)nmt) + ")");
- ContextSelector selector(cc_);
- for (auto& mt : multithermalBiases_) {
- int N = (int)mt.betaMinusBeta0.size();
- int32_t n32; read(&n32, 4);
- if (n32 != N)
- throw OpenMMException("GLUED bias-state: OPES multithermal state size mismatch (expected " +
- std::to_string(N) + ", got " + std::to_string((long long)n32) + ")");
- mt.deltaF.resize(N);
- read(mt.deltaF.data(), (size_t)N * 8);
- read(&mt.rct, 8);
- double cnt; read(&cnt, 8); mt.counter = (long long)cnt;
- mt.deltaFGPU.upload(mt.deltaF);
- mt.rctGPU.upload(vector<double>{mt.rct});
- mt.counterGPU.upload(vector<double>{(double)mt.counter});
- }
- }
+void CommonCalcGluedForceKernel::setBiasStateBytes(const vector<char>& bytes) {
+    // Sections are uploaded as they are parsed, so a blob that fails validation
+    // part-way would leave the Context half restored. Roll back to the state
+    // captured before the attempt.
+    const vector<char> previous = getBiasStateBytes();
+    try {
+        loadBiasState(bytes);
+    } catch (...) {
+        loadBiasState(previous);
+        throw;
+    }
+}
+
+void CommonCalcGluedForceKernel::loadBiasState(const vector<char>& bytes) {
+    const char* p = bytes.data();
+    const char* const end = bytes.data() + bytes.size();
+    auto fail = [](const string& what) {
+        throw OpenMMException("GLUED bias-state: " + what);
+    };
+    // Bounds-checked reader: every read must fit in the remaining input.
+    auto read = [&](void* dst, size_t n) {
+        if ((size_t)(end - p) < n)
+            fail("truncated blob");
+        std::memcpy(dst, p, n);
+        p += n;
+    };
+    auto readInt = [&]() { int32_t v; read(&v, 4); return v; };
+    auto readDouble = [&]() { double v; read(&v, 8); return v; };
+    auto readCount = [&](const char* section, size_t expected) {
+        int32_t n = readInt();
+        if (n != (int32_t)expected)
+            fail(string(section) + " bias count mismatch (expected " + to_string(expected) +
+                 ", got " + to_string((long long)n) + ")");
+    };
+    auto requireFinite = [&](const vector<double>& values, const char* what) {
+        for (double v : values)
+            if (!std::isfinite(v))
+                fail(string("nonfinite ") + what);
+    };
+
+    char magic[4];
+    read(magic, 4);
+    if (std::memcmp(magic, "GPUS", 4) != 0)
+        fail("missing versioned header");
+    if (readInt() != kCheckpointVersion)
+        fail("unsupported version; only version " + to_string(kCheckpointVersion) +
+             " checkpoints can be restored (older ones lack the state needed to continue)");
+    unsigned long long hash;
+    read(&hash, 8);
+    if (hash != configurationHash_)
+        fail("configuration mismatch: the checkpoint was written by a differently "
+             "configured GluedForce");
+    int64_t lastUpdateStep;
+    read(&lastUpdateStep, 8);
+
+    ContextSelector selector(cc_);
+
+    readCount("OPES", opesBiases_.size());
+    for (auto& o : opesBiases_) {
+        int D = o.numCVsBias;
+        int nk = readInt();
+        if (nk < 0 || nk > o.maxKernels)
+            fail("OPES kernel count out of range");
+        vector<double> sumUprob{readDouble()};
+        vector<int> numSamples{readInt()};
+        vector<int> depositCount{readInt()};
+        vector<double> sumWeights{readDouble()};
+        vector<double> sumW(2), sigma0(D);
+        read(sumW.data(), 16);
+        read(o.runningMean.data(), (size_t)D * 8);
+        read(o.runningM2.data(), (size_t)D * 8);
+        read(sigma0.data(), (size_t)D * 8);
+        o.kernelCentersCPU.resize((size_t)nk * D);
+        o.kernelSigmasCPU.resize((size_t)nk * D);
+        o.kernelLogWeightsCPU.resize(nk);
+        read(o.kernelCentersCPU.data(), (size_t)nk * D * 8);
+        read(o.kernelSigmasCPU.data(), (size_t)nk * D * 8);
+        read(o.kernelLogWeightsCPU.data(), (size_t)nk * 8);
+        if (numSamples[0] < 0 || depositCount[0] < 0 || sumWeights[0] < 0 || sumW[0] < 0 ||
+            sumW[1] < 0)
+            fail("negative OPES counter");
+        requireFinite(sumUprob, "OPES normalization");
+        requireFinite(sumWeights, "OPES weight sum");
+        requireFinite(sumW, "OPES weight sum");
+        requireFinite(o.runningMean, "OPES running mean");
+        requireFinite(o.runningM2, "OPES running variance");
+        requireFinite(sigma0, "OPES sigma");
+        requireFinite(o.kernelCentersCPU, "OPES kernel center");
+        requireFinite(o.kernelSigmasCPU, "OPES kernel width");
+        requireFinite(o.kernelLogWeightsCPU, "OPES kernel weight");
+        for (double s : o.kernelSigmasCPU)
+            if (s <= 0)
+                fail("nonpositive OPES kernel width");
+
+        o.numKernels = nk;
+        o.nSamples = numSamples[0];
+        o.logZCPU = sumUprob[0];
+        o.numKernelsGPU.upload(vector<int>{nk});
+        o.numAllocatedGPU.upload(vector<int>{nk});
+        o.nSamplesGPU.upload(numSamples);
+        o.stepCountGPU.upload(depositCount);
+        o.logZGPU.upload(sumUprob);
+        o.sumWeightsGPU.upload(sumWeights);
+        o.logSumWGPU.upload(sumW);
+        o.runningMeanGPU.upload(o.runningMean);
+        o.runningM2GPU.upload(o.runningM2);
+        o.sigma0GPU.upload(sigma0);
+        if (nk > 0) {
+            o.kernelCenters.uploadSubArray(o.kernelCentersCPU.data(), 0, nk * D);
+            o.kernelSigmas.uploadSubArray(o.kernelSigmasCPU.data(), 0, nk * D);
+            o.kernelLogWeights.uploadSubArray(o.kernelLogWeightsCPU.data(), 0, nk);
+        }
+    }
+
+    readCount("ABMD", abmdBiases_.size());
+    for (auto& a : abmdBiases_) {
+        read(a.rhoMinCPU.data(), (size_t)a.numCVsBias * 8);
+        a.rhoMin.upload(a.rhoMinCPU);
+    }
+
+    readCount("MetaD", metaDGridBiases_.size());
+    for (auto& m : metaDGridBiases_) {
+        m.numDeposited = readInt();
+        read(m.gridCPU.data(), (size_t)m.totalGridPoints * 8);
+        m.grid.upload(m.gridCPU);
+    }
+
+    readCount("PBMetaD", pbmetaDGridBiases_.size());
+    for (auto& pb : pbmetaDGridBiases_) {
+        readCount("PBMetaD sub-grid", pb.subGrids.size());
+        for (auto& m : pb.subGrids) {
+            m.numDeposited = readInt();
+            read(m.gridCPU.data(), (size_t)m.totalGridPoints * 8);
+            m.grid.upload(m.gridCPU);
+        }
+    }
+
+    readCount("external", externalGridBiases_.size());
+    readCount("linear", linearBiases_.size());
+    readCount("wall", wallBiases_.size());
+
+    readCount("OPES_EXPANDED", opesExpandedBiases_.size());
+    for (auto& oe : opesExpandedBiases_) {
+        oe.logZCPU = readDouble();
+        int numUpdates = readInt();
+        oe.logZGPU.upload(vector<double>{oe.logZCPU});
+        oe.numUpdatesGPU.upload(vector<int>{numUpdates});
+    }
+
+    readCount("extended-Lagrangian", extLagBiases_.size());
+    for (auto& el : extLagBiases_) {
+        int D = (int)el.cvIndices.size();
+        el.initialized = readInt() != 0;
+        read(el.s.data(), (size_t)D * 8);
+        read(el.p.data(), (size_t)D * 8);
+        el.sGPUArr.upload(el.s);
+        el.pGPUArr.upload(el.p);
+    }
+
+    readCount("EDS", edsBiases_.size());
+    for (auto& eds : edsBiases_) {
+        int D = (int)eds.cvIndices.size();
+        vector<double> mean(D), ssd(D), accum(D);
+        vector<int> count(D);
+        read(eds.lambda.data(), (size_t)D * 8);
+        read(mean.data(), (size_t)D * 8);
+        read(ssd.data(), (size_t)D * 8);
+        read(accum.data(), (size_t)D * 8);
+        for (int& c : count)
+            c = readInt();
+        eds.lambdaGPU.upload(eds.lambda);
+        eds.meanGPU.upload(mean);
+        eds.ssdGPU.upload(ssd);
+        eds.accumGPU.upload(accum);
+        eds.countGPU.upload(count);
+    }
+
+    readCount("MaxEnt", maxentBiases_.size());
+    for (auto& mx : maxentBiases_) {
+        read(mx.lambda.data(), mx.cvIndices.size() * 8);
+        mx.lambdaGPU.upload(mx.lambda);
+    }
+
+    readCount("OPES multithermal", multithermalBiases_.size());
+    for (auto& mt : multithermalBiases_) {
+        int N = (int)mt.betaMinusBeta0.size();
+        readCount("OPES multithermal state", N);
+        mt.deltaF.resize(N);
+        read(mt.deltaF.data(), (size_t)N * 8);
+        mt.rct = readDouble();
+        double counter = readDouble();
+        mt.counter = (long long)counter;
+        mt.deltaFGPU.upload(mt.deltaF);
+        mt.rctGPU.upload(vector<double>{mt.rct});
+        mt.counterGPU.upload(vector<double>{counter});
+    }
+
+    if (p != end)
+        fail("unexpected trailing bytes");
+    lastUpdateStep_ = lastUpdateStep;
 }

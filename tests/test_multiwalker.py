@@ -1,9 +1,9 @@
 """
-test_multiwalker.py — Tests for multiwalker B2 (shared GPU allocation with atomic deposits).
+test_multiwalker.py — two walkers sharing one bias through MultiWalkerPool.
 
-Two walkers share a single bias grid (MetaD) or kernel list (OPES) via raw CUDA
-device pointers. All deposits from both walkers go to the same GPU arrays atomically.
-This test only runs on the CUDA platform.
+MetaD walkers merge grid increments every sync_interval steps; OPES walkers
+advance through one ordered shared history. This test only runs on the CUDA
+platform.
 """
 
 import sys
@@ -18,6 +18,7 @@ try:
     import openmm as mm
     import openmm.unit as unit
     import gluedplugin as gsp
+    from MultiGPUManager import MultiWalkerPool
 except ImportError as e:
     pytest.skip(f"Required modules not available: {e}", allow_module_level=True)
 
@@ -57,43 +58,6 @@ def set_positions_distance(ctx, d=0.3):
 # ---------------------------------------------------------------------------
 # MetaD multiwalker tests
 # ---------------------------------------------------------------------------
-
-@pytest.mark.skipif(not has_cuda(), reason="CUDA platform not available")
-def test_metad_multiwalker_ptr_roundtrip():
-    """
-    Basic smoke test: create two MetaD walkers, get ptrs from primary,
-    set ptrs on secondary — no exception should occur.
-    """
-    sys0, f0 = make_simple_system_and_force()
-    cv_idx = f0.addCollectiveVariable(gsp.GluedForce.CV_DISTANCE, [0, 1], [])
-    # MetaD: height=1.0, sigma=0.05, gamma=5.0, kT=2.479, pace=10,
-    #        numBins=50, origin=0.1, max=0.8
-    f0.addBias(gsp.GluedForce.BIAS_METAD, [cv_idx],
-               [1.0, 0.05, 5.0, 2.479, 0.1, 0.8],
-               [10, 50, 0])
-    sys0.addForce(f0)
-
-    sys1, f1 = make_simple_system_and_force()
-    cv_idx1 = f1.addCollectiveVariable(gsp.GluedForce.CV_DISTANCE, [0, 1], [])
-    f1.addBias(gsp.GluedForce.BIAS_METAD, [cv_idx1],
-               [1.0, 0.05, 5.0, 2.479, 0.1, 0.8],
-               [10, 50, 0])
-    sys1.addForce(f1)
-
-    ctx0, _ = make_context(sys0, f0)
-    ctx1, _ = make_context(sys1, f1)
-
-    set_positions_distance(ctx0, 0.3)
-    set_positions_distance(ctx1, 0.35)
-
-    # Get ptrs from primary
-    ptrs = f0.getMultiWalkerPtrs(ctx0, 0)
-    assert len(ptrs) == 1, f"MetaD should return 1 ptr, got {len(ptrs)}"
-    assert ptrs[0] != 0, "Device pointer should be non-zero"
-
-    # Set ptrs on secondary
-    f1.setMultiWalkerPtrs(ctx1, 0, ptrs)
-
 
 @pytest.mark.skipif(not has_cuda(), reason="CUDA platform not available")
 def test_metad_multiwalker_shared_deposition():
@@ -145,14 +109,9 @@ def test_metad_multiwalker_shared_deposition():
     set_positions_distance(ctx0, d0)
     set_positions_distance(ctx1, d1)
 
-    # Share the grid: secondary uses primary's grid
-    ptrs = f0.getMultiWalkerPtrs(ctx0, 0)
-    f1.setMultiWalkerPtrs(ctx1, 0, ptrs)
-
-    # Run both walkers
-    for _ in range(N_STEPS):
-        integ0.step(1)
-        integ1.step(1)
+    # Share the grid: merge both walkers' hills after every deposit.
+    pool = MultiWalkerPool([[ctx0, ctx1]], [[f0, f1]], sync_interval=PACE)
+    pool.run(N_STEPS)
 
     # Both walkers read the same shared grid — energy at the same CV value
     # should be larger than single walker (roughly 2x the deposits went in).
@@ -174,40 +133,6 @@ def test_metad_multiwalker_shared_deposition():
 # ---------------------------------------------------------------------------
 # OPES multiwalker tests
 # ---------------------------------------------------------------------------
-
-@pytest.mark.skipif(not has_cuda(), reason="CUDA platform not available")
-def test_opes_multiwalker_ptr_roundtrip():
-    """
-    Smoke test: OPES primary returns 5 non-zero ptrs; secondary accepts them.
-    """
-    sys0, f0 = make_simple_system_and_force()
-    cv0 = f0.addCollectiveVariable(gsp.GluedForce.CV_DISTANCE, [0, 1], [])
-    # OPES params: [kT, gamma, sigma0, sigmaMin]; int params: [variant, pace, maxKernels]
-    f0.addBias(gsp.GluedForce.BIAS_OPES, [cv0],
-               [2.479, 10.0, 0.05, 0.005],
-               [0, 20, 10000])
-    sys0.addForce(f0)
-
-    sys1, f1 = make_simple_system_and_force()
-    cv1 = f1.addCollectiveVariable(gsp.GluedForce.CV_DISTANCE, [0, 1], [])
-    f1.addBias(gsp.GluedForce.BIAS_OPES, [cv1],
-               [2.479, 10.0, 0.05, 0.005],
-               [0, 20, 10000])
-    sys1.addForce(f1)
-
-    ctx0, _ = make_context(sys0, f0)
-    ctx1, _ = make_context(sys1, f1)
-
-    set_positions_distance(ctx0, 0.3)
-    set_positions_distance(ctx1, 0.35)
-
-    ptrs = f0.getMultiWalkerPtrs(ctx0, 0)
-    assert len(ptrs) == 5, f"OPES should return 5 ptrs, got {len(ptrs)}: {ptrs}"
-    for i, p in enumerate(ptrs):
-        assert p != 0, f"OPES device pointer[{i}] should be non-zero"
-
-    f1.setMultiWalkerPtrs(ctx1, 0, ptrs)
-
 
 @pytest.mark.skipif(not has_cuda(), reason="CUDA platform not available")
 def test_opes_multiwalker_kernel_count():
@@ -264,13 +189,9 @@ def test_opes_multiwalker_kernel_count():
     set_positions_distance(ctx0, D_WALKER0)
     set_positions_distance(ctx1, D_WALKER1)
 
-    # Share OPES arrays: secondary uses primary's kernel list
-    ptrs = f0.getMultiWalkerPtrs(ctx0, 0)
-    f1.setMultiWalkerPtrs(ctx1, 0, ptrs)
-
-    for _ in range(N_STEPS):
-        integ0.step(1)
-        integ1.step(1)
+    # Share the OPES history: the walkers alternate steps on one kernel list.
+    pool = MultiWalkerPool([[ctx0, ctx1]], [[f0, f1]], sync_interval=PACE)
+    pool.run(N_STEPS)
 
     shared_metrics = f0.getOPESMetrics(ctx0, 0)
     shared_nker = int(shared_metrics[2])
@@ -321,8 +242,7 @@ def test_metad_single_walker_unaffected():
 @pytest.mark.skipif(not has_cuda(), reason="CUDA platform not available")
 def test_metad_multiwalker_secondary_reads_shared_grid():
     """
-    After primary deposits, secondary should read the shared grid and see non-zero bias.
-    This tests that the evalKernel arg redirect works correctly.
+    After the walkers deposit and merge, both must see the same grid.
     """
     PACE = 5
     N_STEPS = 25  # deposit 5 times
@@ -347,13 +267,10 @@ def test_metad_multiwalker_secondary_reads_shared_grid():
     set_positions_distance(ctx0, 0.3)
     set_positions_distance(ctx1, 0.3)
 
-    # Set up sharing
-    ptrs = f0.getMultiWalkerPtrs(ctx0, 0)
-    f1.setMultiWalkerPtrs(ctx1, 0, ptrs)
-
-    # Run only the primary walker (deposits into shared grid)
-    for _ in range(N_STEPS):
-        integ0.step(1)
+    pool = MultiWalkerPool([[ctx0, ctx1]], [[f0, f1]], sync_interval=PACE)
+    pool.run(N_STEPS)
+    set_positions_distance(ctx0, 0.3)
+    set_positions_distance(ctx1, 0.3)
 
     # Secondary evaluates: should see non-zero bias from primary's deposits
     # Force energy evaluation on secondary
@@ -379,8 +296,6 @@ if __name__ == "__main__":
 
     tests = [
         test_metad_single_walker_unaffected,
-        test_metad_multiwalker_ptr_roundtrip,
-        test_opes_multiwalker_ptr_roundtrip,
         test_metad_multiwalker_secondary_reads_shared_grid,
         test_metad_multiwalker_shared_deposition,
         test_opes_multiwalker_kernel_count,

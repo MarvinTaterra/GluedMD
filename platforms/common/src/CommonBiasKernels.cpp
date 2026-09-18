@@ -39,6 +39,18 @@ void CommonCalcGluedForceKernel::setupBiases(const GluedForce& force) {
  // is no virial/box-derivative path, so a bias on them would apply zero force on every
  // atom (a silent no-op). Fail loudly instead — VOLUME/CELL are read-only CVs (use them
  // for monitoring / COLVAR output). (H13)
+ // An expression that depends on a VOLUME/CELL CV is read-only too.
+ vector<bool> readOnly(force.getNumCollectiveVariables(), false);
+ for (int spec = 0, slot = 0; spec < force.getNumCollectiveVariableSpecs(); ++spec) {
+ int t; vector<int> atoms; vector<double> params;
+ force.getCollectiveVariableInfo(spec, t, atoms, params);
+ bool ro = (t == GluedForce::CV_VOLUME || t == GluedForce::CV_CELL);
+ if (t == GluedForce::CV_EXPRESSION)
+ for (int input : atoms)   // expression inputs are CV value indices
+ ro = ro || readOnly[input];
+ readOnly[slot] = ro;
+ slot += (t == GluedForce::CV_PATH) ? 2 : 1;
+ }
  for (int b = 0; b < numBiases; b++) {
  int t; vector<int> ci; vector<double> p; vector<int> ip;
  force.getBiasInfo(b, t, ci, p, ip);
@@ -47,7 +59,7 @@ void CommonCalcGluedForceKernel::setupBiases(const GluedForce& force) {
  idx < plan_.volumeFirstCVIndex + plan_.numVolumeCVs;
  bool isCell = plan_.numCellCVs > 0 && idx >= plan_.cellFirstCVIndex &&
  idx < plan_.cellFirstCVIndex + plan_.numCellCVs;
- if (isVol || isCell)
+ if (isVol || isCell || readOnly[idx])
  throw OpenMMException("GLUED: biasing a VOLUME/CELL CV is not supported (no "
  "virial/force path); these CVs are read-only — use them for monitoring only.");
  }
@@ -201,7 +213,7 @@ void CommonCalcGluedForceKernel::setupBiases(const GluedForce& force) {
  a.evalKernel->addArg(plan_.cvBiasGradients); // 6
  a.evalKernel->addArg(plan_.biasEnergies); // 7
  a.evalKernel->addArg(a.biasEnergyIdx); // 8
- a.evalKernel->addArg(); // 9: spare
+ a.evalKernel->addArg(0); // 9: commitHistory
 
  } else if (bType == GluedForce::BIAS_METAD) {
  metaDGridBiases_.emplace_back();
@@ -546,7 +558,7 @@ void CommonCalcGluedForceKernel::setupBiases(const GluedForce& force) {
  o.logSumWGPU.initialize<double>(cc_, 2, "opesBias_sumW_" + to_string(bIdx));
  o.logSumWGPU.upload(vector<double>{exp(-o.gamma), exp(-2.0*o.gamma)});
  o.stepCountGPU.initialize<int>(cc_, 1, "opesBias_stepCnt_" + to_string(bIdx));
- o.stepCountGPU.upload(vector<int>{0});
+ o.stepCountGPU.upload(vector<int>{1});
 
  o.biasEnergyIdx = biasEnergyCounter++;
 
@@ -587,11 +599,27 @@ void CommonCalcGluedForceKernel::setupBiases(const GluedForce& force) {
   barrier_kJ = o.kT / (1.0 - invGF);   // == γ·kT
  }
 
- ComputeProgram oProg = cc_.compileProgram(kOPESKernelSrc, {});
+ // Angular CVs (dihedrals, puckering phase angles) live on a circle: the OPES
+ // kernels take circular differences along those dimensions. The mask is a
+ // compile-time constant of this bias's program.
+ unsigned periodicMask = 0;
+ for (int spec = 0, slot = 0; spec < force.getNumCollectiveVariableSpecs(); ++spec) {
+ int type; vector<int> atoms; vector<double> params;
+ force.getCollectiveVariableInfo(spec, type, atoms, params);
+ bool phaseAngle = type == GluedForce::CV_PUCKERING && params.size() > 1 &&
+ params[1] == (params[0] == 5 ? 1 : 2);
+ if (type == GluedForce::CV_DIHEDRAL || phaseAngle)
+ for (int d = 0; d < D; ++d)
+ if (cvIndices[d] == slot)
+ periodicMask |= (1u << d);
+ slot += (type == GluedForce::CV_PATH) ? 2 : 1;
+ }
+ ComputeProgram oProg = cc_.compileProgram(kOPESKernelSrc,
+ {{"OPES_PERIODIC_MASK", to_string(periodicMask)}});
  o.evalKernel = oProg->createKernel("opesEvalBias");
  o.numKernelsGPU.initialize<int>(cc_, 1, "numKernelsGPU_" + to_string(bIdx));
  o.numKernelsGPU.upload(vector<int>(1, 0));
- // B2 multiwalker slot-claim counter (must be initialized alongside numKernelsGPU).
+ // Slot-claim counter for appends; -1 signals a full table (see updateState()).
  o.numAllocatedGPU.initialize<int>(cc_, 1, "numAllocatedGPU_" + to_string(bIdx));
  o.numAllocatedGPU.upload(vector<int>{0});
  // KDNorm initial value = exp(-gamma) sentinel (ensures no zero-division before first deposit).
@@ -638,7 +666,7 @@ void CommonCalcGluedForceKernel::setupBiases(const GluedForce& force) {
  o.gatherDepositKernel->addArg(cutoff2); // 19: 2*gamma/(gamma-1)
  o.gatherDepositKernel->addArg(o.logSumWGPU); // 20: {sum_w, sum_w2} linear accumulators
  o.gatherDepositKernel->addArg(o.stepCountGPU); // 21: step count for neff
- o.gatherDepositKernel->addArg(o.numAllocatedGPU); // 22: B2 multiwalker slot-claim counter
+ o.gatherDepositKernel->addArg(o.numAllocatedGPU); // 22: slot-claim counter
  o.gatherDepositKernel->addArg(o.maxKernels); // 23: buffer capacity limit
  o.gatherDepositKernel->addArg(o.gamma); // 24: γ (adaptive-σ factor in EXPLORE/METAD)
  o.gatherDepositKernel->addArg(barrier_kJ); // 25: γ·kT (kept for symmetry / future use)
@@ -654,6 +682,7 @@ void CommonCalcGluedForceKernel::setupBiases(const GluedForce& force) {
  o.welfordKernel->addArg(o.runningM2GPU); // 3
  o.welfordKernel->addArg(o.nSamplesGPU); // 4
  o.welfordKernel->addArg(D); // 5
+ o.welfordKernel->addArg(o.adaptiveSigmaStride); // 6
  }
 
  o.neffKernel = oProg->createKernel("opesUpdateNeff");
@@ -898,7 +927,7 @@ void CommonCalcGluedForceKernel::setupBiases(const GluedForce& force) {
  el.evalKernel->addArg(plan_.cvBiasGradients); // 5
  el.evalKernel->addArg(plan_.biasEnergies); // 6
  el.evalKernel->addArg(el.biasEnergyIdx); // 7
- el.evalKernel->addArg(); // 8: spare (8.5.1 fix)
+ el.evalKernel->addArg(0); // 8: initialized (8.5.1 fix)
 
  } else if (bType == GluedForce::BIAS_EDS) {
  // EDS White-Voth: bParams = [target_0, max_range_0, ..., kbt]
