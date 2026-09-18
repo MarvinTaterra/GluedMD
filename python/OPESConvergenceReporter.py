@@ -37,6 +37,7 @@ For OPES_METAD_EXPLORE (``mode='explore'`` on ``add_opes``) prefer
 """
 
 import sys
+import math
 
 # Boltzmann constant in kJ/mol/K (matches GluedForce.kTFromTemperature).
 _R_KJ = 8.314462618e-3
@@ -94,6 +95,16 @@ class OPESConvergenceReporter:
         # which Python ignores but prints to stderr.
         self._out = None
         self._file = None
+
+        if not isinstance(check_interval, int) or check_interval <= 0:
+            raise ValueError("check_interval must be a positive integer")
+        if not math.isfinite(tol) or tol < 0:
+            raise ValueError("tol must be finite and nonnegative")
+        for name, value, lower in (("post_convergence_steps", post_convergence_steps, 0),
+                                    ("min_steps", min_steps, 0), ("min_kernels", min_kernels, 0),
+                                    ("min_consecutive_passes", min_consecutive_passes, 1)):
+            if not isinstance(value, int) or value < lower:
+                raise ValueError(f"{name} must be an integer >= {lower}")
 
         if criterion not in self._VALID_CRITERIA:
             raise ValueError(

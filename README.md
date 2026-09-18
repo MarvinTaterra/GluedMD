@@ -3,7 +3,7 @@
 
 🌐 **Website:** [gluedmd.com](https://www.gluedmd.com/)
 
-GLUED is a GPU-resident enhanced sampling plugin for OpenMM. Collective variables, biases, and chain-rule force scatter all run natively inside OpenMM's GPU kernel infrastructure — no CPU↔GPU round-trip per step.
+GLUED is a GPU-resident enhanced sampling plugin for OpenMM. Collective variables, biases, and chain-rule force scatter all run natively inside OpenMM's GPU kernel infrastructure with host synchronization for state updates, energy CV reductions, and walker coordination.
 ## Features
 - **Collective variables** — distance, angle, dihedral, COM-distance, gyration, coordination, RMSD, DRMSD, contact map, dipole, path CVs, ring puckering, secondary structure, expression CVs, PyTorch CVs
 - **Bias methods** — harmonic / moving restraints, walls, well-tempered metadynamics, PBMETAD, OPES (METAD + EXPANDED), ABMD, EDS, MaxEnt, external bias, extended-Lagrangian (AFED)
@@ -19,7 +19,7 @@ cmake --build build
 cmake --install build
 python tests/test_api_smoke.py
 ```
-See [`docs/installation.md`](docs/installation.md) for full build instructions including CUDA/OpenCL/HIP backends.
+See [`docs/installation.md`](docs/installation.md) for full build instructions including CUDA/OpenCL backends and the Reference smoke-test stub.
 ## Documentation
 - [Overview](docs/index.md)
 - [Installation](docs/installation.md)

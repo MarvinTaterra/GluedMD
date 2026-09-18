@@ -22,9 +22,9 @@ double ReferenceCalcGluedForceKernel::execute(ContextImpl& context,
     return 0.0;
 }
 
-void ReferenceCalcGluedForceKernel::updateState(ContextImpl& context,
-                                                     int step) {
-    // Stage 5+ will trigger bias deposition here.
+bool ReferenceCalcGluedForceKernel::updateState(ContextImpl& context,
+                                                     long long step) {
+    return false;  // the Reference stub has no biases
 }
 
 void ReferenceCalcGluedForceKernel::getCurrentCVs(ContextImpl& context,

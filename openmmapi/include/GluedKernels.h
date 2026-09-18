@@ -50,10 +50,12 @@ public:
                            bool includeForces, bool includeEnergy) = 0;
 
     /**
-     * Called once per time step.  Handles bias deposition (METAD, OPES, etc.)
-     * which must not fire more than once per step.
+     * Called once per time step, before the step's force evaluation. Commits
+     * bias history (deposits, running statistics, auxiliary coordinates) against
+     * the current coordinates. Returns true if the bias potential changed, so the
+     * integrator can discard cached forces.
      */
-    virtual void updateState(OpenMM::ContextImpl& context, int step) = 0;
+    virtual bool updateState(OpenMM::ContextImpl& context, long long step) = 0;
 
     virtual void getCurrentCVs(OpenMM::ContextImpl& context,
                                 std::vector<double>& values) = 0;
@@ -85,23 +87,6 @@ public:
      * have been deposited yet.
      */
     virtual std::vector<float> getKernelSigmas(int biasIndex) = 0;
-
-    /**
-     * Multiwalker B2: get raw device pointers for the specified bias's shared arrays.
-     * biasType=BIAS_METAD: returns [grid_ptr]
-     * biasType=BIAS_OPES:  returns [centers, sigmas, logweights, numKernels, numAllocated]
-     * Default implementation returns empty vector (non-CUDA platforms).
-     * localIdx: 0-based index within that bias type's list (not the global bias index).
-     */
-    virtual std::vector<long long> getMultiWalkerPtrs(int biasType, int localIdx) { return {}; }
-
-    /**
-     * Multiwalker B2: redirect this walker's bias kernels to use external shared GPU arrays.
-     * Called after context creation on secondary walkers.
-     * ptrs: raw CUDA device pointers (as long long) from primary's getMultiWalkerPtrs().
-     * localIdx: 0-based index within that bias type's list.
-     */
-    virtual void redirectToPrimaryBias(int biasType, int localIdx, const std::vector<long long>& ptrs) {}
 };
 
 } // namespace GluedPlugin

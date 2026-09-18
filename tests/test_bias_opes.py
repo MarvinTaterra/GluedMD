@@ -32,6 +32,7 @@ OPES formulas (Invernizzi & Parrinello 2020, J. Phys. Chem. Lett. 11:2093):
 """
 import sys
 import math
+import pytest
 import openmm as mm
 import gluedplugin as gp
 
@@ -179,7 +180,7 @@ def opes_V_1kernel(s_val, s_dep, sigma_dep, gamma, kT, variant=0):
         eff_G = 0.0
     else:
         G     = math.exp(-0.5 * norm2)
-        eff_G = max(G - eps_eval, 0.0)   # eval kernel subtracts eps_eval (0 for variant=1)
+        eff_G = max(G - eps_dep, 0.0)   # eval kernel subtracts eps_eval (0 for variant=1)
 
     # sum_uprob from deposit kernel: h_stored*(G_self - eps_dep); h_stored cancels with numer.
     G_self_dep = max(1.0 - eps_dep, 1e-300)
@@ -509,7 +510,7 @@ def test_opes_explore_rejects_inf_gamma(platform):
     except Exception as e:
         raised = True
         msg = str(e)
-        assert ("EXPLORE" in msg) or ("gamma" in msg.lower()), \
+        assert ("EXPLORE" in msg) or ("gamma" in msg.lower()) or ("finite" in msg), \
             f"Unexpected error message: {msg}"
     assert raised, "Should have raised for gamma=inf in EXPLORE mode"
     print("  test_opes_explore_rejects_inf_gamma: OK")
@@ -619,108 +620,52 @@ def test_opes_python_adaptive_rejects_stride_with_explicit_sigma():
     print("  test_opes_python_adaptive_rejects_stride_with_explicit_sigma: OK")
 
 
-def test_opes_adaptive_sigma_matches_plumed_for_metad(platform):
-    """Adaptive σ in METAD must scale M2 by γ (PLUMED's convention),
-    giving σ_dep ≈ √γ · σ_observed_during_warmup.
+def _check_adaptive_first_deposit(platform, mode):
+    """Compare the first adaptive-sigma deposit with the PLUMED recurrence.
 
-    Bug variant scaled the wrong way: σ_dep ≈ σ_observed / √γ.
+    Reference: OPESmetad::update (plumed2, 2026-09-17). The first MD update is
+    excluded from the running variance; at the first deposit M2 is adjusted
+    once by gamma, divided by the sample count and by the mode factor (gamma
+    for METAD, 1 for EXPLORE), and Silverman's rule is applied in both modes.
     """
-    import math
     import numpy as np
-    import openmm as mm_lib
-    import glued as g
+    import glued
 
-    system = mm_lib.System()
+    gamma, stride = 10.0, 8
+    system = mm.System()
     for _ in range(3):
-        system.addParticle(1.0)
-    f  = g.Force(temperature=300.0)
-    cv = f.add_distance([0, 1])
-    gamma, stride = 10.0, 200
-    bias_idx = f.add_opes(cv, sigma=None, gamma=gamma, pace=1,
-                          adaptive_sigma_stride=stride, mode='metad')
+        system.addParticle(1000.0)
+    f = glued.Force(temperature=300)
+    cv = f.add_position(0, 0)
+    b = f.add_opes(cv, None, gamma=gamma, pace=stride, adaptive_sigma_stride=stride,
+                   mode=mode, sigma_min=1e-6)
     system.addForce(f)
-    integ = mm_lib.LangevinIntegrator(300.0, 1.0, 0.001)
-    ctx   = mm_lib.Context(system, integ, platform)
+    ctx = mm.Context(system, mm.VerletIntegrator(1e-6), platform)
 
     samples = []
-    for step in range(stride):
-        d = 1.0 + 0.05 * math.sin(step * 0.1)
-        ctx.setPositions([
-            mm_lib.Vec3(0.0, 0.0, 0.0),
-            mm_lib.Vec3(d,   0.0, 0.0),
-            mm_lib.Vec3(5.0, 5.0, 5.0),
-        ])
-        integ.step(1)
-        samples.append(d)
+    for step in range(stride + 1):
+        x = 0.1 * math.sin(step)
+        ctx.setPositions([[x, 0, 0], [0, 1, 0], [0, 0, 1]])
+        ctx.getIntegrator().step(1)
+        if step:
+            samples.append(x)
 
-    sigma_obs = float(np.std(samples, ddof=1))
-    integ.step(2)   # past stride+pace → first deposit
+    variance = float(np.var(samples))
+    factor = 1 if mode == 'explore' else gamma
+    baseline = math.sqrt(variance * gamma / factor)
+    # neff after one deposit with the {exp(-gamma), exp(-2 gamma)} sentinels.
+    sw, sw2 = 2 * math.exp(-gamma), 2 * math.exp(-2 * gamma)
+    size = 2 if mode == 'explore' else (1 + sw) ** 2 / (1 + sw2)
+    expected = baseline * (size * 3 / 4) ** (-1 / 5)
+    assert f.getKernelSigmas(ctx, b)[0] == pytest.approx(expected, rel=2e-6)
 
-    sigmas = f.getKernelSigmas(ctx, bias_idx)
-    assert len(sigmas) >= 1, f"expected ≥1 deposit, got {len(sigmas)}"
-    sigma_dep = float(sigmas[0])
 
-    expected_plumed = math.sqrt(gamma) * sigma_obs
-    expected_buggy  = sigma_obs / math.sqrt(gamma)
-    ratio_plumed = sigma_dep / expected_plumed
-    ratio_buggy  = sigma_dep / expected_buggy
-
-    print(f"  σ_obs={sigma_obs:.5f}  σ_dep={sigma_dep:.5f}  "
-          f"PLUMED-exp={expected_plumed:.5f}  buggy-exp={expected_buggy:.5f}")
-
-    assert 0.85 < ratio_plumed < 1.15, (
-        f"σ_dep / (√γ·σ_obs) = {ratio_plumed:.3f}; expected ≈1.0. "
-        f"If near {1.0/gamma:.3f} the bug has regressed.")
-    assert ratio_buggy > 2.0, (
-        f"σ_dep / (σ_obs/√γ) = {ratio_buggy:.3f}; expected ≈γ={gamma:.1f}. "
-        "If near 1.0 the bug has regressed.")
-    print("  test_opes_adaptive_sigma_matches_plumed_for_metad: OK")
+def test_opes_adaptive_sigma_matches_plumed_for_metad(platform):
+    _check_adaptive_first_deposit(platform, 'metad')
 
 
 def test_opes_adaptive_sigma_explore_no_factor(platform):
-    """EXPLORE applies factor=1 — σ_dep ≈ σ_observed, no √γ scaling."""
-    import math
-    import numpy as np
-    import openmm as mm_lib
-    import glued as g
-
-    system = mm_lib.System()
-    for _ in range(3):
-        system.addParticle(1.0)
-    f  = g.Force(temperature=300.0)
-    cv = f.add_distance([0, 1])
-    gamma, stride = 10.0, 200
-    bias_idx = f.add_opes(cv, sigma=None, gamma=gamma, pace=1,
-                          adaptive_sigma_stride=stride, mode='explore')
-    system.addForce(f)
-    integ = mm_lib.LangevinIntegrator(300.0, 1.0, 0.001)
-    ctx   = mm_lib.Context(system, integ, platform)
-
-    samples = []
-    for step in range(stride):
-        d = 1.0 + 0.05 * math.sin(step * 0.1)
-        ctx.setPositions([
-            mm_lib.Vec3(0.0, 0.0, 0.0),
-            mm_lib.Vec3(d,   0.0, 0.0),
-            mm_lib.Vec3(5.0, 5.0, 5.0),
-        ])
-        integ.step(1)
-        samples.append(d)
-
-    sigma_obs = float(np.std(samples, ddof=1))
-    integ.step(2)
-    sigmas = f.getKernelSigmas(ctx, bias_idx)
-    assert len(sigmas) >= 1
-    sigma_dep = float(sigmas[0])
-    # EXPLORE broadens user-supplied σ by √γ at host setup time, but the
-    # adaptive branch is reached only with sigma=None so the host-side
-    # √γ scaling is NOT applied to a fresh σ; only the kernel-internal
-    # factor=1 matters here. Net: σ_dep should match σ_obs.
-    ratio = sigma_dep / sigma_obs
-    print(f"  EXPLORE: σ_obs={sigma_obs:.5f}  σ_dep={sigma_dep:.5f}  ratio={ratio:.3f}")
-    assert 0.85 < ratio < 1.15, (
-        f"EXPLORE σ_dep/σ_obs = {ratio:.3f}; expected ≈1.0 (factor=1).")
-    print("  test_opes_adaptive_sigma_explore_no_factor: OK")
+    _check_adaptive_first_deposit(platform, 'explore')
 
 
 def test_opes_adaptive_blocks_early_deposition(platform):

@@ -2,7 +2,7 @@
 # scripts/run_tests.sh — full local test + perf suite
 #
 # Usage:
-#   ./scripts/run_tests.sh              # build + all tests + perf
+#   ./scripts/run_tests.sh              # build + all tests (optional --perf)
 #   ./scripts/run_tests.sh --no-build   # skip cmake (use existing build/)
 #   ./scripts/run_tests.sh --no-perf    # skip benchmark comparison
 #   ./scripts/run_tests.sh --update-baselines  # write new baseline JSONs
@@ -20,7 +20,7 @@ header(){ echo -e "\n${YELLOW}══ $* ══${NC}"; }
 
 # ── Defaults ─────────────────────────────────────────────────────────────────
 DO_BUILD=1
-DO_PERF=1
+DO_PERF=0
 UPDATE_BASELINES=0
 THRESHOLD=0.90   # fail if a benchmark drops below 90% of baseline
 
@@ -28,6 +28,7 @@ for arg in "$@"; do
   case "$arg" in
     --no-build)          DO_BUILD=0 ;;
     --no-perf)           DO_PERF=0 ;;
+    --perf)              DO_PERF=1 ;;
     --update-baselines)  UPDATE_BASELINES=1 ;;
     *) echo "Unknown option: $arg"; exit 1 ;;
   esac
@@ -66,7 +67,19 @@ else
   fail "Unit tests"; FAILED=1
 fi
 
+# These numerical checks live in main() and are not collected by pytest.
+for script in test_cv_energy.py test_cv_energy_vsite.py test_bias_multithermal.py; do
+  if python "tests/$script"; then
+    pass "$script"
+  else
+    fail "$script"; FAILED=1
+  fi
+done
+
 # ── Benchmarks ────────────────────────────────────────────────────────────────
+if [[ $DO_PERF -eq 1 && ! -d benchmarks ]]; then
+  fail "benchmarks/ is not included in this checkout"; exit 1
+fi
 if [[ $DO_PERF -eq 1 ]]; then
   header "Benchmarks"
 

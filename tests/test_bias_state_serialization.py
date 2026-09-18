@@ -74,7 +74,7 @@ def test_magic_version_header():
     assert len(blob) >= 8, f"blob too short: {len(blob)} bytes"
     assert blob[:4] == b'GPUS', f"wrong magic: {blob[:4]!r}"
     version = struct.unpack_from('<i', blob, 4)[0]
-    assert version == 1, f"expected version=1, got {version}"
+    assert version == 2, f"expected version=2, got {version}"
     print(f"  test_magic_version_header: OK  ({len(blob)} bytes, version={version})")
 
 

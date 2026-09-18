@@ -68,9 +68,11 @@ print(f"Overall acceptance rate: {re.acceptance_rate:.1%}")
 
 ---
 
-## Scenario C — Multiple walkers per GPU, shared bias across GPUs
+## Scenario C — Multiple walkers sharing one bias
 
-This is the most powerful pattern: W walkers spread across G GPUs, where walkers within the same GPU group share their bias arrays in real time (GPU-atomic, no CPU round-trip), and bias state is periodically merged across GPU groups at the Python level.
+W walkers spread across G GPUs all contribute to one bias. `MultiWalkerPool`
+keeps the shared bias consistent by moving bias-state checkpoints between the
+walkers' Contexts; groups on different devices step concurrently.
 
 ```python
 from MultiGPUManager import MultiGPUManager, MultiWalkerPool
@@ -113,20 +115,22 @@ pool = MultiWalkerPool(
 pool.run(n_steps=5_000_000)
 ```
 
-### What happens under the hood
+### How the shared bias is kept consistent
 
-**Intra-GPU (within a group):** `MultiWalkerPool.__init__` calls `getMultiWalkerPtrs` on each group primary and `setMultiWalkerPtrs` on every secondary in the same group. From this point, all walkers in the group write their MetaD deposits atomically to the same GPU double-precision grid — at full GPU throughput with no synchronization overhead.
+The pool shares only the bias selected by `bias_index`; every other bias keeps
+its own per-walker history (so H-REUS windows can share a MetaD grid while
+keeping separate restraints).
 
-**Cross-GPU (between groups):** Every `sync_interval` steps `MultiWalkerPool` downloads the bias state from each group primary (one `getBiasState()` call per group), sums the MetaD grid arrays element-wise using `BiasStateMerger`, and uploads the merged state to every group primary via `setBiasState()`. This CPU round-trip is amortized over `sync_interval` steps; the cost is negligible when `sync_interval ≥ 50`.
+| Shared bias | Mechanism |
+|---|---|
+| MetaD, PBMetaD | Every `sync_interval` steps the hills each walker deposited since the previous merge are summed and written back to every walker. Hills are additive, so this is exact up to the merge latency. Groups run concurrently between merges. |
+| OPES, OPES-expanded, multithermal | The walkers advance one MD step at a time in a fixed order, each starting from the state the previous walker left. A compressed kernel table with running statistics cannot be merged after the fact, so this is the only exact scheme; it is serial and costs a checkpoint transfer per walker step. Any positive `sync_interval` enables it. |
 
-### Sync modes
-
-| `sync_mode` | MetaD behavior | OPES behavior |
-|---|---|---|
-| `"additive"` (default) | Element-wise grid sum | Copy from group with most kernels |
-| `"broadcast"` | Copy group 0's grid to all others | Copy group 0's state to all others |
-
-Use `"additive"` for true multi-walker sampling where every walker contributes hills to the shared landscape. Use `"broadcast"` when groups have independent bias targets (e.g. H-REUS windows) and you only want one-way propagation.
+`sync_interval=0` leaves every walker's bias independent (use it for H-REUS
+windows that only exchange configurations). `sync_mode="broadcast"` copies group
+0's grid to everyone at each sync instead of merging. All walkers must start from
+the same shared-bias state and define the shared bias identically. Advance the
+walkers only through `pool.run()`.
 
 ---
 
@@ -156,9 +160,10 @@ For T-REMD, provide `temperatures=[300, 320, 340, 360]` (one per group) instead 
 
 ## Choosing `sync_interval`
 
-The cross-GPU merge cost scales as `O(G × grid_size)` where G is the number of GPU groups and grid_size is the number of MetaD grid bins. For a 1-D grid with 360 bins and 4 GPUs, this is about 4 × 360 × 8 bytes = ~12 kB of transfers per merge. Even at `sync_interval=10` this is well below 1% overhead.
-
-A practical guideline:
+For MetaD/PBMetaD, merge after every deposit or every few deposits: between
+merges a walker does not see the others' newest hills. A merge downloads and
+re-uploads each walker's grid (`8 × grid points` bytes per walker), which is
+negligible for typical 1-D/2-D grids at intervals of a few hundred steps.
 
 | MetaD pace | Recommended sync_interval |
 |---|---|
@@ -166,7 +171,8 @@ A practical guideline:
 | 100 steps | 100–200 |
 | 50 steps  | 50–100 |
 
-Shorter intervals keep the cross-GPU grids more consistent (important when walkers are rapidly depositing in the same CV region); longer intervals reduce overhead.
+For the OPES family the interval only switches sharing on or off; the state is
+transferred on every walker step.
 
 ---
 
@@ -190,7 +196,9 @@ See class docstring in `MultiGPUManager.py` for full parameter documentation.
 
 ### `MultiWalkerPool.run(n_steps)`
 
-Run `n_steps` MD steps with automatic cross-GPU sync and optional RE.
+Run `n_steps` MD steps with automatic bias synchronization and optional RE.
+Syncs and exchange attempts fall on absolute multiples of their intervals, so
+repeated short calls follow the same schedule as one long call.
 
 ### `MultiWalkerPool.re_acceptance_rate → float`
 
@@ -204,16 +212,23 @@ RE acceptance rate for the (i, j) group pair.
 
 ## `BiasStateMerger`
 
-Low-level utility for parsing and merging `getBiasState()` binary blobs. Can be used independently of `MultiWalkerPool` if you need custom merge logic.
+Low-level utility for parsing, repacking and merging `getBiasState()` blobs. Can
+be used independently of `MultiWalkerPool` for custom MetaD merge logic.
 
 ```python
 from MultiGPUManager import BiasStateMerger
 
-blob_a = force_a.getBiasState()
-blob_b = force_b.getBiasState()
+blob_a = force_a.getBiasState(ctx_a)
+blob_b = force_b.getBiasState(ctx_b)
 
-merged = BiasStateMerger.merge_additive([blob_a, blob_b], force_a)
+merged = BiasStateMerger.merge_additive([blob_a, blob_b], force_a)   # sums all MetaD grids
 
-force_a.setBiasState(merged)
-force_b.setBiasState(merged)
+force_a.setBiasState(merged, ctx_a)
+force_b.setBiasState(merged, ctx_b)
 ```
+
+`merge_additive` sums every MetaD/PBMetaD grid and copies all other sections
+from the first blob. For a persistent shared grid use
+`merge_additive_incremental(blobs, force, baselines)` with the baselines
+returned by the previous call, so hills are not counted twice. `parse(blob,
+force)` and `pack(state)` expose the sections for anything else.

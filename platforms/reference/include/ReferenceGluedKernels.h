@@ -19,7 +19,7 @@ public:
     double execute(OpenMM::ContextImpl& context,
                    bool includeForces, bool includeEnergy) override;
 
-    void updateState(OpenMM::ContextImpl& context, int step) override;
+    bool updateState(OpenMM::ContextImpl& context, long long step) override;
 
     void getCurrentCVs(OpenMM::ContextImpl& context,
                        std::vector<double>& values) override;

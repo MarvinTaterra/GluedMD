@@ -10,704 +10,326 @@ Three supported patterns:
      Our custom force runs on the primary context — no additional changes needed.
 
   B. One system per GPU — Replica Exchange (H-REUS / T-REMD)
-       # Build (context, force) pairs; each context is pinned to a specific GPU:
        replicas = MultiGPUManager.build_replicas(factories, devices=[0, 1, 2, 3])
-       # factories is a list of callables: device_idx → (context, force)
        re = ReplicaExchange(replicas, mode="H-REUS", kT=kT)
        re.run(n_cycles=500, steps_per_cycle=500)
      MultiGPUManager.build_replicas() passes DeviceIndex to each factory so each
      context lands on the requested device without further intervention.
 
-  C. Multiple walkers per GPU across multiple GPUs
+  C. Multiple walkers sharing one bias, across one or more GPUs
        pool = MultiWalkerPool(
            walker_groups,    # [[ctx_gpu0_w0, ctx_gpu0_w1], [ctx_gpu1_w0, ...]],
            force_groups,     # [[f_gpu0_w0,  f_gpu0_w1],  [f_gpu1_w0,  ...]],
            bias_index=0,     # which bias to share
-           sync_interval=50, # steps between cross-GPU bias state merges
+           sync_interval=50, # steps between bias-state merges
        )
        pool.run(n_steps=100_000)
-     Within each GPU group, walkers share GPU bias arrays via getMultiWalkerPtrs /
-     setMultiWalkerPtrs (atomic, no CPU round-trip).  Across GPUs, bias state is
-     periodically merged at the Python level using getBiasState / setBiasState with
-     an additive MetaD-grid merge or an OPES-union merge.
-
-     MultiWalkerPool can also drive replica exchange *between* GPU groups:
-       pool = MultiWalkerPool(..., re_mode="H-REUS", kT=kT, re_interval=500)
+     See MultiWalkerPool for how the shared bias is kept consistent.
 
 Requirements
 ------------
 - openmm >= 8.0
 - gluedplugin (this repo, CUDA platform build)
-- numpy (for additive grid merge)
-
-The module is deliberately import-time-light — numpy is only imported when an
-additive MetaD merge is actually requested.
+- numpy (for the grid merge)
 """
 
 import math
 import random
 import struct
-import warnings
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import openmm as mm
 import openmm.unit as unit
 
-try:
-    import gluedplugin as gsp
-    _GSP_AVAILABLE = True
-except ImportError:
-    _GSP_AVAILABLE = False
-    gsp = None
+from ReplicaExchange import exchange_log_acceptance
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _total_energy_kJ(ctx: mm.Context) -> float:
-    return ctx.getState(getEnergy=True).getPotentialEnergy().value_in_unit(
-        unit.kilojoules_per_mole)
-
-
-def _group_energy_kJ(ctx: mm.Context, groups_mask: int) -> float:
-    return ctx.getState(getEnergy=True, groups=groups_mask).getPotentialEnergy(
-    ).value_in_unit(unit.kilojoules_per_mole)
-
-
-def _bias_type_name(btype: int) -> str:
-    if not _GSP_AVAILABLE:
-        return f"BIAS_{btype}"
-    names = {
-        gsp.GluedForce.BIAS_METAD:    "METAD",
-        gsp.GluedForce.BIAS_PBMETAD:  "PBMETAD",
-        gsp.GluedForce.BIAS_OPES:     "OPES",
-        gsp.GluedForce.BIAS_ABMD:     "ABMD",
-        gsp.GluedForce.BIAS_EDS:      "EDS",
-        gsp.GluedForce.BIAS_EXT_LAGRANGIAN: "EXT_LAGRANGIAN",
-        gsp.GluedForce.BIAS_MAXENT:   "MAXENT",
-    }
-    return names.get(btype, f"BIAS_{btype}")
+# Bias type codes (GluedForce::BiasType). Spelled out so the parser only needs
+# an object with getNumBiases()/getBiasParameters(), not the compiled plugin.
+_BIAS_METAD = 3
+_BIAS_PBMETAD = 4
+_BIAS_OPES = 5
+_BIAS_ABMD = 7
+_BIAS_OPES_EXPANDED = 11
+_BIAS_EXT_LAGRANGIAN = 12
+_BIAS_MAXENT = 13
+_BIAS_EDS = 14
+_BIAS_OPES_MULTITHERMAL = 15
 
 
 # ---------------------------------------------------------------------------
 # BiasStateMerger — parse / merge / repack getBiasState() blobs
 #
-# Binary layout (little-endian, version 1):
-#   4B magic 'GPUS' + int32 version
-#   int32  n_opes
-#   per OPES bias (D = numCVs for that bias):
-#     int32 nk, double logZ, int32 nSamples
-#     double[D] runningMean, double[D] runningM2
-#     double[nk*D] centers, double[nk*D] sigmas, double[nk] logWeights
-#   int32  n_abmd
-#   per ABMD bias (D = numCVs):
-#     double[D] rhoMin
-#   int32  n_metad
-#   per MetaD bias (G = totalGridPoints):
-#     int32 numDeposited, double[G] grid
-#   int32  n_pbmetad
-#   per PBMetaD bias:
-#     int32  n_subgrids
-#     per sub-grid: int32 numDeposited, double[G_k] grid
-#   int32  n_external   (stateless — count tag only)
-#   int32  n_linear     (stateless — count tag only)
-#   int32  n_wall       (stateless — count tag only)
-#   int32  n_opes_expanded
-#   per OPES_EXPANDED bias:
-#     double logZ, int32 numUpdates
-#   int32  n_ext_lagrangian
-#   per ExtLag bias (D = numCVs):
-#     double[D] s, double[D] p
-#   int32  n_eds
-#   per EDS bias (D = numCVs):
-#     double[D] lambda, mean, ssd, accum; int32[D] count
-#   int32  n_maxent
-#   per MaxEnt bias (D = numCVs):
-#     double[D] lambda
+# Binary layout (little-endian, version 2; mirrors CommonSerialization.cpp):
+#   char[4] 'GPUS', int32 version
+#   uint64 configurationHash, int64 lastUpdateStep
+#   int32 n_opes; per OPES bias (D = numCVs, K = numKernels):
+#     int32 K, double sumUprob, int32 numSamples, int32 depositCount
+#     double sumWeights, double[2] sumW
+#     double[D] runningMean, double[D] runningM2, double[D] sigma0
+#     double[K*D] centers, double[K*D] sigmas, double[K] logWeights
+#   int32 n_abmd;          per bias: double[D] rhoMin
+#   int32 n_metad;         per bias: int32 numDeposited, double[G] grid
+#   int32 n_pbmetad;       per bias: int32 n_subgrids, then per sub-grid as MetaD
+#   int32 n_external, int32 n_linear, int32 n_wall   (stateless, counts only)
+#   int32 n_opes_expanded; per bias: double logZ, int32 numUpdates
+#   int32 n_ext_lagrangian; per bias: int32 initialized, double[D] s, double[D] p
+#   int32 n_eds;           per bias: double[D] lambda, mean, ssd, accum; int32[D] count
+#   int32 n_maxent;        per bias: double[D] lambda
+#   int32 n_multithermal;  per bias: int32 N, double[N] deltaF, double rct, double counter
 # ---------------------------------------------------------------------------
 
 class BiasStateMerger:
-    """
-    Parse, inspect, and merge getBiasState() binary blobs.
+    """Parse, repack and merge ``getBiasState()`` checkpoints.
 
-    Primarily used for cross-GPU MetaD-grid additive merge:
-      merged = BiasStateMerger.merge_additive([blob0, blob1], force)
+    ``parse`` returns a dict with one list per bias section (see the layout
+    above); ``pack`` is its exact inverse. Grid entries are ``(numDeposited,
+    grid_bytes)`` tuples, PBMetaD entries are lists of those, and OPES entries
+    keep every field of the section so a walker's complete state can be moved
+    between Contexts.
 
-    The additive merge is *incremental* across sync cycles (see
-    :meth:`merge_additive_incremental`): only the per-group delta since the
-    last sync is folded into the shared grid, so already-shared bias is not
-    re-added each cycle.
-
-    For OPES, the kernel lists from all walkers are concatenated and the
-    Welford running statistics combined with the parallel (Chan) formula — a
-    real union merge rather than discarding walkers.
+    ``merge_additive`` sums MetaD/PBMetaD grids across blobs. Everything else
+    in the merged blob is copied from the first input; grids are the only
+    state for which a sum is meaningful.
     """
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    @staticmethod
+    def parse(blob: bytes, force) -> dict:
+        """Parse a blob. ``force`` supplies the per-bias dimensions the blob omits."""
+        pos = 0
+
+        def read(fmt):
+            nonlocal pos
+            size = struct.calcsize(fmt)
+            if pos + size > len(blob):
+                raise ValueError(
+                    f"bias-state blob truncated at offset {pos} (need {size} bytes)")
+            values = struct.unpack_from(fmt, blob, pos)
+            pos += size
+            return values
+
+        def read_i32():
+            return read("<i")[0]
+
+        def read_bytes(n):
+            nonlocal pos
+            if n < 0 or pos + n > len(blob):
+                raise ValueError(
+                    f"bias-state blob truncated at offset {pos} (need {n} bytes)")
+            out = blob[pos:pos + n]
+            pos += n
+            return out
+
+        def read_count(section, expected):
+            n = read_i32()
+            if n != expected:
+                raise ValueError(f"bias-state {section} count mismatch: blob declares "
+                                 f"{n} but the force has {expected}")
+
+        if blob[:4] != b"GPUS":
+            raise ValueError("missing bias-state header")
+        pos = 4
+        version = read_i32()
+        if version != 2:
+            raise ValueError(f"unsupported bias-state version {version}")
+        config_hash = read("<Q")[0]
+        last_update = read("<q")[0]
+
+        # Per-bias dimensions from the force configuration, in registration order.
+        dims = defaultdict(list)
+        for i in range(force.getNumBiases()):
+            btype, cv_idxs, _, intparams = force.getBiasParameters(i)
+            D = len(cv_idxs)
+            if btype == _BIAS_METAD:
+                # intparams: [pace, bins_0..bins_D-1, periodic_0..periodic_D-1]
+                points = 1
+                for d in range(D):
+                    points *= intparams[1 + d] + (0 if intparams[1 + D + d] else 1)
+                dims[btype].append(points)
+            elif btype == _BIAS_PBMETAD:
+                # intparams: [pace, bins_0, periodic_0, bins_1, periodic_1, ...]
+                dims[btype].append([intparams[1 + 2 * d] + (0 if intparams[2 + 2 * d] else 1)
+                                    for d in range(D)])
+            else:
+                dims[btype].append(D)
+
+        def grid(points):
+            return (read_i32(), read_bytes(points * 8))
+
+        read_count("OPES", len(dims[_BIAS_OPES]))
+        opes = []
+        for D in dims[_BIAS_OPES]:
+            K = read_i32()
+            sum_uprob = read("<d")[0]
+            num_samples, deposit_count = read("<ii")
+            sum_weights = read("<d")[0]
+            sum_w = read_bytes(16)
+            running_mean = read_bytes(D * 8)
+            running_m2 = read_bytes(D * 8)
+            sigma0 = read_bytes(D * 8)
+            centers = read_bytes(K * D * 8)
+            sigmas = read_bytes(K * D * 8)
+            log_weights = read_bytes(K * 8)
+            opes.append((K, sum_uprob, num_samples, deposit_count, sum_weights, sum_w,
+                         running_mean, running_m2, sigma0, centers, sigmas, log_weights))
+
+        read_count("ABMD", len(dims[_BIAS_ABMD]))
+        abmd = [read_bytes(D * 8) for D in dims[_BIAS_ABMD]]
+
+        read_count("MetaD", len(dims[_BIAS_METAD]))
+        metad = [grid(points) for points in dims[_BIAS_METAD]]
+
+        read_count("PBMetaD", len(dims[_BIAS_PBMETAD]))
+        pbmetad = []
+        for sub_sizes in dims[_BIAS_PBMETAD]:
+            read_count("PBMetaD sub-grid", len(sub_sizes))
+            pbmetad.append([grid(points) for points in sub_sizes])
+
+        n_external, n_linear, n_wall = read("<iii")
+
+        read_count("OPES_EXPANDED", len(dims[_BIAS_OPES_EXPANDED]))
+        opes_expanded = [read("<di") for _ in dims[_BIAS_OPES_EXPANDED]]
+
+        read_count("EXT_LAGRANGIAN", len(dims[_BIAS_EXT_LAGRANGIAN]))
+        ext_lag = [(read_i32(), read_bytes(D * 8), read_bytes(D * 8))
+                   for D in dims[_BIAS_EXT_LAGRANGIAN]]
+
+        read_count("EDS", len(dims[_BIAS_EDS]))
+        eds = [(read_bytes(D * 8), read_bytes(D * 8), read_bytes(D * 8), read_bytes(D * 8),
+                read_bytes(D * 4))
+               for D in dims[_BIAS_EDS]]
+
+        read_count("MAXENT", len(dims[_BIAS_MAXENT]))
+        maxent = [read_bytes(D * 8) for D in dims[_BIAS_MAXENT]]
+
+        read_count("OPES multithermal", len(dims[_BIAS_OPES_MULTITHERMAL]))
+        multithermal = []
+        for _ in dims[_BIAS_OPES_MULTITHERMAL]:
+            n_states = read_i32()
+            multithermal.append((read_bytes(n_states * 8), *read("<dd")))
+        if pos != len(blob):
+            raise ValueError("unexpected trailing bytes in bias-state blob")
+
+        return dict(
+            version=version, config_hash=config_hash, last_update=last_update,
+            opes=opes, abmd=abmd, metad=metad, pbmetad=pbmetad,
+            n_external=n_external, n_linear=n_linear, n_wall=n_wall,
+            opes_expanded=opes_expanded, ext_lag=ext_lag, eds=eds, maxent=maxent,
+            multithermal=multithermal)
+
+    @staticmethod
+    def pack(state: dict) -> bytes:
+        """Inverse of :meth:`parse`."""
+        buf = bytearray(b"GPUS")
+        buf += struct.pack("<iQq", state["version"], state["config_hash"], state["last_update"])
+
+        def i32(v):
+            buf.extend(struct.pack("<i", v))
+
+        def grid(entry):
+            i32(entry[0])
+            buf.extend(entry[1])
+
+        i32(len(state["opes"]))
+        for (K, sum_uprob, num_samples, deposit_count, sum_weights, sum_w, running_mean,
+             running_m2, sigma0, centers, sigmas, log_weights) in state["opes"]:
+            buf += struct.pack("<idiid", K, sum_uprob, num_samples, deposit_count, sum_weights)
+            for section in (sum_w, running_mean, running_m2, sigma0, centers, sigmas, log_weights):
+                buf.extend(section)
+        i32(len(state["abmd"]))
+        for rho_min in state["abmd"]:
+            buf.extend(rho_min)
+        i32(len(state["metad"]))
+        for entry in state["metad"]:
+            grid(entry)
+        i32(len(state["pbmetad"]))
+        for sub_grids in state["pbmetad"]:
+            i32(len(sub_grids))
+            for entry in sub_grids:
+                grid(entry)
+        buf += struct.pack("<iii", state["n_external"], state["n_linear"], state["n_wall"])
+        i32(len(state["opes_expanded"]))
+        for log_z, num_updates in state["opes_expanded"]:
+            buf += struct.pack("<di", log_z, num_updates)
+        i32(len(state["ext_lag"]))
+        for initialized, s, p in state["ext_lag"]:
+            i32(initialized)
+            buf.extend(s)
+            buf.extend(p)
+        i32(len(state["eds"]))
+        for sections in state["eds"]:
+            for section in sections:
+                buf.extend(section)
+        i32(len(state["maxent"]))
+        for lam in state["maxent"]:
+            buf.extend(lam)
+        i32(len(state["multithermal"]))
+        for delta_f, rct, counter in state["multithermal"]:
+            i32(len(delta_f) // 8)
+            buf.extend(delta_f)
+            buf += struct.pack("<dd", rct, counter)
+        return bytes(buf)
+
+    @staticmethod
+    def merge_grid_increments(entries, baselines):
+        """Merge grid entries ``(numDeposited, grid_bytes)`` from several walkers.
+
+        ``baselines[i]`` is the entry walker ``i`` started from after the previous
+        merge (all baselines are identical then). The result is that common
+        baseline plus every walker's increment since, so repeated merges never
+        count a hill twice. Pass ``baselines=None`` to sum absolute grids.
+        """
+        import numpy as np
+        if baselines is None:
+            baselines = [(0, bytes(len(entries[0][1])))] * len(entries)
+        num_deposited, grid = baselines[0]
+        grid = np.frombuffer(grid, dtype="<f8").copy()
+        for (n, g), (base_n, base_g) in zip(entries, baselines):
+            if n < base_n:
+                raise ValueError("a walker's grid has fewer deposits than its baseline; "
+                                 "broadcast a new baseline before merging")
+            num_deposited += n - base_n
+            grid += np.frombuffer(g, dtype="<f8") - np.frombuffer(base_g, dtype="<f8")
+        return int(num_deposited), grid.tobytes()
 
     @staticmethod
     def merge_additive(blobs: List[bytes], force) -> bytes:
+        """Sum the MetaD/PBMetaD grids of several blobs (first merge only).
+
+        Non-grid sections are copied from ``blobs[0]``. For repeated merges of
+        a persistent shared grid use :meth:`merge_additive_incremental`.
         """
-        Merge multiple bias state blobs into one (non-incremental / first sync).
-
-        MetaD grids: element-wise sum of all blobs (walkers collectively fill
-        the shared grid — correct for independent-walker multi-walker MetaD).
-        numDeposited: sum across blobs.
-
-        OPES: union of all walkers' kernel lists with combined Welford stats
-        (see :meth:`_merge_opes`).
-
-        OPES_EXPANDED: combined independently of OPES (logZ averaged in linear
-        space weighted by numUpdates, numUpdates summed).
-
-        All other sections (ABMD rhoMin, ExtLag s/p, EDS λ, MaxEnt λ):
-        take from blob[0] (walkers in separate groups have independent states).
-
-        Requires numpy.
-
-        Note
-        ----
-        This sums the *full absolute* grids of every blob.  For repeated syncs
-        of a persistent shared grid this double-counts already-shared bias; use
-        :meth:`merge_additive_incremental` for the steady-state sync path.
-        """
-        merged, _ = BiasStateMerger.merge_additive_incremental(
-            blobs, force, baselines=None)
+        merged, _ = BiasStateMerger.merge_additive_incremental(blobs, force)
         return merged
 
     @staticmethod
     def merge_additive_incremental(blobs: List[bytes], force, baselines=None):
+        """Sum grid increments since the previous merge.
+
+        ``baselines`` is the list returned by the previous call (one parsed
+        state per blob, all equal to the state that was broadcast); with it only
+        each blob's increment since then is added, so hills are never counted
+        twice. Returns ``(merged_blob, new_baselines)``.
         """
-        Incremental additive merge of bias state blobs.
-
-        Parameters
-        ----------
-        blobs : list of bytes
-            One getBiasState() blob per group primary (current state).
-        force : GluedForce or None
-            Reference force, used only for per-bias dimensionality.
-        baselines : list of dict or None
-            Per-group parsed baseline (the state each group last had broadcast
-            *to* it, i.e. the last shared grid that group started accumulating
-            from).  ``None`` (or a length mismatch) means "first sync": fall
-            back to summing the full absolute grids.
-
-        Returns
-        -------
-        (merged_blob, new_baselines)
-            ``merged_blob`` is the packed merged state to broadcast to every
-            group.  ``new_baselines`` is a list (one per group) of the parsed
-            merged state — store it and pass it back as ``baselines`` next
-            sync so the merge folds in only each group's delta.
-
-        Incremental rule (per grid cell, per group g)::
-
-            new_shared = previous_shared + Σ_g (G_g_now − G_g_last_synced)
-
-        where ``previous_shared`` is the common baseline that was broadcast to
-        all groups last cycle.  Because every group received the same baseline,
-        we use ``baselines[0]`` as ``previous_shared`` and each group's own
-        baseline as ``G_g_last_synced``.  numDeposited is folded the same way.
-
-        On the first sync (``baselines is None``) this reduces exactly to the
-        full-sum semantics of the legacy merge.
-        """
-        if len(blobs) == 0:
+        if not blobs:
             raise ValueError("no blobs to merge")
-        if len(blobs) == 1:
-            # Still parse so the returned baseline is well-formed.
-            parsed_single = BiasStateMerger._parse(blobs[0], force)
-            return blobs[0], [parsed_single]
-
-        import numpy as np
-
-        # Parse all blobs into structured dicts.
-        parsed = [BiasStateMerger._parse(b, force) for b in blobs]
-
-        # Decide whether we have a usable per-group baseline.
-        incremental = (baselines is not None and len(baselines) == len(parsed))
-
-        # Build merged result from parsed[0] as base, then override.
-        result = {k: v for k, v in parsed[0].items()}
-
-        def _grid_array(b):
-            return np.frombuffer(bytes(b), dtype="<f8")
-
-        # --- MetaD grids: additive (incremental) sum ---
-        if parsed[0]["metad"]:
-            merged_metad = []
-            for i, (nd0, g0) in enumerate(parsed[0]["metad"]):
-                cur = [_grid_array(p["metad"][i][1]) for p in parsed]
-                nd_cur = [p["metad"][i][0] for p in parsed]
-                if incremental:
-                    prev_shared = _grid_array(baselines[0]["metad"][i][1])
-                    nd_prev_shared = baselines[0]["metad"][i][0]
-                    summed = prev_shared.copy()
-                    total_nd = nd_prev_shared
-                    for g in range(len(parsed)):
-                        base_g = _grid_array(baselines[g]["metad"][i][1])
-                        summed = summed + (cur[g] - base_g)
-                        total_nd += nd_cur[g] - baselines[g]["metad"][i][0]
-                else:
-                    summed = sum(cur)
-                    total_nd = sum(nd_cur)
-                merged_metad.append((int(total_nd), summed.tobytes()))
-            result["metad"] = merged_metad
-
-        # --- PBMetaD sub-grids: additive (incremental) sum ---
-        if parsed[0]["pbmetad"]:
-            merged_pb = []
-            for bi, subgrids0 in enumerate(parsed[0]["pbmetad"]):
-                merged_subs = []
-                for si, (nd0, g0) in enumerate(subgrids0):
-                    cur = [_grid_array(p["pbmetad"][bi][si][1]) for p in parsed]
-                    nd_cur = [p["pbmetad"][bi][si][0] for p in parsed]
-                    if incremental:
-                        prev_shared = _grid_array(baselines[0]["pbmetad"][bi][si][1])
-                        nd_prev_shared = baselines[0]["pbmetad"][bi][si][0]
-                        summed = prev_shared.copy()
-                        total_nd = nd_prev_shared
-                        for g in range(len(parsed)):
-                            base_g = _grid_array(baselines[g]["pbmetad"][bi][si][1])
-                            summed = summed + (cur[g] - base_g)
-                            total_nd += nd_cur[g] - baselines[g]["pbmetad"][bi][si][0]
-                    else:
-                        summed = sum(cur)
-                        total_nd = sum(nd_cur)
-                    merged_subs.append((int(total_nd), summed.tobytes()))
-                merged_pb.append(merged_subs)
-            result["pbmetad"] = merged_pb
-
-        # --- OPES: union merge of kernel lists + combined Welford stats ---
-        if parsed[0]["opes"]:
-            result["opes"] = BiasStateMerger._merge_opes(parsed, np)
-
-        # --- OPES_EXPANDED: merged independently of OPES (L32) ---
-        if parsed[0]["opes_expanded"]:
-            result["opes_expanded"] = BiasStateMerger._merge_opes_expanded(parsed)
-
-        merged_blob = BiasStateMerger._pack(result)
-
-        # The new baseline for every group is the merged (now shared) state.
-        # Re-parse once so all groups share an identical, independently-owned
-        # baseline dict for the next incremental delta.
-        merged_parsed = BiasStateMerger._parse(merged_blob, force)
-        new_baselines = [merged_parsed for _ in range(len(parsed))]
-        return merged_blob, new_baselines
-
-    # ------------------------------------------------------------------
-    # OPES merge helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _merge_opes(parsed: List[dict], np) -> List[tuple]:
-        """
-        Union-merge the OPES section across all parsed blobs.
-
-        The blob stores, per OPES bias: nk kernels (centers, sigmas,
-        logWeights), a scalar logZ, nSamples, and the per-CV Welford running
-        mean / M2.  This is enough to perform a real merge of *loosely coupled*
-        OPES walkers:
-
-          * kernels: concatenate all walkers' kernel lists (centers, sigmas,
-            logWeights);
-          * nSamples: sum;
-          * runningMean / runningM2: combine pairwise with the parallel
-            (Chan et al.) formula:
-                δ      = meanB − meanA
-                mean   = meanA + δ · nB / (nA + nB)
-                M2     = M2A + M2B + δ² · nA·nB / (nA + nB)
-          * logZ: recomputed as log Σ_k exp(logWeight_k) over the *unioned*
-            kernel set (the normalisation OPES uses), so it stays consistent
-            with the merged kernel list rather than copying one walker's value.
-
-        Walkers that share a common ancestry will list overlapping kernels;
-        this is a union (not de-duplication) merge, which is the standard
-        multi-walker OPES behaviour (each walker's deposits are kept).
-        """
-        n_bias = len(parsed[0]["opes"])
-        merged = []
-        for bi in range(n_bias):
-            # Dimensionality D from the first walker's mean buffer.
-            mean0 = np.frombuffer(bytes(parsed[0]["opes"][bi][3]), dtype="<f8")
-            D = mean0.shape[0]
-
-            centers_parts, sigmas_parts, lw_parts = [], [], []
-            # Pairwise-combined Welford accumulators.
-            n_acc = 0
-            mean_acc = np.zeros(D, dtype="<f8")
-            m2_acc = np.zeros(D, dtype="<f8")
-
-            for p in parsed:
-                (nk, logZ, ns, mean_b, m2_b,
-                 cen_b, sig_b, lw_b) = p["opes"][bi]
-                centers_parts.append(bytes(cen_b))
-                sigmas_parts.append(bytes(sig_b))
-                lw_parts.append(bytes(lw_b))
-
-                mean_g = np.frombuffer(bytes(mean_b), dtype="<f8")
-                m2_g   = np.frombuffer(bytes(m2_b),   dtype="<f8")
-                nB = int(ns)
-                if nB <= 0:
-                    continue
-                if n_acc == 0:
-                    n_acc = nB
-                    mean_acc = mean_g.copy()
-                    m2_acc = m2_g.copy()
-                else:
-                    delta = mean_g - mean_acc
-                    tot = n_acc + nB
-                    mean_acc = mean_acc + delta * (nB / tot)
-                    m2_acc = m2_acc + m2_g + (delta * delta) * (n_acc * nB / tot)
-                    n_acc = tot
-
-            centers_cat = b"".join(centers_parts)
-            sigmas_cat  = b"".join(sigmas_parts)
-            lw_cat      = b"".join(lw_parts)
-            nk_total = sum(p["opes"][bi][0] for p in parsed)
-
-            # Reconcile logZ over the unioned kernel weights:
-            #   logZ = log Σ_k exp(logWeight_k)   (log-sum-exp for stability)
-            if nk_total > 0:
-                lw_all = np.frombuffer(lw_cat, dtype="<f8")
-                m = float(lw_all.max())
-                logZ_merged = m + float(np.log(np.exp(lw_all - m).sum()))
-            else:
-                logZ_merged = float(parsed[0]["opes"][bi][1])
-
-            merged.append((
-                int(nk_total), logZ_merged, int(n_acc),
-                mean_acc.tobytes(), m2_acc.tobytes(),
-                centers_cat, sigmas_cat, lw_cat))
-        return merged
-
-    @staticmethod
-    def _merge_opes_expanded(parsed: List[dict]) -> List[tuple]:
-        """
-        Merge the OPES_EXPANDED section independently of the OPES section (L32).
-
-        Each entry stores (logZ, numUpdates).  numUpdates is summed; logZ is
-        combined in linear space weighted by each walker's numUpdates (a
-        numUpdates-weighted average of exp(logZ)).  Falls back to a plain mean
-        when no walker has positive numUpdates.
-        """
-        import math as _math
-        n_oe = len(parsed[0]["opes_expanded"])
-        merged = []
-        for ei in range(n_oe):
-            entries = [p["opes_expanded"][ei] for p in parsed]
-            total_nu = sum(int(nu) for (_, nu) in entries)
-            if total_nu > 0:
-                # Weighted average of exp(logZ) using a shifted log-sum-exp.
-                logz_vals = [lz for (lz, _) in entries]
-                m = max(logz_vals)
-                acc = 0.0
-                for (lz, nu) in entries:
-                    if nu > 0:
-                        acc += nu * _math.exp(lz - m)
-                logZ_merged = m + _math.log(acc / total_nu)
-            else:
-                logZ_merged = sum(lz for (lz, _) in entries) / len(entries)
-            merged.append((logZ_merged, int(total_nu)))
-        return merged
-
-    @staticmethod
-    def _parse(blob: bytes, force) -> dict:
-        """Parse a getBiasState() blob into a structured dict.
-
-        Parsing is driven by the blob's own count fields (n_opes, n_abmd, ...)
-        and per-entry sizes (nk, n_subgrids, ...).  The force configuration is
-        used only to recover the per-bias dimensionality ``D`` (the number of
-        CVs), which the blob does not store directly.  When the blob's section
-        counts disagree with the force configuration, a clear ValueError is
-        raised rather than silently mis-parsing.
-        """
-        p = [0]   # mutable position
-
-        def read_fmt(fmt):
-            size = struct.calcsize(fmt)
-            val = struct.unpack_from(fmt, blob, p[0])
-            p[0] += size
-            return val
-
-        def read_i32():
-            return read_fmt("<i")[0]
-
-        def read_bytes(n):
-            if p[0] + n > len(blob):
-                raise ValueError(
-                    f"bias-state blob truncated: needed {n} bytes at offset "
-                    f"{p[0]} but only {len(blob) - p[0]} remain")
-            out = blob[p[0]:p[0]+n]
-            p[0] += n
-            return out
-
-        # Header
-        has_header = (len(blob) >= 8 and blob[:4] == b'GPUS')
-        if has_header:
-            p[0] += 4; read_i32()  # version
-
-        # Gather bias configuration from force.  These per-bias dimension lists
-        # are validated against the blob's own counts below.
-        opes_dims, abmd_dims, metad_specs, pbmetad_specs = [], [], [], []
-        eds_dims, maxent_dims, extlag_dims, opes_expanded_count = [], [], [], 0
-        if _GSP_AVAILABLE and force is not None:
-            for i in range(force.getNumBiases()):
-                btype, cv_idxs, params, intparams = force.getBiasParameters(i)
-                D = len(cv_idxs)
-                if btype == gsp.GluedForce.BIAS_OPES:
-                    opes_dims.append(D)
-                elif btype == gsp.GluedForce.BIAS_ABMD:
-                    abmd_dims.append(D)
-                elif btype == gsp.GluedForce.BIAS_METAD:
-                    # Grid size: prod(numBins_d + (0 if isPeriodic else 1))
-                    # intparams layout: [pace, numBins_0, isPeriodic_0, numBins_1, ...]
-                    G = 1
-                    for d in range(D):
-                        nb = intparams[1 + d * 2]
-                        periodic = intparams[2 + d * 2]
-                        G *= (nb if periodic else nb + 1)
-                    metad_specs.append(G)
-                elif btype == gsp.GluedForce.BIAS_PBMETAD:
-                    # PBMetaD: D independent 1D sub-grids
-                    # intparams: [pace, numBins_0, isPeriodic_0, numBins_1, ...]
-                    sub_sizes = []
-                    for d in range(D):
-                        nb = intparams[1 + d * 2]
-                        periodic = intparams[2 + d * 2]
-                        sub_sizes.append(nb if periodic else nb + 1)
-                    pbmetad_specs.append(sub_sizes)
-                elif btype == gsp.GluedForce.BIAS_EDS:
-                    eds_dims.append(D)
-                elif btype == gsp.GluedForce.BIAS_MAXENT:
-                    maxent_dims.append(D)
-                elif btype == gsp.GluedForce.BIAS_EXT_LAGRANGIAN:
-                    extlag_dims.append(D)
-                elif btype == gsp.GluedForce.BIAS_OPES_EXPANDED:
-                    opes_expanded_count += 1
-
-        def _check_count(section, blob_n, config_dims):
-            """Validate the blob's section count against the force config.
-
-            The config list is only consulted when the force was supplied; an
-            empty list means "no force info" and we trust the blob.
-            """
-            if config_dims and blob_n != len(config_dims):
-                raise ValueError(
-                    f"bias-state {section} count mismatch: blob declares "
-                    f"{blob_n} but force config has {len(config_dims)}")
-
-        # Parse OPES section.  Drive iteration off the blob's n_opes, using the
-        # config only to recover D per bias.
-        opes = []
-        n_opes = read_i32()
-        _check_count("OPES", n_opes, opes_dims)
-        for d_i in range(n_opes):
-            D = opes_dims[d_i] if d_i < len(opes_dims) else None
-            nk = read_i32()
-            logZ = read_fmt("<d")[0]
-            ns = read_i32()
-            if D is None:
-                raise ValueError(
-                    "cannot parse OPES bias without force config (need D=numCVs)")
-            mean_bytes = read_bytes(D * 8)
-            m2_bytes   = read_bytes(D * 8)
-            centers_bytes    = read_bytes(nk * D * 8)   # double (M-OPESfloat)
-            sigmas_bytes     = read_bytes(nk * D * 8)
-            logweights_bytes = read_bytes(nk * 8)
-            opes.append((nk, logZ, ns, mean_bytes, m2_bytes,
-                         centers_bytes, sigmas_bytes, logweights_bytes))
-
-        # Parse ABMD section.
-        abmd = []
-        if p[0] < len(blob):
-            n_abmd = read_i32()
-            _check_count("ABMD", n_abmd, abmd_dims)
-            for d_i in range(n_abmd):
-                if d_i >= len(abmd_dims):
-                    raise ValueError(
-                        "cannot parse ABMD bias without force config (need D)")
-                abmd.append(read_bytes(abmd_dims[d_i] * 8))
-
-        # Parse MetaD section.  G (grid size) is recovered from config.
-        metad = []
-        if p[0] < len(blob):
-            n_metad = read_i32()
-            _check_count("MetaD", n_metad, metad_specs)
-            for b_i in range(n_metad):
-                if b_i >= len(metad_specs):
-                    raise ValueError(
-                        "cannot parse MetaD bias without force config (need grid size)")
-                G = metad_specs[b_i]
-                nd = read_i32()
-                grid_bytes = read_bytes(G * 8)
-                metad.append((nd, grid_bytes))
-
-        # Parse PBMetaD section.  Sub-grid count is driven by the blob; sizes
-        # come from config.
-        pbmetad = []
-        if p[0] < len(blob):
-            n_pbmetad = read_i32()
-            _check_count("PBMetaD", n_pbmetad, pbmetad_specs)
-            for b_i in range(n_pbmetad):
-                if b_i >= len(pbmetad_specs):
-                    raise ValueError(
-                        "cannot parse PBMetaD bias without force config (need sub-grid sizes)")
-                sub_sizes = pbmetad_specs[b_i]
-                n_sub = read_i32()
-                if n_sub != len(sub_sizes):
-                    raise ValueError(
-                        f"PBMetaD bias {b_i} sub-grid count mismatch: blob "
-                        f"declares {n_sub} but force config has {len(sub_sizes)}")
-                subs = []
-                for si in range(n_sub):
-                    G = sub_sizes[si]
-                    nd = read_i32()
-                    grid_bytes = read_bytes(G * 8)
-                    subs.append((nd, grid_bytes))
-                pbmetad.append(subs)
-
-        # Stateless count tags.
-        n_external = read_i32() if p[0] < len(blob) else 0
-        n_linear   = read_i32() if p[0] < len(blob) else 0
-        n_wall     = read_i32() if p[0] < len(blob) else 0
-
-        # OPES expanded.  Count driven by blob; validate against config.
-        opes_expanded = []
-        if p[0] < len(blob):
-            n_oe = read_i32()
-            if opes_expanded_count and n_oe != opes_expanded_count:
-                raise ValueError(
-                    f"bias-state OPES_EXPANDED count mismatch: blob declares "
-                    f"{n_oe} but force config has {opes_expanded_count}")
-            for _ in range(n_oe):
-                logZ_oe = read_fmt("<d")[0]
-                nu_oe   = read_i32()
-                opes_expanded.append((logZ_oe, nu_oe))
-
-        # Extended Lagrangian.
-        ext_lag = []
-        if p[0] < len(blob):
-            n_el = read_i32()
-            _check_count("EXT_LAGRANGIAN", n_el, extlag_dims)
-            for d_i in range(n_el):
-                if d_i >= len(extlag_dims):
-                    raise ValueError(
-                        "cannot parse EXT_LAGRANGIAN bias without force config (need D)")
-                D = extlag_dims[d_i]
-                s_bytes = read_bytes(D * 8)
-                p_bytes = read_bytes(D * 8)
-                ext_lag.append((s_bytes, p_bytes))
-
-        # EDS.
-        eds = []
-        if p[0] < len(blob):
-            n_eds = read_i32()
-            _check_count("EDS", n_eds, eds_dims)
-            for d_i in range(n_eds):
-                if d_i >= len(eds_dims):
-                    raise ValueError(
-                        "cannot parse EDS bias without force config (need D)")
-                D = eds_dims[d_i]
-                lam  = read_bytes(D * 8)
-                mean = read_bytes(D * 8)
-                ssd  = read_bytes(D * 8)
-                acc  = read_bytes(D * 8)
-                cnt  = read_bytes(D * 4)
-                eds.append((lam, mean, ssd, acc, cnt))
-
-        # MaxEnt.
-        maxent = []
-        if p[0] < len(blob):
-            n_mx = read_i32()
-            _check_count("MAXENT", n_mx, maxent_dims)
-            for d_i in range(n_mx):
-                if d_i >= len(maxent_dims):
-                    raise ValueError(
-                        "cannot parse MAXENT bias without force config (need D)")
-                maxent.append(read_bytes(maxent_dims[d_i] * 8))
-
-        return dict(
-            opes=opes, abmd=abmd, metad=metad, pbmetad=pbmetad,
-            n_external=n_external, n_linear=n_linear, n_wall=n_wall,
-            opes_expanded=opes_expanded, ext_lag=ext_lag,
-            eds=eds, maxent=maxent
-        )
-
-    @staticmethod
-    def _pack(d: dict) -> bytes:
-        """Repack a parsed dict back into the GPUS binary format."""
-        buf = bytearray()
-
-        def w_bytes(b):
-            buf.extend(b)
-
-        def w_i32(v):
-            buf.extend(struct.pack("<i", v))
-
-        def w_d(v):
-            buf.extend(struct.pack("<d", v))
-
-        # Header.
-        buf.extend(b'GPUS')
-        w_i32(1)  # version
-
-        # OPES.
-        w_i32(len(d["opes"]))
-        for (nk, logZ, ns, mean_b, m2_b, cen_b, sig_b, lw_b) in d["opes"]:
-            w_i32(nk); w_d(logZ); w_i32(ns)
-            w_bytes(mean_b); w_bytes(m2_b)
-            w_bytes(cen_b); w_bytes(sig_b); w_bytes(lw_b)
-
-        # ABMD.
-        w_i32(len(d["abmd"]))
-        for rho_b in d["abmd"]:
-            w_bytes(rho_b)
-
-        # MetaD.
-        w_i32(len(d["metad"]))
-        for (nd, grid_b) in d["metad"]:
-            w_i32(nd); w_bytes(grid_b)
-
-        # PBMetaD.
-        w_i32(len(d["pbmetad"]))
-        for subs in d["pbmetad"]:
-            w_i32(len(subs))
-            for (nd, grid_b) in subs:
-                w_i32(nd); w_bytes(grid_b)
-
-        # Stateless tags.
-        w_i32(d.get("n_external", 0))
-        w_i32(d.get("n_linear", 0))
-        w_i32(d.get("n_wall", 0))
-
-        # OPES expanded.
-        w_i32(len(d["opes_expanded"]))
-        for (logZ_oe, nu_oe) in d["opes_expanded"]:
-            w_d(logZ_oe); w_i32(nu_oe)
-
-        # ExtLag.
-        w_i32(len(d["ext_lag"]))
-        for (s_b, p_b) in d["ext_lag"]:
-            w_bytes(s_b); w_bytes(p_b)
-
-        # EDS.
-        w_i32(len(d["eds"]))
-        for (lam_b, mean_b, ssd_b, acc_b, cnt_b) in d["eds"]:
-            w_bytes(lam_b); w_bytes(mean_b); w_bytes(ssd_b)
-            w_bytes(acc_b); w_bytes(cnt_b)
-
-        # MaxEnt.
-        w_i32(len(d["maxent"]))
-        for lam_b in d["maxent"]:
-            w_bytes(lam_b)
-
-        return bytes(buf)
+        parsed = [BiasStateMerger.parse(b, force) for b in blobs]
+        if baselines is not None and len(baselines) != len(parsed):
+            raise ValueError("one baseline per blob is required")
+        merged = dict(parsed[0])
+        merged["metad"] = [
+            BiasStateMerger.merge_grid_increments(
+                [p["metad"][i] for p in parsed],
+                None if baselines is None else [b["metad"][i] for b in baselines])
+            for i in range(len(merged["metad"]))]
+        merged["pbmetad"] = [
+            [BiasStateMerger.merge_grid_increments(
+                 [p["pbmetad"][i][k] for p in parsed],
+                 None if baselines is None else [b["pbmetad"][i][k] for b in baselines])
+             for k in range(len(sub_grids))]
+            for i, sub_grids in enumerate(merged["pbmetad"])]
+        return BiasStateMerger.pack(merged), [merged] * len(parsed)
 
 
 # ---------------------------------------------------------------------------
@@ -818,54 +440,63 @@ class MultiGPUManager:
 # Scenario C — MultiWalkerPool
 # ---------------------------------------------------------------------------
 
+# Bias types a pool can share: checkpoint section, and whether the state must
+# be passed between walkers one step at a time.
+_SHARED_SECTIONS = {
+    _BIAS_METAD: ("metad", False),
+    _BIAS_PBMETAD: ("pbmetad", False),
+    _BIAS_OPES: ("opes", True),
+    _BIAS_OPES_EXPANDED: ("opes_expanded", True),
+    _BIAS_OPES_MULTITHERMAL: ("multithermal", True),
+}
+
+
 class MultiWalkerPool:
     """
-    Multi-walker ensemble across one or more GPUs.
+    Several walkers (Contexts) sharing one bias, optionally with replica
+    exchange between groups.
 
-    Architecture
-    ~~~~~~~~~~~~
-    *Intra-GPU sharing* (within each GPU group): The first walker in each group
-    is the "group primary".  All other walkers in the group have their bias GPU
-    arrays redirected to the primary's arrays via ``setMultiWalkerPtrs``.
-    Deposits from all walkers in the group land atomically into a single set of
-    GPU arrays — no CPU round-trip within a group.
+    Every walker has its own Context and its own GluedForce built from the same
+    definition. ``walker_groups[g]`` lists the walkers that run on one device;
+    groups step concurrently on worker threads, walkers within a group step in
+    turn. ``bias_index`` selects the shared bias (in ``addBias`` order); all
+    other biases keep a private per-walker history.
 
-    *Cross-GPU merge* (between GPU groups, every ``sync_interval`` steps):
-    The group primaries download their bias state via ``getBiasState()``, the
-    states are merged (additive for MetaD grids, richest-OPES for OPES kernels),
-    and the merged state is uploaded to all group primaries via ``setBiasState()``.
+    How the shared bias is kept consistent depends on its type:
+
+    * **MetaD / PBMetaD** — hills are additive, so each walker deposits into its
+      own grid and every ``sync_interval`` steps the increments accumulated by
+      all walkers since the previous merge are summed and written back to every
+      walker. Between merges a walker does not yet see the others' newest hills,
+      so choose ``sync_interval`` around the deposition pace.
+    * **OPES / OPES-expanded / multithermal** — the state is a compressed kernel
+      table with running statistics that cannot be merged after the fact. The
+      walkers therefore advance one MD step at a time in a fixed order, each
+      starting from the state the previous walker left, and ``sync_interval``
+      only switches sharing on (> 0) or off (0). This is exact but serial: it
+      costs a checkpoint transfer per walker step and no concurrency.
+
+    ``sync_interval=0`` leaves every walker's bias independent, which is what
+    you want for H-REUS windows that only exchange configurations.
 
     Parameters
     ----------
     walker_groups : list of list of mm.Context
-        ``walker_groups[g][w]`` is the OpenMM Context for walker *w* in GPU
-        group *g*.  All walkers within a group must be on the same GPU device.
     force_groups : list of list of GluedForce
-        Matching force objects: ``force_groups[g][w]``.
+        ``force_groups[g][w]`` belongs to ``walker_groups[g][w]``.
     bias_index : int
-        Index of the bias to share (0-based, in registration order).
+        Index of the bias to share.
     sync_interval : int
-        Steps between cross-GPU bias-state merges.  Set to 0 to disable
-        cross-GPU merging (useful when each GPU group is a fully independent
-        replica and you want no shared bias at all).
+        Steps between grid merges (MetaD/PBMetaD); 0 disables sharing.
     sync_mode : str
-        "additive" (default) — merge MetaD grids by element-wise sum.
-        "broadcast" — copy group-primary-0's state to all other primaries.
+        "additive" (default) merges grid increments; "broadcast" copies group 0's
+        grid to everyone instead.
     re_mode : str or None
-        If not None, also drive H-REUS or T-REMD between the group primaries
-        after every ``re_interval`` steps.  Uses one replica per group (the
-        group primary).  See :class:`ReplicaExchange` for criteria.
-    re_interval : int
-        Steps between replica exchange attempts (ignored if re_mode is None).
-    kT : float
-        Thermal energy in kJ/mol — required for H-REUS.
-    temperatures : list of float
-        Temperatures in K — required for T-REMD, one per group.
-    bias_force_group : int or None
-        OpenMM force group of the bias force — required for T-REMD to isolate
-        MM energy from bias energy.
-    seed : int or None
-        RNG seed.
+        "H-REUS" or "T-REMD" to also attempt exchanges between the first walker
+        of each group every ``re_interval`` steps. See :class:`ReplicaExchange`.
+    kT, temperatures, bias_force_group, seed
+        As for :class:`ReplicaExchange`. ``bias_force_group`` is accepted for
+        backward compatibility; the acceptance test uses complete energies.
     """
 
     _GAS_CONSTANT = 8.314462618e-3   # kJ mol⁻¹ K⁻¹
@@ -884,90 +515,104 @@ class MultiWalkerPool:
         bias_force_group: Optional[int] = None,
         seed: Optional[int] = None,
     ):
-        if len(walker_groups) != len(force_groups):
-            raise ValueError("walker_groups and force_groups must have the same length")
+        if len(walker_groups) != len(force_groups) or not walker_groups:
+            raise ValueError("walker_groups and force_groups must be nonempty and the same length")
         for g, (wg, fg) in enumerate(zip(walker_groups, force_groups)):
-            if len(wg) != len(fg):
-                raise ValueError(f"Group {g}: len(contexts)={len(wg)} != len(forces)={len(fg)}")
-            if len(wg) == 0:
-                raise ValueError(f"Group {g} has no walkers")
+            if len(wg) != len(fg) or not wg:
+                raise ValueError(f"Group {g}: needs one force per walker and at least one walker")
+        if not isinstance(sync_interval, int) or sync_interval < 0:
+            raise ValueError("sync_interval must be a nonnegative integer")
+        if sync_mode not in ("additive", "broadcast"):
+            raise ValueError("sync_mode must be 'additive' or 'broadcast'")
 
-        self._groups = list(walker_groups)
-        self._forces = list(force_groups)
+        self._groups = [list(wg) for wg in walker_groups]
+        self._forces = [list(fg) for fg in force_groups]
+        self._walkers = [(ctx, force) for wg, fg in zip(self._groups, self._forces)
+                         for ctx, force in zip(wg, fg)]
         self._bias_index = bias_index
         self._sync_interval = sync_interval
         self._sync_mode = sync_mode
         self._re_mode = re_mode.upper() if re_mode else None
         self._re_interval = re_interval
-        self._kT = kT
         self._temperatures = list(temperatures) if temperatures else []
-        self._bias_group = bias_force_group
         self._rng = random.Random(seed)
+        self._elapsed = 0   # MD steps run through this pool so far
 
-        # RE statistics (between group primaries).
         self._re_attempts = 0
         self._re_accepted = 0
-        self._pair_attempts: Dict[Tuple[int,int], int] = defaultdict(int)
-        self._pair_accepted: Dict[Tuple[int,int], int] = defaultdict(int)
+        self._pair_attempts: Dict[Tuple[int, int], int] = defaultdict(int)
+        self._pair_accepted: Dict[Tuple[int, int], int] = defaultdict(int)
 
-        # Per-group last-synced baseline (parsed bias state) for the incremental
-        # additive merge.  None until the first sync establishes a shared grid.
-        self._sync_baselines = None
-
-        # Thread pool for true per-GPU parallel stepping.  Separate OpenMM
-        # Contexts on distinct devices are independent, and Integrator.step()
-        # releases the GIL during the C++/GPU computation, so one thread per GPU
-        # group steps the groups concurrently (real GPU-count speedup).  A pool
-        # is created only when there is more than one group.
-        self._executor = None
-        if len(self._groups) > 1:
-            self._executor = ThreadPoolExecutor(
-                max_workers=len(self._groups),
-                thread_name_prefix="glued-walker-group")
-
-        # Validate RE parameters.
         if self._re_mode == "H-REUS":
-            if kT is None:
-                raise ValueError("H-REUS requires kT")
+            if kT is None or not math.isfinite(kT) or kT <= 0:
+                raise ValueError("H-REUS requires a positive kT")
             self._betas = [1.0 / kT] * len(self._groups)
         elif self._re_mode == "T-REMD":
-            if not self._temperatures or len(self._temperatures) != len(self._groups):
-                raise ValueError("T-REMD requires temperatures list, one per group")
+            if len(self._temperatures) != len(self._groups):
+                raise ValueError("T-REMD requires one temperature per group")
+            if any(not math.isfinite(t) or t <= 0 for t in self._temperatures):
+                raise ValueError("replica temperatures must be finite and positive")
             self._betas = [1.0 / (self._GAS_CONSTANT * T) for T in self._temperatures]
         elif self._re_mode is None:
             self._betas = []
         else:
             raise ValueError(f"Unknown re_mode '{re_mode}'; use 'H-REUS', 'T-REMD', or None")
+        if self._re_mode is not None and (not isinstance(re_interval, int) or re_interval <= 0):
+            raise ValueError("re_interval must be a positive integer")
 
-        # Wire intra-GPU shared GPU arrays.
-        self._setup_intra_gpu_sharing()
+        # Groups on distinct devices step concurrently: Integrator.step() releases
+        # the GIL during the GPU computation.
+        self._executor = None
+        if len(self._groups) > 1:
+            self._executor = ThreadPoolExecutor(
+                max_workers=len(self._groups), thread_name_prefix="glued-walker-group")
+
+        self._setup_sharing()
 
     # ------------------------------------------------------------------
-    # Setup
+    # Shared-state plumbing
     # ------------------------------------------------------------------
 
-    def _setup_intra_gpu_sharing(self):
-        """
-        Wire setMultiWalkerPtrs so all secondary walkers within each GPU group
-        point to the group primary's bias GPU arrays.
+    def _setup_sharing(self):
+        """Check the walkers agree on the shared bias and record the starting state."""
+        self._sharing = self._sync_interval > 0
+        if not self._sharing:
+            return
+        reference = self._walkers[0][1].getBiasParameters(self._bias_index)
+        for _, force in self._walkers:
+            if force.getBiasParameters(self._bias_index) != reference:
+                raise ValueError("every walker must define the shared bias identically")
+        btype = reference[0]
+        if btype not in _SHARED_SECTIONS:
+            raise ValueError("the shared bias must be MetaD, PBMetaD, OPES, "
+                             "OPES-expanded or multithermal")
+        self._section, self._ordered = _SHARED_SECTIONS[btype]
+        # Position of the shared bias within its section (biases of one type
+        # are stored together, in registration order).
+        self._local = sum(self._walkers[0][1].getBiasParameters(i)[0] == btype
+                          for i in range(self._bias_index))
 
-        This is called once during __init__.  It requires that all contexts in
-        a group are already created and on the same GPU device.
-        """
-        for g, (wg, fg) in enumerate(zip(self._groups, self._forces)):
-            if len(wg) < 2:
-                continue  # single walker — nothing to wire
-            primary_ctx   = wg[0]
-            primary_force = fg[0]
-            try:
-                ptrs = primary_force.getMultiWalkerPtrs(primary_ctx, self._bias_index)
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Group {g}: getMultiWalkerPtrs failed — ensure this is the CUDA "
-                    f"platform and bias_index={self._bias_index} is valid."
-                ) from exc
-            for w in range(1, len(wg)):
-                fg[w].setMultiWalkerPtrs(wg[w], self._bias_index, ptrs)
+        # Walkers may differ in their other biases (e.g. H-REUS windows), but
+        # the shared bias must start out identical everywhere.
+        states = [self._state(ctx, force) for ctx, force in self._walkers]
+        if any(self._selected(s) != self._selected(states[0]) for s in states):
+            raise ValueError("walkers must start from the same shared bias state")
+        # For grids: the entry each walker last received (increments are measured
+        # against it). For ordered biases: the single live state.
+        self._shared = self._selected(states[0])
+
+    @staticmethod
+    def _state(ctx, force) -> dict:
+        return BiasStateMerger.parse(force.getBiasState(ctx), force)
+
+    def _selected(self, state: dict):
+        return state[self._section][self._local]
+
+    def _write_selected(self, entry, ctx, force):
+        """Replace only the shared bias in a walker; its other biases stay as they are."""
+        state = self._state(ctx, force)
+        state[self._section][self._local] = entry
+        force.setBiasState(BiasStateMerger.pack(state), ctx)
 
     # ------------------------------------------------------------------
     # Run
@@ -975,142 +620,108 @@ class MultiWalkerPool:
 
     def run(self, n_steps: int, steps_per_sync: Optional[int] = None):
         """
-        Run *n_steps* MD steps across all walkers.
+        Advance all walkers by ``n_steps`` MD steps.
 
-        All walkers in every group are advanced in lockstep.  Cross-GPU bias
-        merge happens every ``sync_interval`` steps.  Replica exchange (if
-        configured) happens every ``re_interval`` steps.
-
-        Parameters
-        ----------
-        n_steps : int
-            Total MD steps to run.
-        steps_per_sync : int, optional
-            Override ``sync_interval`` for this call only.
+        Merges and exchange attempts fall on absolute multiples of their
+        intervals counted from the pool's creation, so repeated short calls
+        keep the same schedule as one long call. ``steps_per_sync`` overrides
+        ``sync_interval`` for this call.
         """
-        sync_every = steps_per_sync if steps_per_sync is not None else self._sync_interval
-        if sync_every <= 0:
-            sync_every = n_steps + 1  # never sync
+        if not isinstance(n_steps, int) or n_steps < 0:
+            raise ValueError("n_steps must be a nonnegative integer")
+        sync_every = self._sync_interval if steps_per_sync is None else steps_per_sync
+        if not isinstance(sync_every, int) or sync_every < 0:
+            raise ValueError("steps_per_sync must be a nonnegative integer")
+        if bool(sync_every) != self._sharing:
+            raise ValueError("bias sharing cannot be switched on or off after construction")
+        merges = sync_every if (self._sharing and not self._ordered) else 0
+        exchanges = self._re_interval if self._re_mode else 0
 
-        # Determine the step size per inner loop iteration.
-        inner = sync_every
-        if self._re_mode is not None:
-            inner = min(inner, self._re_interval)
-        if inner <= 0:
-            inner = 1
+        def next_multiple(interval):
+            return (self._elapsed // interval + 1) * interval
 
-        steps_done = 0
-        steps_since_sync = 0
-        steps_since_re   = 0
-
-        while steps_done < n_steps:
-            batch = min(inner, n_steps - steps_done)
-            self._step_all(batch)
-            steps_done    += batch
-            steps_since_sync += batch
-            steps_since_re   += batch
-
-            if sync_every <= n_steps and steps_since_sync >= sync_every:
+        end = self._elapsed + n_steps
+        while self._elapsed < end:
+            deadline = end
+            if merges:
+                deadline = min(deadline, next_multiple(merges))
+            if exchanges:
+                deadline = min(deadline, next_multiple(exchanges))
+            self._step_all(deadline - self._elapsed)
+            self._elapsed = deadline
+            if merges and self._elapsed % merges == 0:
                 self._sync_bias()
-                steps_since_sync = 0
-
-            if self._re_mode is not None and steps_since_re >= self._re_interval:
+            if exchanges and self._elapsed % exchanges == 0:
                 self._attempt_re_swaps()
-                steps_since_re = 0
-
-    # ------------------------------------------------------------------
-    # Step
-    # ------------------------------------------------------------------
 
     def _step_all(self, n: int):
-        """Advance all walkers in all groups by n MD steps.
+        if self._sharing and self._ordered:
+            # One shared history: each walker steps from the state the previous
+            # walker left, one MD step at a time.
+            state = self._shared
+            for _ in range(n):
+                for ctx, force in self._walkers:
+                    self._write_selected(state, ctx, force)
+                    ctx.getIntegrator().step(1)
+                    state = self._selected(self._state(ctx, force))
+            self._shared = state
+            for ctx, force in self._walkers[:-1]:
+                self._write_selected(state, ctx, force)
+            return
 
-        Each GPU group runs on its own worker thread so groups on distinct
-        devices advance concurrently (Integrator.step() releases the GIL during
-        the GPU computation).  Within a group walkers share one device and are
-        stepped serially.  With a single group, runs inline (no threads).
-        """
-        def _step_group(wg):
-            for ctx in wg:
+        def step_group(walkers):
+            for ctx in walkers:
                 ctx.getIntegrator().step(n)
 
         if self._executor is None:
-            for wg in self._groups:
-                _step_group(wg)
+            step_group(self._groups[0])
             return
-
-        # Submit one task per GPU group and wait for all to finish.  Re-raise
-        # the first exception (if any) after every group has completed.
-        futures = [self._executor.submit(_step_group, wg) for wg in self._groups]
-        first_exc = None
-        for fut in futures:
+        futures = [self._executor.submit(step_group, wg) for wg in self._groups]
+        errors = []
+        for future in futures:
             try:
-                fut.result()
-            except Exception as exc:  # noqa: BLE001 — collect then re-raise
-                if first_exc is None:
-                    first_exc = exc
-        if first_exc is not None:
-            raise first_exc
+                future.result()
+            except Exception as exc:  # noqa: BLE001 — collect, then re-raise the first
+                errors.append(exc)
+        if errors:
+            raise errors[0]
 
     def close(self):
-        """Shut down the per-GPU stepping thread pool.
-
-        Optional — the pool is also released when the object is garbage
-        collected.  Provided so callers can deterministically free threads.
-        """
+        """Shut down the per-group stepping thread pool."""
         if self._executor is not None:
             self._executor.shutdown(wait=True)
             self._executor = None
 
-    def __del__(self):
-        # Best-effort cleanup; never raise from a finaliser.
-        try:
-            self.close()
-        except Exception:
-            pass
-
     # ------------------------------------------------------------------
-    # Cross-GPU bias sync
+    # Grid merging
     # ------------------------------------------------------------------
 
     def _sync_bias(self):
-        """Merge bias states across GPU groups and broadcast the result.
-
-        The additive merge is *incremental*: only the per-group delta since the
-        last sync is folded into the shared grid, so already-shared bias is not
-        re-added each cycle.  Per-group baselines are cached in
-        ``self._sync_baselines`` (see
-        :meth:`BiasStateMerger.merge_additive_incremental`).
-        """
-        if len(self._groups) < 2:
-            return  # nothing to merge for a single group
-
-        # Collect bias states from group primaries.
-        primary_forces = [fg[0] for fg in self._forces]
-        blobs = [bytes(f.getBiasState()) for f in primary_forces]
-
-        if self._sync_mode == "additive":
-            # Representative force for configuration lookup.
-            ref_force = primary_forces[0]
-            try:
-                merged, self._sync_baselines = \
-                    BiasStateMerger.merge_additive_incremental(
-                        blobs, ref_force, baselines=self._sync_baselines)
-            except Exception as exc:
-                warnings.warn(
-                    f"Additive bias merge failed ({exc}); falling back to broadcast.",
-                    stacklevel=2)
-                merged = blobs[0]
-                # Reset baselines: after a fallback broadcast every group starts
-                # from the broadcast state, so a stale incremental baseline would
-                # be wrong.  Force a fresh full-sum on the next successful sync.
-                self._sync_baselines = None
+        """Merge every walker's grid increments and give all walkers the result."""
+        entries = [self._selected(self._state(ctx, force)) for ctx, force in self._walkers]
+        if self._sync_mode == "broadcast":
+            merged = entries[0]
         else:
-            merged = blobs[0]
+            baselines = [self._shared] * len(entries)
+            if self._section == "metad":
+                merged = BiasStateMerger.merge_grid_increments(entries, baselines)
+            else:
+                merged = [BiasStateMerger.merge_grid_increments(
+                              [e[k] for e in entries], [b[k] for b in baselines])
+                          for k in range(len(entries[0]))]
+        self._broadcast(merged)
 
-        # Upload merged state to all group primaries.
-        for f in primary_forces:
-            f.setBiasState(merged)
+    def _broadcast(self, entry):
+        for ctx, force in self._walkers:
+            self._write_selected(entry, ctx, force)
+        self._shared = entry
+
+    def sync_bias_state_from(self, source_group: int):
+        """Replace every walker's shared bias with group ``source_group``'s copy."""
+        if not self._sharing:
+            raise ValueError("bias sharing is disabled for this pool")
+        ctx, force = self._groups[source_group][0], self._forces[source_group][0]
+        self._broadcast(self._selected(self._state(ctx, force)))
 
     # ------------------------------------------------------------------
     # Replica exchange between group primaries
@@ -1121,13 +732,10 @@ class MultiWalkerPool:
         n = len(self._groups)
         if n < 2:
             return
-
         # Alternating even/odd pairs.
         parity = self._rng.randint(0, 1)
-        pairs  = [(i, i + 1) for i in range(parity, n - 1, 2)]
-
-        for i, j in pairs:
-            self._attempt_swap(i, j)
+        for i in range(parity, n - 1, 2):
+            self._attempt_swap(i, i + 1)
 
     def _attempt_swap(self, i: int, j: int):
         ctx_i = self._groups[i][0]
@@ -1136,91 +744,36 @@ class MultiWalkerPool:
 
         si = ctx_i.getState(getPositions=True, getVelocities=True, getEnergy=True)
         sj = ctx_j.getState(getPositions=True, getVelocities=True, getEnergy=True)
-
         x_i = si.getPositions(asNumpy=True)
         x_j = sj.getPositions(asNumpy=True)
         v_i = si.getVelocities(asNumpy=True)
         v_j = sj.getVelocities(asNumpy=True)
-
-        # H35: capture each replica's periodic box vectors so they travel with
-        # the configuration on an accepted swap (and so foreign-position energy
-        # evaluations use the matching box).  Use the plain (list-of-Vec3) form
-        # so the three vectors unpack cleanly into setPeriodicBoxVectors(a,b,c).
+        # Box vectors travel with the configuration (they differ under NPT).
         box_i = si.getPeriodicBoxVectors()
         box_j = sj.getPeriodicBoxVectors()
 
-        if self._re_mode == "H-REUS":
-            E_ii = si.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-            E_jj = sj.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-
-            # H36: evaluate each foreign configuration with try/finally so the
-            # original positions (and box) are always restored even if the
-            # energy evaluation raises.  H35: set the foreign box alongside the
-            # foreign positions, then restore both.
-            try:
-                ctx_i.setPeriodicBoxVectors(*box_j)
-                ctx_i.setPositions(x_j)
-                E_ij = _total_energy_kJ(ctx_i)
-            finally:
-                ctx_i.setPeriodicBoxVectors(*box_i)
-                ctx_i.setPositions(x_i)
-            try:
-                ctx_j.setPeriodicBoxVectors(*box_i)
-                ctx_j.setPositions(x_i)
-                E_ji = _total_energy_kJ(ctx_j)
-            finally:
-                ctx_j.setPeriodicBoxVectors(*box_j)
-                ctx_j.setPositions(x_j)
-
-            delta     = -beta_i * (E_ij + E_ji - E_ii - E_jj)
-            v_i_new, v_j_new = v_j, v_i
-
-        else:  # T-REMD
-            # L30: the T-REMD criterion only needs each replica's *own* energy
-            # at its own configuration.  Compute it directly from the captured
-            # State (no foreign positions set), so there are never pending
-            # foreign-position side effects to leave stale.
-            if self._bias_group is not None:
-                # Isolate MM energy from bias energy.  Both reads are at the
-                # replica's current (own) configuration; wrap in try/finally as
-                # a safety net even though no positions are being swapped here.
-                try:
-                    U_ii = (_total_energy_kJ(ctx_i)
-                            - _group_energy_kJ(ctx_i, 1 << self._bias_group))
-                    U_jj = (_total_energy_kJ(ctx_j)
-                            - _group_energy_kJ(ctx_j, 1 << self._bias_group))
-                finally:
-                    # No positions were changed; restoring is a no-op safeguard
-                    # that also guarantees a consistent state if a read failed.
-                    ctx_i.setPositions(x_i)
-                    ctx_j.setPositions(x_j)
-            else:
-                U_ii = si.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-                U_jj = sj.getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
-
-            delta = (beta_i - beta_j) * (U_ii - U_jj)
-            Ti, Tj = self._temperatures[i], self._temperatures[j]
-            v_i_new = v_j * math.sqrt(Ti / Tj)
-            v_j_new = v_i * math.sqrt(Tj / Ti)
+        delta = exchange_log_acceptance(ctx_i, ctx_j, si, sj, beta_i, beta_j)
+        scale = math.sqrt(beta_j / beta_i)   # velocity rescaling between temperatures
+        v_i_new, v_j_new = v_j * scale, v_i / scale
 
         key = (min(i, j), max(i, j))
-        self._pair_attempts[key]  += 1
-        self._re_attempts         += 1
+        self._pair_attempts[key] += 1
+        self._re_attempts += 1
 
-        accepted = delta >= 0.0 or self._rng.random() < math.exp(min(0.0, delta))
+        accepted = delta >= 0.0 or self._rng.random() < math.exp(delta)
         if accepted:
-            self._re_accepted          += 1
-            self._pair_accepted[key]   += 1
-            # H35: box vectors travel with the configuration.
+            self._re_accepted += 1
+            self._pair_accepted[key] += 1
             ctx_i.setPeriodicBoxVectors(*box_j)
-            ctx_i.setPositions(x_j);  ctx_i.setVelocities(v_i_new)
+            ctx_i.setPositions(x_j)
+            ctx_i.setVelocities(v_i_new)
             ctx_j.setPeriodicBoxVectors(*box_i)
-            ctx_j.setPositions(x_i);  ctx_j.setVelocities(v_j_new)
-
+            ctx_j.setPositions(x_i)
+            ctx_j.setVelocities(v_j_new)
         return accepted
 
     # ------------------------------------------------------------------
-    # Statistics
+    # Statistics and convenience
     # ------------------------------------------------------------------
 
     @property
@@ -1246,23 +799,10 @@ class MultiWalkerPool:
 
     @property
     def total_walkers(self) -> int:
-        return sum(len(wg) for wg in self._groups)
-
-    # ------------------------------------------------------------------
-    # Convenience: forward-compatible with ReplicaExchange protocol
-    # ------------------------------------------------------------------
-
-    def sync_bias_state_from(self, source_group: int):
-        """Broadcast bias state from group *source_group* to all others."""
-        _, f_src = self._forces[source_group][0], self._forces[source_group][0]
-        f_src = self._forces[source_group][0]
-        blob = f_src.getBiasState()
-        for g, fg in enumerate(self._forces):
-            if g != source_group:
-                fg[0].setBiasState(blob)
+        return len(self._walkers)
 
     def get_cv_values(self, group: int = 0, walker: int = 0) -> List[float]:
         """Return current CV values for a specific walker."""
-        ctx   = self._groups[group][walker]
+        ctx = self._groups[group][walker]
         force = self._forces[group][walker]
         return list(force.getCurrentCVValues(ctx))

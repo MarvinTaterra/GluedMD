@@ -20,8 +20,8 @@ namespace GluedPlugin {
  * Key design constraints:
  * - Inherits ForceImpl directly (NOT CustomCPPForceImpl) so that all computation
  *   stays on the GPU without a CPU↔GPU round-trip.
- * - The lastStepIndex_ guard in updateContextState() ensures bias deposition
- *   fires exactly once per step even when execute() is called multiple times.
+ * - The lastStepIndex_ guard in updateContextState() ensures bias history is
+ *   committed exactly once per step even when execute() is called multiple times.
  */
 class OPENMM_EXPORT_GLUED GluedForceImpl : public OpenMM::ForceImpl {
 public:
@@ -63,14 +63,11 @@ public:
     // of length numKernels * numCVsBias, row-major: kernel index outer).
     std::vector<float> getKernelSigmas(int biasIndex);
 
-    // Multiwalker B2: get shared GPU array pointers from primary, or redirect to primary's arrays.
-    std::vector<long long> getMultiWalkerPtrs(int biasType, int localIdx);
-    void redirectToPrimaryBias(int biasType, int localIdx, const std::vector<long long>& ptrs);
-
 private:
     const GluedForce& owner_;
     OpenMM::Kernel kernel_;
-    int lastStepIndex_ = -1;
+    OpenMM::ContextImpl* context_ = nullptr;
+    long long lastStepIndex_ = -1;
 
     // CV_ENERGY (OPES multithermal): a linked inner Context holding a clone of the
     // System's forces EXCEPT this GluedForce, used to evaluate the unbiased total PE

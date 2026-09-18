@@ -157,10 +157,10 @@ def test_multiple_biases():
     f.addCollectiveVariable(gp.GluedForce.CV_DISTANCE, av, mm.vectord())
     cvi = mm.vectori(); cvi.append(0)
     pv1 = mm.vectord(); pv1.append(0.5); pv1.append(200.0)
-    pv2 = mm.vectord(); pv2.append(0.8); pv2.append(300.0); pv2.append(0.05)
+    pv2 = mm.vectord([0.8, 0.05, 10.0, 2.479, 0.0, 2.0])
     iv = mm.vectori()
     f.addBias(gp.GluedForce.BIAS_HARMONIC, cvi, pv1, iv)
-    f.addBias(gp.GluedForce.BIAS_METAD, cvi, pv2, iv)
+    f.addBias(gp.GluedForce.BIAS_METAD, cvi, pv2, mm.vectori([10, 50, 0]))
     rt, _ = _roundtrip(f)
     assert rt.getNumBiases() == 2
     _check_bias(f, rt, 0)

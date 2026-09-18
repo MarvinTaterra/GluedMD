@@ -3,6 +3,7 @@
 #include "openmm/serialization/SerializationNode.h"
 #include "openmm/OpenMMException.h"
 #include <string>
+#include <memory>
 #include <vector>
 
 using namespace OpenMM;
@@ -18,6 +19,7 @@ void GluedForceProxy::serialize(const void* object,
     const auto& force = *reinterpret_cast<const GluedForce*>(object);
 
     node.setIntProperty("forceGroup", force.getForceGroup());
+    node.setStringProperty("name", force.getName());
     node.setDoubleProperty("temperature", force.getTemperature());
     node.setBoolProperty("usesPBC", force.usesPeriodicBoundaryConditions());
 
@@ -82,9 +84,15 @@ void* GluedForceProxy::deserialize(const SerializationNode& node) const {
     if (node.getIntProperty("version") != 1)
         throw OpenMMException("GluedForceProxy: unsupported format version");
 
-    auto* force = new GluedForce();
+    auto force = std::unique_ptr<GluedForce>(new GluedForce());
+    force->setName(node.getStringProperty("name", "GluedForce"));
+    // Reject absurd counts before they turn into huge allocations.
+    auto validCount = [](int n) {
+        if (n < 0 || n > 10000000)
+            throw OpenMMException("GluedForceProxy: invalid array size");
+    };
     force->setForceGroup(node.getIntProperty("forceGroup", 0));
-    force->setTemperature(node.getDoubleProperty("temperature", -1.0));
+    force->setTemperature(node.getDoubleProperty("temperature", 300.0));
     force->setUsesPeriodicBoundaryConditions(node.getBoolProperty("usesPBC", false));
 
     // --- Collective variables ---
@@ -92,11 +100,13 @@ void* GluedForceProxy::deserialize(const SerializationNode& node) const {
     for (const SerializationNode& cvNode : cvsNode.getChildren()) {
         int type = cvNode.getIntProperty("type");
         int numAtoms = cvNode.getIntProperty("numAtoms");
+        validCount(numAtoms);
         vector<int> atoms(numAtoms);
         for (int j = 0; j < numAtoms; ++j)
             atoms[j] = cvNode.getIntProperty("atom" + to_string(j));
 
         int numParams = cvNode.getIntProperty("numParams");
+        validCount(numParams);
         vector<double> params(numParams);
         for (int j = 0; j < numParams; ++j)
             params[j] = cvNode.getDoubleProperty("param" + to_string(j));
@@ -117,16 +127,19 @@ void* GluedForceProxy::deserialize(const SerializationNode& node) const {
     for (const SerializationNode& biasNode : biasesNode.getChildren()) {
         int type = biasNode.getIntProperty("type");
         int numCVs = biasNode.getIntProperty("numCVs");
+        validCount(numCVs);
         vector<int> cvIndices(numCVs);
         for (int j = 0; j < numCVs; ++j)
             cvIndices[j] = biasNode.getIntProperty("cv" + to_string(j));
 
         int numParams = biasNode.getIntProperty("numParams");
+        validCount(numParams);
         vector<double> params(numParams);
         for (int j = 0; j < numParams; ++j)
             params[j] = biasNode.getDoubleProperty("param" + to_string(j));
 
         int numIntParams = biasNode.getIntProperty("numIntParams");
+        validCount(numIntParams);
         vector<int> intParams(numIntParams);
         for (int j = 0; j < numIntParams; ++j)
             intParams[j] = biasNode.getIntProperty("intParam" + to_string(j));
@@ -134,5 +147,5 @@ void* GluedForceProxy::deserialize(const SerializationNode& node) const {
         force->addBias(type, cvIndices, params, intParams);
     }
 
-    return force;
+    return force.release();
 }

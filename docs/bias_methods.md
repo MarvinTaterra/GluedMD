@@ -69,8 +69,8 @@ Well-tempered Metadynamics. Deposits Gaussian hills on a fixed grid at regular i
 
 where `h_eff = height * exp[−V(s) / (kT*(γ−1))]` (well-tempering).
 
-| `parameters` | `[height, sigma_0, gamma, kT, origin_0, max_0, sigma_1, origin_1, max_1, ...]` — hill height (kJ/mol), sigma per CV (same units as CV), biasfactor γ, thermal energy kT (kJ/mol), then grid bounds per CV |
-| `integerParameters` | `[pace, numBins_0, isPeriodic_0, numBins_1, isPeriodic_1, ...]` — deposition interval (steps), grid bins and periodicity per CV |
+| `parameters` | `[height, sigma_0, ..., sigma_D-1, gamma, kT, origin_0, ..., origin_D-1, max_0, ..., max_D-1]` — grouped sigmas and grid bounds (1–3 CVs) |
+| `integerParameters` | `[pace, numBins_0, ..., numBins_D-1, isPeriodic_0, ..., isPeriodic_D-1]` — grouped bin counts then periodicity flags |
 
 ```python
 force.add_metad(phi_idx, sigma=0.35, height=1.0, pace=500,
@@ -78,7 +78,7 @@ force.add_metad(phi_idx, sigma=0.35, height=1.0, pace=500,
                 bins=360, periodic=True, gamma=15.0)
 ```
 
-Set `gamma=None` or a very large value (e.g., 1e6) to recover non-tempered MetaD.
+Set `gamma=None` for non-tempered MetaD (raw gamma=0); gamma=1 also disables tempering. PBMetaD retains its separate interleaved parameter layout. Outside nonperiodic grid bounds, energy is clamped and its derivative is zero.
 
 ---
 
@@ -359,4 +359,4 @@ blob = force.getBiasState()   # returns Python bytes
 force.setBiasState(blob)
 ```
 
-The binary format includes a `GLUED` magic header and version byte so that stale blobs are detected and rejected.
+The blob carries a `GPUS` magic header, a version integer and a hash of the force configuration, so stale or mismatched blobs are rejected rather than partially applied. Pass the Context explicitly (`getBiasState(ctx)`, `setBiasState(blob, ctx)`) when a System is shared by several Contexts.

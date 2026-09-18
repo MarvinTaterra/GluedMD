@@ -860,7 +860,7 @@ void CommonCalcGluedForceKernel::compileCVKernels(const GluedForce& force) {
  if (cvType == GluedForce::CV_PYTORCH) {
  string modelPath = force.getPyTorchCVModelPath(i);
  auto* module = new torch::jit::script::Module(
- torch::jit::load(modelPath));
+ torch::jit::load(modelPath, torch::kCPU));
  module->eval();
  pytorchCVPlans_[ptIdx].model = shared_ptr<void>(module,
  [](void* p) {

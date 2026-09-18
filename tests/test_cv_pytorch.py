@@ -17,6 +17,8 @@ import sys
 import math
 import os
 import tempfile
+import pytest
+pytest.importorskip("torch", reason="Torch runtime is optional")
 
 CUDA_PLATFORM = "CUDA"
 TOL = 1e-4

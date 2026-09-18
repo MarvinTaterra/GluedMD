@@ -12,6 +12,9 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <iomanip>
+#include <limits>
+#include <sstream>
 #include <string>
 
 #ifdef GLUED_HAS_TORCH
@@ -704,17 +707,18 @@ KERNEL void cvPath(
  // Cache atom positions once to avoid N re-loads of posq per atom in Pass 1,
  // and to eliminate posq loads entirely in Pass 2.
  bool useAtomCache = (M <= MAX_PATH_ATOMS);
- float cPx[MAX_PATH_ATOMS], cPy[MAX_PATH_ATOMS], cPz[MAX_PATH_ATOMS];
+ real cPx[MAX_PATH_ATOMS], cPy[MAX_PATH_ATOMS], cPz[MAX_PATH_ATOMS];
  if (useAtomCache) {
  for (int j = 0; j < M; j++) {
   real4 p = posq[atoms[aStart + j]];
-  cPx[j] = (float)p.x; cPy[j] = (float)p.y; cPz[j] = (float)p.z;
+  cPx[j] = p.x; cPy[j] = p.y; cPz[j] = p.z;
  }
  }
 
  // Pass 1: compute per-frame RMSD², cache weights w[f]
  // Frames are 1-indexed (k=1..N) per Branduardi et al. (2007) convention.
- float wBuf[MAX_PATH_FRAMES];
+ real wBuf[MAX_PATH_FRAMES];
+ real minDistance = (real)1e30;
  real S = (real)0, sNum = (real)0;
  for (int f = 0; f < N; f++) {
  real rmsd2 = (real)0;
@@ -732,14 +736,18 @@ KERNEL void cvPath(
  rmsd2 += dx*dx + dy*dy + dz*dz;
  }
  rmsd2 /= (real)M;
- real w = exp(-lambda * rmsd2);
- wBuf[f] = (float)w;
+ wBuf[f] = rmsd2;
+ minDistance = min(minDistance, rmsd2);
+ }
+ for (int f = 0; f < N; f++) {
+ real w = exp(-lambda * (wBuf[f] - minDistance));
+ wBuf[f] = w;
  S += w;
  sNum += (real)(f + 1) * w;
  }
- real invS = (S > (real)1e-300) ? ((real)1.0 / S) : (real)0.0;
+ real invS = (real)1.0 / S;
  real s = sNum * invS;
- real z = (S > (real)1e-300) ? (-log(S) / lambda) : (real)0.0;
+ real z = minDistance - log(S) / lambda;
 
  cvValues[cvIdxS] = (double)s;
  cvValues[cvIdxZ] = (double)z;
@@ -2636,6 +2644,13 @@ KERNEL void wallEvalBias(
 // ---------------------------------------------------------------------------
 extern const string kOPESKernelSrc = kAtomicAddShim + R"(
 #define MAX_OPES_CVS 16
+DEVICE double opesDelta(double delta, int d) {
+ if ((OPES_PERIODIC_MASK >> d) & 1) {
+  const double period = 6.2831853071795864769;
+  delta -= floor(delta/period + 0.5)*period;
+ }
+ return delta;
+}
 // ---------------------------------------------------------------------------
 // opesEvalBias — OPES bias potential (Invernizzi & Parrinello 2020)
 // ---------------------------------------------------------------------------
@@ -2687,7 +2702,7 @@ KERNEL void opesEvalBias(
   double norm2 = 0.0;
   double dc_d[MAX_OPES_CVS], sig_d[MAX_OPES_CVS];
   for (int d = 0; d < numCVsBias; d++) {
-   dc_d[d] = sVals[d] - (double)centers[k*numCVsBias + d];
+   dc_d[d] = opesDelta(sVals[d] - (double)centers[k*numCVsBias + d], d);
    sig_d[d] = (double)sigmas[k*numCVsBias + d];
    norm2 += dc_d[d]*dc_d[d] / (sig_d[d]*sig_d[d]);
   }
@@ -2755,7 +2770,7 @@ KERNEL void opesGatherDeposit(
  GLOBAL double* RESTRICT runningMean,             // 2
  GLOBAL double* RESTRICT runningM2,              // 3
  GLOBAL int* RESTRICT nSamples,                  // 4
- GLOBAL const double* RESTRICT sigma0,           // 5
+ GLOBAL double* RESTRICT sigma0,           // 5
  double sigmaMin,                                // 6
  GLOBAL double* RESTRICT kCenters,              // 7  (double: bias-storage precision, M-OPESfloat)
  GLOBAL double* RESTRICT kSigmas,               // 8
@@ -2772,7 +2787,7 @@ KERNEL void opesGatherDeposit(
  double cutoff2,                                // 19: 2·γ/invGF = 2·γ²/(γ-1)
  GLOBAL double* RESTRICT sumWArr,              // 20: {sum_w, sum_w2} (LINEAR)
  GLOBAL int* RESTRICT stepCountArr,            // 21: deposit count (for diagnostics)
- GLOBAL int* RESTRICT numAllocatedGPU,         // 22: B2 multiwalker slot-claim counter
+ GLOBAL int* RESTRICT numAllocatedGPU,         // 22: slot-claim counter; set to -1 when full
  int maxKernels,                                // 23: buffer capacity limit
  double gammaArg,                               // 24: γ (for adaptive-σ factor in EXPLORE/METAD)
  double barrier_kJ                              // 25: γ·kT (unused inside; kept for symmetry)
@@ -2805,8 +2820,9 @@ KERNEL void opesGatherDeposit(
 
  // Linear weight accumulators {sum_w, sum_w2}.
  // Initialized with sentinel {exp(-gamma), exp(-2*gamma)} before any deposits.
- sumWArr[0] += h_raw;
- sumWArr[1] += h_raw * h_raw;
+ double reweight = exp(V_kT);
+ sumWArr[0] += reweight;
+ sumWArr[1] += reweight * reweight;
  stepCountArr[0]++;
 
  // neff = (1+sum_w)^2/(1+sum_w2) — 1+ terms give neff≈1
@@ -2825,30 +2841,28 @@ KERNEL void opesGatherDeposit(
   if (variant == 1) {
    // FIXED_SIGMA: no Silverman adaptation.
    sig = sigma0[d];
-  } else if (adaptiveSigmaStride > 0) {
-   // PLUMED multiplies av_M2_ by γ once at first deposit for METAD: the M2
-   // was estimated from unbiased warm-up dynamics and must be scaled up
-   // to the broader WT-target distribution variance (OPESmetad.cpp L1051,
-   // `av_M2_[i] *= biasfactor_`). EXPLORE does NOT apply this correction
-   // (factor=1). variant=1 (fixed-σ) doesn't reach this branch.
-   //
-   // We multiply on every read instead of one-and-permanent: the difference
-   // is < 5% in σ for typical runs (biased-phase Welford increments are
-   // already γ-broader, so over-scaling is partial and bounded).
-   // Adaptive-sigma variance: PLUMED uses sigma = sqrt(av_M2 / counter / factor) with
-   // factor = biasfactor(gamma) for METAD and 1 for EXPLORE — i.e. it DIVIDES the variance
-   // by gamma. The previous code multiplied by gamma, making METAD kernels ~sqrt(gamma) too
-   // broad. EXPLORE (variant 2, factor=1) is unchanged. (H-OPESsigma)
-   double factor = (variant == 2) ? 1.0 : gammaArg;
-   double var = (n > 1) ? runningM2[d] / factor / (double)(n - 1) : 0.0;
-   sig = (var > 0.0) ? sqrt(var) : 1.0;
-   if (sig < sigmaMin) sig = sigmaMin;
   } else {
-   // Default well-tempered: apply Silverman's rule (Scott 1992) — applied
-   // even when sigma0 is provided, unless FIXED_SIGMA or adaptive stride is set.
-   double s_rescaling = pow(size_for_silv * (D + 2) / 4.0, -1.0 / (D + 4.0));
-   sig = sigma0[d] * s_rescaling;
-   if (sig < sigmaMin) sig = sigmaMin;
+   // Follows PLUMED OPESmetad::update. In adaptive mode the running variance
+   // is measured during the unbiased warm-up; at the first deposit
+   // (counter == 2, PLUMED's counter_ starts at 1) it is scaled once by gamma
+   // to the broader well-tempered distribution and the baseline sigma0 used
+   // by the height correction below is fixed from it. METAD then divides the
+   // variance by gamma; EXPLORE (factor 1) does not.
+   double sigmaFloor = max(sigmaMin, 1e-6);
+   if (adaptiveSigmaStride > 0) {
+    double factor = (variant == 2) ? 1.0 : gammaArg;
+    if (stepCountArr[0] == 2) {
+     runningM2[d] *= gammaArg;
+     sigma0[d] = max(sqrt(max(0.0, runningM2[d] / (double)n / factor)), sigmaFloor);
+    }
+    sig = sqrt(max(0.0, runningM2[d] / (double)n / factor));
+   } else {
+    sig = sigma0[d];
+   }
+   // Silverman's rule of thumb, applied to the (bounded) bandwidth.
+   sig = max(sig, sigmaFloor);
+   sig *= pow(size_for_silv * (D + 2) / 4.0, -1.0 / (D + 4.0));
+   sig = max(sig, sigmaFloor);
   }
   sig_new[d] = sig;
  }
@@ -2857,7 +2871,7 @@ KERNEL void opesGatherDeposit(
  // Applies for Silverman path in variant 0 (METAD) and 2 (EXPLORE) when sigma0>0.
  // Skipped for adaptive (sigma0=0 sentinel) and for variant=1 (fixed-σ; no rescaling).
  double lw_new = lw_raw;
- if (variant != 1 && adaptiveSigmaStride == 0) {
+ if (variant != 1) {
   for (int d = 0; d < D; d++)
    lw_new += log(sigma0[d] / sig_new[d]);
  }
@@ -2872,7 +2886,7 @@ KERNEL void opesGatherDeposit(
   double n2 = 0.0;
   bool over = false;
   for (int d = 0; d < D; d++) {
-   double dc = c_new[d] - (double)kCenters[kp*D+d];
+   double dc = opesDelta(c_new[d] - (double)kCenters[kp*D+d], d);
    double s  = (double)kSigmas[kp*D+d];
    double x  = dc / s;
    n2 += x*x;
@@ -2884,8 +2898,6 @@ KERNEL void opesGatherDeposit(
  int nAfter;
  if (merge_k >= 0) {
   // Merge: weighted Gaussian mixture merge (standard GMM statistics, Bishop 2006 §2.3).
-  // NOTE: In B2 multiwalker mode, concurrent merges to the same slot can race.
-  // This is a known limitation; compression is optional and rare in practice.
   double lw_old = (double)kLogWeights[merge_k];
   double h_old  = exp(lw_old);
   double h_tot  = h_old + h_new;
@@ -2895,20 +2907,21 @@ KERNEL void opesGatherDeposit(
   for (int d = 0; d < D; d++) {
    double c1 = (double)kCenters[merge_k*D+d];
    double s1 = (double)kSigmas[merge_k*D+d];
-   double c2 = c_new[d], s2 = sig_new[d];
+   double c2 = c1 + opesDelta(c_new[d]-c1,d), s2 = sig_new[d];
    double cm = f1*c1 + f2*c2;
-   double ss = f1*(s1*s1+c1*c1) + f2*(s2*s2+c2*c2) - cm*cm;
+   double dcMerge = c2-c1;
+   double ss = f1*s1*s1 + f2*s2*s2 + f1*f2*dcMerge*dcMerge;
    if (ss < 0.0) ss = 0.0;
    double sm = sqrt(ss);
    if (sm < sigmaMin) sm = sigmaMin;   // a degenerate merge can give ss->0; never store sigma=0
-   kCenters[merge_k*D+d] = cm;
+   kCenters[merge_k*D+d] = opesDelta(cm,d);
    kSigmas[merge_k*D+d]  = sm;
   }
   kLogWeights[merge_k] = lw_mrg;
   nAfter = nBefore;
  } else {
-  // B2 multiwalker: claim a slot atomically so concurrent walkers don't collide.
-  // numAllocatedGPU is the slot-claim counter; numKernelsGPU is committed (visible to eval).
+  // Append into the next free slot. numAllocatedGPU counts claimed slots and
+  // numKernelsGPU the committed ones; without concurrent walkers they agree.
   int k = atomicAdd(numAllocatedGPU, 1);
   if (k < maxKernels) {
    // Write kernel data into the claimed slot.
@@ -2917,24 +2930,23 @@ KERNEL void opesGatherDeposit(
     kSigmas[k*D+d]  = sig_new[d];
    }
    kLogWeights[k] = lw_new;
-   // Atomically increment committed count; eval kernel reads numKernelsGPU[0].
-   // NOTE: In B2 multiwalker mode there is a small window where the eval kernel on
-   // another context might read this slot before data is fully visible. This is an
-   // accepted limitation of the first B2 implementation — the eval kernel would
-   // simply use slightly stale (still-valid) sigma/center values for that slot.
-   // For strict cross-context ordering, __threadfence_system() would be needed,
-   // but it is not available in NVRTC-compiled kernels.
+   // Commit: the eval kernel reads numKernelsGPU[0].
    atomicAdd(numKernelsGPU, 1);
    nAfter = nBefore + 1;
   } else {
-   // Buffer full: roll back the allocation claim and skip.
-   atomicAdd(numAllocatedGPU, -1);
-   nAfter = nBefore;
+   // Table full and no kernel close enough to merge into: undo this deposit's
+   // accumulator updates and flag the host (which raises) by negating the
+   // allocation counter.
+   numAllocatedGPU[0] = -1;
+   sumWArr[0] -= reweight;
+   sumWArr[1] -= reweight * reweight;
+   stepCountArr[0]--;
+   return;
   }
  }
 
  // KDNorm update: add uncorrected weight (Σ exp(bias_i/kT)).
- sumWeightsGPU[0] += h_raw;
+ sumWeightsGPU[0] += reweight;
 
  // Update sum_uprob = Σ_{j,k'} h_{k'}*(G_jk' - ε).
  // ε = exp(-cutoff2/2).  G_jk' uses sigma of k' (asymmetric).
@@ -2959,7 +2971,7 @@ KERNEL void opesGatherDeposit(
   for (int j = 0; j < nBefore; j++) {
    double n2 = 0.0; bool skip = false;
    for (int d = 0; d < D; d++) {
-    double dc = (double)kCenters[j*D+d] - c_new[d];
+    double dc = opesDelta((double)kCenters[j*D+d] - c_new[d], d);
     n2 += dc*dc / (sig_new[d]*sig_new[d]);
     if (n2 >= cutoff2) { skip = true; break; }
    }
@@ -2969,7 +2981,7 @@ KERNEL void opesGatherDeposit(
   for (int kp = 0; kp < nBefore; kp++) {
    double n2 = 0.0; bool skip = false;
    for (int d = 0; d < D; d++) {
-    double dc = c_new[d] - (double)kCenters[kp*D+d];
+    double dc = opesDelta(c_new[d] - (double)kCenters[kp*D+d], d);
     double s  = (double)kSigmas[kp*D+d];
     n2 += dc*dc / (s*s);
     if (n2 >= cutoff2) { skip = true; break; }
@@ -2987,7 +2999,7 @@ KERNEL void opesGatherDeposit(
     double n2  = 0.0;
     bool skip  = false;
     for (int d = 0; d < D; d++) {
-     double dc = (double)kCenters[j*D+d] - (double)kCenters[kp*D+d];
+     double dc = opesDelta((double)kCenters[j*D+d] - (double)kCenters[kp*D+d], d);
      double s  = (double)kSigmas[kp*D+d];
      n2 += dc*dc / (s*s);
      if (n2 >= cutoff2) { skip = true; break; }
@@ -3012,16 +3024,17 @@ KERNEL void opesAccumulateWelford(
  GLOBAL double* RESTRICT runningMean,
  GLOBAL double* RESTRICT runningM2,
  GLOBAL int* RESTRICT nSamples,
- int D
+ int D,
+ int adaptiveStride
 ) {
  if (GLOBAL_ID != 0) return;
  nSamples[0]++;
  int n = nSamples[0];
  for (int d = 0; d < D; d++) {
  double cv = cvValues[cvIdxList[d]];
- double delta = cv - runningMean[d];
- runningMean[d] += delta / n;
- double delta2 = cv - runningMean[d];
+ double delta = opesDelta(cv - runningMean[d], d);
+ runningMean[d] += delta / min(n, adaptiveStride);
+ double delta2 = opesDelta(cv - runningMean[d], d);
  runningM2[d] += delta * delta2;
  }
 }
@@ -3288,7 +3301,8 @@ KERNEL void abmdEvalBias(
  int D,
  GLOBAL double* RESTRICT cvBiasGradients,
  GLOBAL double* RESTRICT biasEnergies,
- int biasIdx
+ int biasIdx,
+ int commitHistory
 ) {
  if (GLOBAL_ID != 0) return;
  double V = 0.0;
@@ -3299,7 +3313,7 @@ KERNEL void abmdEvalBias(
  double rho = cvDist * cvDist;
  double rhoM = rhoMin[d];
  if (rhoM < 0.0 || rho < rhoM) {
- rhoMin[d] = rho;
+ if (commitHistory) rhoMin[d] = rho;
  } else {
  double diff = rho - rhoM;
  double k = (double)kappa[d];
@@ -3361,9 +3375,11 @@ KERNEL void extLagEvalBias(
  int D,
  GLOBAL double* RESTRICT cvBiasGradients,
  GLOBAL double* RESTRICT biasEnergies,
- int biasIdx
+ int biasIdx,
+ int initialized
 ) {
  if (GLOBAL_ID != 0) return;
+ if (!initialized) { biasEnergies[biasIdx]=0.0; return; }
  double E = 0.0;
  for (int i = 0; i < D; i++) {
  int ci = cvIdxList[i];
@@ -3587,12 +3603,12 @@ KERNEL void metaDEvalBias(
 ) {
  if (GLOBAL_ID != 0) return;
  int lo[3], hi[3];
- double alpha[3];
+ double alpha[3], active[3] = {1.0, 1.0, 1.0};
  for (int d = 0; d < D; d++) {
  double frac = (cvValues[cvIdxList[d]] - origin[d]) * invSpacing[d];
  int N = actualPoints[d];
  if (N <= 1) {
- lo[d] = 0; hi[d] = 0; alpha[d] = 0.0;
+ lo[d] = 0; hi[d] = 0; alpha[d] = 0.0; active[d] = 0.0;
  } else if (periodic[d]) {
  frac = frac - floor(frac / (double)N) * (double)N;
  if (frac < 0.0) frac += N;
@@ -3601,6 +3617,7 @@ KERNEL void metaDEvalBias(
  alpha[d] = frac - lo[d];
  hi[d] = (lo[d] + 1) % N;
  } else {
+ if (frac < 0.0 || frac > (double)(N-1)) active[d] = 0.0;
  if (frac < 0.0) frac = 0.0;
  if (frac > (double)(N-1)) frac = (double)(N-1);
  lo[d] = (int)frac;
@@ -3632,7 +3649,7 @@ KERNEL void metaDEvalBias(
  }
  biasEnergies[biasIdx] = V;
  for (int d = 0; d < D; d++)
- cvBiasGradients[cvIdxList[d]] += dV[d] * invSpacing[d];
+ cvBiasGradients[cvIdxList[d]] += dV[d] * invSpacing[d] * active[d];
 }
 
 // metaDDeposit reads V = biasEnergies[biasEnergyIdx] from the shared energy buffer
@@ -3640,8 +3657,7 @@ KERNEL void metaDEvalBias(
 // and computes height = h0 * exp(-V * heightInvFactor), where
 // heightInvFactor = 0 → flat (γ≤1), height = h0
 // heightInvFactor = 1/((γ-1)*kT) → well-tempered
-// atomicAdd is used so that concurrent deposits from multiple walkers (B2 multiwalker)
-// are race-free. Requires sm_60+ for double atomicAdd.
+// Grid points are updated with atomicAdd (requires sm_60+ for double atomicAdd).
 KERNEL void metaDDeposit(
  GLOBAL double* RESTRICT grid,
  GLOBAL const double* RESTRICT origin,
@@ -3886,30 +3902,85 @@ void CommonCalcGluedForceKernel::buildPlan(const System& system,
  auto err = [&](const string& m){ throw OpenMMException("GluedForce CV " + std::to_string(i) + ": " + m); };
  auto needA = [&](int n){ if ((int)atoms.size() < n) err("expected >= " + std::to_string(n) + " atoms, got " + std::to_string(atoms.size())); };
  auto needP = [&](int n){ if ((int)params.size() < n) err("expected >= " + std::to_string(n) + " parameters, got " + std::to_string(params.size())); };
- for (int a : atoms) if (a < 0 || a >= numParticles) err("atom index " + std::to_string(a) + " out of range [0," + std::to_string(numParticles) + ")");
+ for (double value : params)
+ if (!std::isfinite(value)) err("parameters must be finite");
+ // Expression CVs store their input CV value indices in the atom list, and
+ // COORDINATION stores its group-A size in atoms[0]; neither is an atom index.
+ {
+ size_t first = (cvType == GluedForce::CV_COORDINATION) ? 1 : 0;
+ int limit = (cvType == GluedForce::CV_EXPRESSION) ? vIdx : numParticles;
+ const char* what = (cvType == GluedForce::CV_EXPRESSION) ? "input CV index " : "atom index ";
+ for (size_t ai = first; ai < atoms.size(); ++ai)
+ if (atoms[ai] < 0 || atoms[ai] >= limit)
+ err(what + std::to_string(atoms[ai]) + " out of range [0," + std::to_string(limit) + ")");
+ }
+ auto needComponent = [&](double c, int maxComponent, const char* what) {
+ if (c < 0 || c > maxComponent || c != floor(c)) err(string("invalid ") + what + " component");
+ };
+ auto totalMass = [&](size_t begin, size_t end) {
+ double mass = 0;
+ for (size_t j = begin; j < end; ++j) mass += system.getParticleMass(atoms[j]);
+ return mass;
+ };
  int nValues = 1;
  bool enforceContig = true;
  switch (cvType) {
  case GluedForce::CV_DISTANCE: needA(2); break;
  case GluedForce::CV_ANGLE: needA(3); break;
  case GluedForce::CV_DIHEDRAL: needA(4); break;
- case GluedForce::CV_COM_DISTANCE: needA(1); needP(1); break;
- case GluedForce::CV_GYRATION: needA(1); break;
+ case GluedForce::CV_COM_DISTANCE: {
+ needA(2); needP(1);
+ double n1 = params[0];
+ if (n1 != floor(n1) || n1 < 1 || n1 >= atoms.size()) err("invalid COM group size");
+ if (totalMass(0, size_t(n1)) <= 0 || totalMass(size_t(n1), atoms.size()) <= 0)
+ err("COM groups must have positive total mass");
+ break;
+ }
+ case GluedForce::CV_GYRATION:
+ needA(1);
+ if (totalMass(0, atoms.size()) <= 0) err("gyration requires positive total mass");
+ break;
  case GluedForce::CV_COORDINATION: needA(2); needP(3);
  if (atoms[0] < 1 || atoms[0] >= (int)atoms.size()) err("coordination group-A size atoms[0]=" + std::to_string(atoms[0]) + " invalid"); break;
- case GluedForce::CV_RMSD: needA(1); needP(3*(int)atoms.size()); break;
- case GluedForce::CV_PATH: { needP(2); int N=(int)params[1]; if (N < 2) err("path needs >= 2 frames"); if (N > 128) err("path frame count " + std::to_string(N) + " exceeds MAX_PATH_FRAMES=128"); needP(2 + N*3*(int)atoms.size()); nValues = 2; } break;
- case GluedForce::CV_POSITION: needA(1); needP(1); break;
- case GluedForce::CV_DRMSD: needA(2); needP((int)atoms.size()/2); break;
- case GluedForce::CV_CONTACTMAP: needA(2); needP(4*((int)atoms.size()/2)); break;
- case GluedForce::CV_PLANE: needA(3); needP(1); break;
- case GluedForce::CV_PROJECTION: needA(2); needP(3); break;
+ case GluedForce::CV_RMSD:
+ needA(1);
+ if (params.size() != 3 * atoms.size()) err("RMSD requires exactly 3 reference coordinates per atom (no masses)");
+ break;
+ case GluedForce::CV_PATH: {
+ needA(1); needP(2);
+ if (params[0] <= 0 || params[1] != floor(params[1])) err("invalid path lambda or frame count");
+ int N = (int)params[1];
+ if (N < 2) err("path needs >= 2 frames");
+ if (N > 128) err("path frame count " + std::to_string(N) + " exceeds MAX_PATH_FRAMES=128");
+ needP(2 + N*3*(int)atoms.size());
+ nValues = 2;
+ break;
+ }
+ case GluedForce::CV_POSITION: needA(1); needP(1); needComponent(params[0], 2, "Cartesian"); break;
+ case GluedForce::CV_DRMSD:
+ needA(2);
+ if (atoms.size() % 2 || params.size() != atoms.size()/2) err("DRMSD needs one reference distance per atom pair");
+ break;
+ case GluedForce::CV_CONTACTMAP:
+ needA(2);
+ if (atoms.size() % 2 || params.size() != 2*atoms.size()) err("contact map needs [r0,n,m,w] per atom pair");
+ break;
+ case GluedForce::CV_PLANE: needA(3); needP(1); needComponent(params[0], 2, "plane"); break;
+ case GluedForce::CV_PROJECTION:
+ needA(2); needP(3);
+ if (params[0]*params[0] + params[1]*params[1] + params[2]*params[2] <= 0) err("projection direction must be nonzero");
+ break;
  case GluedForce::CV_VOLUME: break;
- case GluedForce::CV_CELL: needP(1); break;
+ case GluedForce::CV_CELL: needP(1); needComponent(params[0], 2, "cell"); break;
  case GluedForce::CV_DIPOLE: needA(1); needP((int)atoms.size()+1); break;
  case GluedForce::CV_PCA: needA(1); needP(6*(int)atoms.size()); break;
  case GluedForce::CV_SECONDARY_STRUCTURE: needA(5); needP(2); break;
- case GluedForce::CV_PUCKERING: needA(5); needP(2); break;
+ case GluedForce::CV_PUCKERING:
+ needA(5); needP(2);
+ if ((atoms.size() != 5 && atoms.size() != 6) || params[0] != atoms.size())
+ err("puckering requires a five- or six-atom ring with params[0] equal to the ring size");
+ needComponent(params[1], 2, "puckering");
+ break;
  case GluedForce::CV_ERMSD: { needP(1); int N=(int)(params[0]+0.5); if (N < 1) err("eRMSD needs >= 1 residue"); if (N > 64) err("eRMSD residue count " + std::to_string(N) + " exceeds kernel limit 64"); needA(3*N); needP(2 + 4*N*(N-1)); } break;
  case GluedForce::CV_ENERGY: break; // total potential energy; no atoms/params (inner-context eval)
  case GluedForce::CV_EXPRESSION: enforceContig = false; break; // stores its own output index
@@ -4605,10 +4676,60 @@ ComputeContext& CommonCalcGluedForceKernel::getInnerComputeContext(ContextImpl& 
     throw OpenMMException("GluedForce: CV_ENERGY requires the CUDA or OpenCL platform");
 }
 
+// Canonical description of everything that determines the layout and meaning
+// of the bias state, hashed (FNV-1a, 64-bit) so a checkpoint can be refused
+// when the force it is restored into differs from the one that wrote it.
+static unsigned long long configurationHash(const GluedForce& force) {
+    std::ostringstream text;
+    text << std::setprecision(17)
+         << force.getTemperature() << ':' << force.usesPeriodicBoundaryConditions();
+    for (int i = 0; i < force.getNumCollectiveVariableSpecs(); ++i) {
+        int type;
+        vector<int> atoms;
+        vector<double> params;
+        force.getCollectiveVariableInfo(i, type, atoms, params);
+        text << "|CV:" << type << ':' << atoms.size();
+        for (int a : atoms) text << ':' << a;
+        text << ':' << params.size();
+        for (double x : params) text << ':' << x;
+        if (type == GluedForce::CV_EXPRESSION) {
+            string expression;
+            vector<int> inputs;
+            force.getExpressionCVInfo(i, expression, inputs);
+            text << ':' << expression;
+        }
+        if (type == GluedForce::CV_PYTORCH)
+            text << ':' << force.getPyTorchCVModelPath(i);
+    }
+    for (int i = 0; i < force.getNumBiases(); ++i) {
+        int type;
+        vector<int> cvs, intParams;
+        vector<double> params;
+        force.getBiasInfo(i, type, cvs, params, intParams);
+        text << "|BIAS:" << type << ':' << cvs.size();
+        for (int c : cvs) text << ':' << c;
+        text << ':' << params.size();
+        for (double x : params) text << ':' << x;
+        text << ':' << intParams.size();
+        for (size_t j = 0; j < intParams.size(); ++j) {
+            // The OPES kernel capacity may be raised on restart.
+            bool capacity = (type == GluedForce::BIAS_OPES && j == 2);
+            text << ':' << (capacity ? 0 : intParams[j]);
+        }
+    }
+    unsigned long long hash = 14695981039346656037ULL;
+    for (unsigned char c : text.str()) {
+        hash ^= c;
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
 void CommonCalcGluedForceKernel::initialize(const System& system,
  const GluedForce& force) {
  ContextSelector selector(cc_);
  forceGroupFlag_ = 1 << force.getForceGroup();
+ configurationHash_ = configurationHash(force);
  testForceMode_ = force.getTestForceMode();
  testForceScale_ = force.getTestForceScale();
  testBiasGradients_ = force.getTestBiasGradients();
@@ -4660,15 +4781,34 @@ double CommonCalcGluedForceKernel::execute(ContextImpl& context,
  return 0.0;
 
  ContextSelector selector(cc_);
-
- // Refresh GPU atom indices if OpenMM reordered atoms (Hilbert sort)
- if (cc_.getAtomsWereReordered())
- rebuildGpuAtomIndices();
+ evaluateCVs(context);
 
  // cvBiasGradients is registered with addAutoclearBuffer — already zeroed by OpenMM.
  // Only upload when test mode supplies explicit gradient values.
  if (!testBiasGradients_.empty())
  plan_.cvBiasGradients.upload(testBiasGradients_);
+
+ // Force evaluation never commits history: energy queries, minimization and
+ // rejected trial moves must leave adaptive biases untouched (see updateState()).
+ double biasEnergy = evaluateBiases(context, includeEnergy, false);
+
+ // expression CV gradient propagation (reverse dep order).
+ // Must run unconditionally — even in testBiasGradients_ mode, the test sets
+ // gradients on the expression CV output and expects them to propagate to inputs.
+ for (int ei = (int)expressionCVPlans_.size()-1; ei >= 0; ei--)
+ if (expressionCVPlans_[ei].numInputs > 0)
+ expressionCVPlans_[ei].propKernel->execute(1);
+
+ if (plan_.numJacEntries > 0)
+ scatterKernel_->execute(plan_.numJacEntries);
+
+ return biasEnergy;
+}
+
+void CommonCalcGluedForceKernel::evaluateCVs(ContextImpl& context) {
+ // Refresh GPU atom indices if OpenMM reordered atoms (Hilbert sort)
+ if (cc_.getAtomsWereReordered())
+ rebuildGpuAtomIndices();
 
  // Push box vectors to CV kernels only when the box has actually changed.
  // For NVE/NVT (no barostat) this fires exactly once (first step); for NPT it
@@ -4777,9 +4917,6 @@ double CommonCalcGluedForceKernel::execute(ContextImpl& context,
  ermsdKernel_->execute(plan_.numErmsdCVs);
  }
 
- // expression CV eval (reads cvValues of inputs, writes cvValues of output + partials)
- for (auto& ep : expressionCVPlans_)
- ep.evalKernel->execute(1);
 
  // PyTorch CV evaluation.
  // GPU-native path (primary): extract kernel gathers positions into a GPU buffer;
@@ -4814,7 +4951,11 @@ double CommonCalcGluedForceKernel::execute(ContextImpl& context,
 
  // 3. Forward pass on the shared CUDA stream
  auto* module = static_cast<torch::jit::script::Module*>(pt.model.get());
+ module->to(input.device());
+ module->zero_grad();
  auto output = module->forward({input}).toTensor().squeeze();
+ if (output.numel() != 1 || !output.requires_grad())
+     throw OpenMMException("Torch CV must return one differentiable scalar");
 
  // 4. Write scalar CV value D2D: cast to float64 on GPU then
  // cudaMemcpyAsync directly into the cvValues slot — no CPU touch,
@@ -4830,6 +4971,8 @@ double CommonCalcGluedForceKernel::execute(ContextImpl& context,
 
  // 5. Backward pass on the shared CUDA stream
  output.backward();
+ if (!input.grad().defined() || input.grad().sizes() != input.sizes())
+     throw OpenMMException("Torch CV has no input gradient or an invalid gradient shape");
  auto grad = input.grad().contiguous();
 
  // 6. D2D copy interleaved gradient into gradBufGPU on the same stream.
@@ -4848,7 +4991,14 @@ double CommonCalcGluedForceKernel::execute(ContextImpl& context,
  // Flush GPU queue so posq reflects the current step's positions.
  cc_.flushQueue();
  vector<mm_float4> posqAll(cc_.getPaddedNumAtoms());
+ if (cc_.getUseDoublePrecision()) {
+ vector<mm_double4> precise(cc_.getPaddedNumAtoms());
+ cc_.getPosq().download(precise);
+ for (size_t i = 0; i < precise.size(); ++i)
+ posqAll[i] = mm_float4((float)precise[i].x, (float)precise[i].y, (float)precise[i].z, 0);
+ } else {
  cc_.getPosq().download(posqAll);
+ }
 
  for (auto& pt : pytorchCVPlans_) {
  vector<float> posCPU(pt.numAtoms * 3);
@@ -4863,10 +5013,16 @@ double CommonCalcGluedForceKernel::execute(ContextImpl& context,
  .clone()
  .requires_grad_(true);
  auto* module = static_cast<torch::jit::script::Module*>(pt.model.get());
+ module->to(input.device());
+ module->zero_grad();
  auto output = module->forward({input}).toTensor().squeeze();
+ if (output.numel() != 1 || !output.requires_grad())
+     throw OpenMMException("Torch CV must return one differentiable scalar");
  double cvVal = output.item<double>();
  plan_.cvValues.uploadSubArray(&cvVal, pt.outputCVIndex, 1);
  output.backward();
+ if (!input.grad().defined() || input.grad().sizes() != input.sizes())
+     throw OpenMMException("Torch CV has no input gradient or an invalid gradient shape");
  auto grad = input.grad().contiguous();
  const float* gdata = grad.data_ptr<float>();
  vector<float> gx(pt.numAtoms), gy(pt.numAtoms), gz(pt.numAtoms);
@@ -4939,6 +5095,8 @@ double CommonCalcGluedForceKernel::execute(ContextImpl& context,
  Vec3 ba, bb, bc;
  context.getPeriodicBoxVectors(ba, bb, bc);
  innerContextImpl_->setPeriodicBoxVectors(ba, bb, bc);
+ for (const auto& parameter : innerContextImpl_->getParameters())
+     innerContextImpl_->setParameter(parameter.first, context.getParameter(parameter.first));
  cc2.reorderAtoms();                       // keeps innerInvAtomOrder_ current via listener
  energyCopyStateKernel_->execute(Np);
  double U = innerContextImpl_->calcForcesAndEnergy(true, true, -1);   // all force groups
@@ -4949,11 +5107,17 @@ double CommonCalcGluedForceKernel::execute(ContextImpl& context,
  }
  }
 
- // evaluate bias potentials and accumulate into cvBiasGradients.
- // Must run after CV kernels (need cvValues) and before scatter (fills gradients).
+ // expression CV eval (reads cvValues of inputs, writes cvValues of output + partials)
+ for (auto& ep : expressionCVPlans_)
+ ep.evalKernel->execute(1);
+}
+
+double CommonCalcGluedForceKernel::evaluateBiases(ContextImpl& context,
+ bool includeEnergy, bool commitHistory) {
  // Skip when testBiasGradients_ is set (unit tests supply gradients directly).
+ if (!testBiasGradients_.empty())
+ return 0.0;
  double biasEnergy = 0.0;
- if (testBiasGradients_.empty()) {
  for (auto& h : harmonicBiases_) {
  h.evalKernel->execute(1);
  }
@@ -4970,16 +5134,11 @@ double CommonCalcGluedForceKernel::execute(ContextImpl& context,
  mv.evalKernel->execute(1);
  }
  for (auto& o : opesBiases_) {
- // Fully-adaptive mode: accumulate Welford stats every step so the deposit
- // kernel has a good variance estimate when it fires at the next pace boundary.
- if (o.welfordKernel) {
- o.welfordKernel->execute(1);
- o.nSamplesCPU++;  // mirrors GPU nSamples; used in updateState() guard
- }
  // numKernels is GPU-resident in o.numKernelsGPU — no setArg needed.
  o.evalKernel->execute(1);
  }
  for (auto& a : abmdBiases_) {
+ a.evalKernel->setArg(9, commitHistory ? 1 : 0);
  a.evalKernel->execute(1);
  }
  for (auto& m : metaDGridBiases_) {
@@ -5004,10 +5163,7 @@ double CommonCalcGluedForceKernel::execute(ContextImpl& context,
  // Extended Lagrangian: evaluate coupling (s is GPU-resident).
  // On first execute() call, s is uninitialized — seed it from current cvValues.
  for (auto& el : extLagBiases_) {
- if (!el.initialized) {
- el.initSKernel->execute(1);
- el.initialized = true;
- }
+ el.evalKernel->setArg(8, el.initialized ? 1 : 0);
  el.evalKernel->execute(1);
  }
  // EDS: evaluate linear bias (lambda is GPU-resident).
@@ -5031,35 +5187,58 @@ double CommonCalcGluedForceKernel::execute(ContextImpl& context,
  plan_.biasEnergies.download(plan_.biasEnergiesCPU);
  for (double e : plan_.biasEnergiesCPU) biasEnergy += e;
  }
- }
-
- // expression CV gradient propagation (reverse dep order).
- // Must run unconditionally — even in testBiasGradients_ mode, the test sets
- // gradients on the expression CV output and expects them to propagate to inputs.
- for (int ei = (int)expressionCVPlans_.size()-1; ei >= 0; ei--)
- if (expressionCVPlans_[ei].numInputs > 0)
- expressionCVPlans_[ei].propKernel->execute(1);
-
- if (plan_.numJacEntries > 0)
- scatterKernel_->execute(plan_.numJacEntries);
-
- cvValuesReady_ = true;
  return biasEnergy;
 }
 
-void CommonCalcGluedForceKernel::updateState(ContextImpl& context,
- int step) {
+bool CommonCalcGluedForceKernel::hasHistory() const {
+ return !opesBiases_.empty() || !abmdBiases_.empty() || !metaDGridBiases_.empty() ||
+ !pbmetaDGridBiases_.empty() || !opesExpandedBiases_.empty() || !extLagBiases_.empty() ||
+ !edsBiases_.empty() || !maxentBiases_.empty() || !multithermalBiases_.empty();
+}
+
+// Device-side deposit and sample counters are 32-bit. Stop before they wrap.
+static const long long kMaxAdaptiveStep = std::numeric_limits<int>::max() - 1;
+
+bool CommonCalcGluedForceKernel::updateState(ContextImpl& context,
+ long long step) {
  // Always track the step count — used by moving restraint in execute().
  lastKnownStep_ = step;
-
- // updateState() is called BEFORE execute() within the same step.
- // cvValues holds results from the PREVIOUS execute(); skip if uninitialized.
- if (!cvValuesReady_) return;
- if (step == lastUpdateStep_) return;
- if (opesBiases_.empty() && abmdBiases_.empty() && metaDGridBiases_.empty() && pbmetaDGridBiases_.empty() && opesExpandedBiases_.empty() && extLagBiases_.empty() && edsBiases_.empty() && maxentBiases_.empty() && multithermalBiases_.empty()) return;
+ // A moving restraint changes the potential every step even without history.
+ bool changed = !movingRestraintBiases_.empty();
+ if (step == lastUpdateStep_ || plan_.numCVs == 0 || !hasHistory())
+ return changed;
  lastUpdateStep_ = step;
+ if (step >= kMaxAdaptiveStep)
+ throw OpenMMException("GLUED: adaptive bias counters support fewer than "
+ + std::to_string(kMaxAdaptiveStep) + " MD steps per run");
 
  ContextSelector selector(cc_);
+
+ // History is committed against the current coordinates, so re-evaluate CVs
+ // and biases here rather than reuse the previous force evaluation (which may
+ // have been at a trial configuration). Only steps that commit something pay
+ // for the extra evaluation; a MetaD run with pace 500 evaluates once per 500
+ // steps, while ABMD, extended-Lagrangian, EDS and adaptive OPES need it every
+ // step.
+ auto due = [&](int pace) { return pace > 0 && step % pace == 0; };
+ bool needsEvaluation = !abmdBiases_.empty() || !extLagBiases_.empty() || !edsBiases_.empty();
+ for (auto& o : opesBiases_) needsEvaluation = needsEvaluation || o.welfordKernel || due(o.pace);
+ for (auto& oe : opesExpandedBiases_) needsEvaluation = needsEvaluation || due(oe.pace);
+ for (auto& mt : multithermalBiases_) needsEvaluation = needsEvaluation || due(mt.pace);
+ for (auto& m : metaDGridBiases_) needsEvaluation = needsEvaluation || due(m.pace);
+ for (auto& pb : pbmetaDGridBiases_) needsEvaluation = needsEvaluation || due(pb.pace);
+ for (auto& mx : maxentBiases_) needsEvaluation = needsEvaluation || due(mx.pace);
+ if (needsEvaluation) {
+ evaluateCVs(context);
+ evaluateBiases(context, false, true);   // also commits ABMD's running minimum
+ changed = changed || !abmdBiases_.empty();
+ }
+
+ // Adaptive OPES: accumulate the CV running variance once per step.
+ for (auto& o : opesBiases_) {
+ if (step > 0 && o.welfordKernel)
+ o.welfordKernel->execute(1);
+ }
 
  // Extended Lagrangian: GPU velocity Verlet every step.
  if (!extLagBiases_.empty()) {
@@ -5076,84 +5255,82 @@ void CommonCalcGluedForceKernel::updateState(ContextImpl& context,
  }
  el.verletKernel->execute(1);
  }
+ changed = true;
  }
 
  // EDS White-Voth: Welford accumulation every step; AdaGrad update every pace steps.
- if (!edsBiases_.empty()) {
  for (auto& eds : edsBiases_) {
- int doUpdate = (step % eds.pace == 0) ? 1 : 0;
+ int doUpdate = due(eds.pace) ? 1 : 0;
  if (doUpdate != eds.lastDoUpdate) {
  eds.lastDoUpdate = doUpdate;
  eds.updateStateKernel->setArg(10, doUpdate);
  }
  eds.updateStateKernel->execute(1);
- }
+ changed = changed || doUpdate;
  }
 
  // MaxEnt: update Lagrange multipliers every pace steps.
- if (!maxentBiases_.empty()) {
  for (auto& mx : maxentBiases_) {
- if (step % mx.pace != 0) continue;
+ if (!due(mx.pace)) continue;
  int uc = step / mx.pace;   // update count t
  mx.updateKernel->setArg(11, uc);
  mx.updateKernel->execute(1);
- }
+ changed = true;
  }
 
- // OPES: GPU-resident Welford + logZ update + kernel deposition (pace-gated).
- // gatherDepositKernel reads cvValues, updates runningMean/runningM2/logZ on GPU,
- // and writes the new kernel row into kernelCenters/Sigmas/LogWeights.
- // neff accumulation reads biasEnergies[biasEnergyIdx] directly on GPU.
+ // OPES: kernel deposition every pace steps — fully GPU-resident.
+ // gatherDepositKernel reads cvValues and biasEnergies, updates the running
+ // statistics and normalization on the GPU, and merges or appends a kernel.
  for (auto& o : opesBiases_) {
- if (step == 0 || step % o.pace != 0) continue;
- if (o.numKernels >= o.maxKernels) continue;
-
- // In fully-adaptive mode the GPU deposit kernel skips until enough samples
- // have been accumulated by welfordKernel.  Mirror that guard on the CPU so
- // numKernels stays in sync (o.nSamplesCPU is incremented by execute()).
- bool gpuWillDeposit = (o.adaptiveSigmaStride == 0) ||
- (o.nSamplesCPU >= o.adaptiveSigmaStride);
-
- o.gatherDepositKernel->execute(1); // reads+increments numKernelsGPU; also updates neff accumulators
- if (gpuWillDeposit)
- o.numKernels++; // CPU mirror for the maxKernels guard
+ if (step == 0 || !due(o.pace)) continue;
+ o.gatherDepositKernel->execute(1);
+ // The kernel signals a full table (no merge possible, no free slot) by
+ // negating the allocation counter.
+ vector<int> allocated(1);
+ o.numAllocatedGPU.download(allocated);
+ if (allocated[0] < 0) {
+ o.numAllocatedGPU.upload(vector<int>{o.maxKernels});
+ throw OpenMMException("GLUED: OPES kernel table is full; increase the maximum kernel count");
+ }
+ changed = true;
  }
 
  // OPES_EXPANDED: update logZ every pace steps — fully GPU-resident.
  for (auto& oe : opesExpandedBiases_) {
- if (step == 0 || step % oe.pace != 0) continue;
+ if (step == 0 || !due(oe.pace)) continue;
  oe.updateLogZKernel->execute(1);
+ changed = true;
  }
 
  // OPES multithermal: learn per-state ΔF_l every pace steps — fully GPU-resident.
- // The kernel reads the previous execute()'s U (cvValues[energyCvIdx]) and V
- // (biasEnergies[biasIdx]) and advances ΔF_l/rct/counter (the expanded-ensemble
- // free-energy recursion) — a one-step lag identical to OPES_EXPANDED's logZ update.
  for (auto& mt : multithermalBiases_) {
- if (step == 0 || mt.pace <= 0 || step % mt.pace != 0) continue;
+ if (step == 0 || !due(mt.pace)) continue;
  mt.updateDeltaFKernel->execute(1);
+ changed = true;
  }
 
  // MetaD deposition (pace-gated) — fully GPU-resident.
  // gatherCVsKernel populates centerGPU; depositKernel reads biasEnergies[biasEnergyIdx]
  // to compute the well-tempered height internally — no CPU round-trip.
  for (auto& m : metaDGridBiases_) {
- if (step == 0 || step % m.pace != 0) continue;
+ if (step == 0 || !due(m.pace)) continue;
  m.gatherCVsKernel->execute(1);
  m.depositKernel->execute(m.totalGridPoints);
  m.numDeposited++;
+ changed = true;
  }
 
  // PBMetaD deposition (pace-gated) — fully GPU-resident.
  for (auto& pb : pbmetaDGridBiases_) {
- if (step == 0 || step % pb.pace != 0) continue;
+ if (step == 0 || !due(pb.pace)) continue;
  for (auto& m : pb.subGrids) {
  m.gatherCVsKernel->execute(1);
  m.depositKernel->execute(m.totalGridPoints);
  m.numDeposited++;
  }
+ changed = true;
  }
-
+ return changed;
 }
 
 void CommonCalcGluedForceKernel::getCurrentCVs(ContextImpl& context,
@@ -5173,8 +5350,7 @@ vector<double> CommonCalcGluedForceKernel::getOPESMetrics(int biasIndex) {
     vector<double> swArr(2, 0.0);
     vector<int>    nkVec(1, 0);
     vector<int>    stepVec(1, 0);
-    if (o.numKernels > 0)
-        o.logZGPU.download(sumUprobVec);   // misnamed: actually sum_uprob (linear)
+    o.logZGPU.download(sumUprobVec);   // misnamed: actually sum_uprob (linear)
     o.sumWeightsGPU.download(sumWVec);     // KDNorm = Σ exp(V/kT)
     o.logSumWGPU.download(swArr);          // {sum_w, sum_w2} for neff
     o.numKernelsGPU.download(nkVec);
@@ -5229,36 +5405,6 @@ vector<float> CommonCalcGluedForceKernel::getKernelSigmas(int biasIndex) {
     vector<float> sigmas(used);
     for (size_t i = 0; i < used; i++) sigmas[i] = (float)sigmasD[i];
     return sigmas;
-}
-
-void CommonCalcGluedForceKernel::redirectToPrimaryBias(
-    int biasType, int localIdx, const std::vector<long long>& ptrs) {
-    if (biasType == GluedForce::BIAS_METAD && localIdx < (int)metaDGridBiases_.size()) {
-        auto& m = metaDGridBiases_[localIdx];
-        unsigned long long gridPtr = (unsigned long long)ptrs[0];
-        m.sharedGridPtr = gridPtr;
-        // Redirect evalKernel arg 2 (grid) and depositKernel arg 0 (grid).
-        m.evalKernel->setArg(2, gridPtr);
-        m.depositKernel->setArg(0, gridPtr);
-    } else if (biasType == GluedForce::BIAS_OPES && localIdx < (int)opesBiases_.size()) {
-        auto& o = opesBiases_[localIdx];
-        o.sharedCentersPtr    = (unsigned long long)ptrs[0];
-        o.sharedSigmasPtr     = (unsigned long long)ptrs[1];
-        o.sharedLogWeightsPtr = (unsigned long long)ptrs[2];
-        o.sharedNumKernelsPtr = (unsigned long long)ptrs[3];
-        o.sharedNumAllocPtr   = (unsigned long long)ptrs[4];
-        // Redirect eval kernel args (centers=2, sigmas=3, logWeights=4, numKernels=5).
-        o.evalKernel->setArg(2, (unsigned long long)ptrs[0]);
-        o.evalKernel->setArg(3, (unsigned long long)ptrs[1]);
-        o.evalKernel->setArg(4, (unsigned long long)ptrs[2]);
-        o.evalKernel->setArg(5, (unsigned long long)ptrs[3]);
-        // Redirect deposit kernel args (centers=7, sigmas=8, logWeights=9, numKernels=11, numAlloc=22).
-        o.gatherDepositKernel->setArg(7,  (unsigned long long)ptrs[0]);
-        o.gatherDepositKernel->setArg(8,  (unsigned long long)ptrs[1]);
-        o.gatherDepositKernel->setArg(9,  (unsigned long long)ptrs[2]);
-        o.gatherDepositKernel->setArg(11, (unsigned long long)ptrs[3]);
-        o.gatherDepositKernel->setArg(22, (unsigned long long)ptrs[4]);
-    }
 }
 
 vector<double> CommonCalcGluedForceKernel::downloadCVValues() {

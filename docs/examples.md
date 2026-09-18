@@ -203,7 +203,9 @@ re.run(n_cycles=500, steps_per_cycle=1000)
 
 ## Multi-walker Metadynamics
 
-Multiple walkers deposit into a single shared MetaD grid on the GPU with no CPU merge step.
+Two walkers deposit into one MetaD bias. The pool merges their hills every
+`sync_interval` steps (here, after every deposit); step the walkers only through
+the pool.
 
 ```python
 def make_walker(system):
@@ -216,17 +218,15 @@ def make_walker(system):
     ctx = mm.Context(system, mm.LangevinMiddleIntegrator(300, 1, 0.002), platform)
     return ctx, f
 
-ctx0, f0 = make_walker(build_system())   # primary — owns the shared grid
-ctx1, f1 = make_walker(build_system())   # secondary
+ctx0, f0 = make_walker(build_system())
+ctx1, f1 = make_walker(build_system())
+ctx0.setPositions(start_positions)
+ctx1.setPositions(start_positions)
 
-# Wire the shared grid (must happen after both contexts are created)
-ptrs = f0.getMultiWalkerPtrs(ctx0, 0)   # bias index 0
-f1.setMultiWalkerPtrs(ctx1, 0, ptrs)
-
-# Run both walkers — deposits from both go into the shared grid
-for _ in range(10000):
-    ctx0.getIntegrator().step(1)
-    ctx1.getIntegrator().step(1)
+from MultiGPUManager import MultiWalkerPool
+pool = MultiWalkerPool([[ctx0, ctx1]], [[f0, f1]], bias_index=0, sync_interval=500)
+pool.run(10000)
+pool.close()
 ```
 
 ---

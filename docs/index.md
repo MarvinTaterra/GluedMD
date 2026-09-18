@@ -1,6 +1,6 @@
 # GLUED
 
-**GLUED** is a GPU-resident enhanced sampling plugin for OpenMM. It provides PLUMED-equivalent collective variables (CVs) and bias methods with all CV evaluation, bias evaluation, and chain-rule force scatter running natively inside OpenMM's GPU kernel infrastructure — eliminating the CPU↔GPU round-trip cost of the `openmm-plumed` plugin.
+**GLUED** is a GPU-resident enhanced sampling plugin for OpenMM. It provides PLUMED-style collective variables (CVs) and bias methods with CV evaluation, bias evaluation, and chain-rule force scatter running natively inside OpenMM's GPU kernel infrastructure, avoiding the per-step CPU↔GPU round-trip of the `openmm-plumed` plugin. The [architecture notes](architecture-notes.md) describe where host work remains (energy/Torch CVs, checkpoints, multi-walker synchronization) and the execution contracts.
 
 ## Why GLUED?
 
@@ -12,9 +12,9 @@ The standard `openmm-plumed` plugin works by: pulling positions from GPU → CPU
 |---|---|
 | **Collective variables** | Distance, Angle, Dihedral, COM-Distance, Radius of Gyration, Coordination Number, RMSD, Distance-RMSD, Contact Map, Path (s/z), Position, Plane, Projection, Dipole, Volume, Cell, Ring Puckering, Secondary Structure, PCA, eRMSD, Expression (algebraic), PyTorch (TorchScript ML) |
 | **Bias methods** | Harmonic restraint, Moving restraint, Well-tempered MetaD, PBMetaD, OPES, OPES-Expanded, External grid, ABMD, Linear coupling, Upper/Lower walls, Extended-Lagrangian (AFED), EDS, MaxEnt |
-| **Utilities** | COLVAR file reporter, Bias state checkpoint/restore, Replica exchange (H-REUS and T-REMD), Multi-walker MetaD/OPES (shared GPU arrays, no CPU merge) |
-| **Multi-GPU** | Single system across GPUs (OpenMM native), N replicas one-per-GPU, N walkers across G GPUs with intra-GPU pointer sharing + cross-GPU additive grid merge |
-| **Platforms** | Reference (CPU), CUDA (GPU). OpenCL and HIP stubs present. |
+| **Utilities** | COLVAR file reporter, Bias state checkpoint/restore, Replica exchange (H-REUS and T-REMD), Multi-walker MetaD/OPES |
+| **Multi-GPU** | Single system across GPUs (OpenMM native), N replicas one-per-GPU, N walkers across G GPUs sharing one bias through merged (MetaD) or ordered (OPES) state transfer |
+| **Platforms** | CUDA and OpenCL numerical kernels; Reference empty-force smoke stub. No HIP backend. |
 
 ## Quick start
 
@@ -59,4 +59,4 @@ The `glued` module is a thin wrapper around `gluedplugin.GluedForce`; the raw `g
 - [Examples](examples.md) — practical recipes for MetaD, OPES, REUS, checkpointing, multi-walker
 - [Multi-GPU Guide](multi_gpu.md) — all three multi-GPU scenarios with code examples
 - [Developer Guide](developer_guide.md) — code architecture, adding new CVs and biases
-- [Architecture Notes](architecture-notes.md) — deep dive into OpenMM internals and why GLUED avoids the CPU↔GPU round-trip
+- [Architecture Notes](architecture-notes.md) — OpenMM internals GLUED builds on, and the execution, checkpoint and multi-walker contracts

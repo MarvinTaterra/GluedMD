@@ -36,13 +36,18 @@ kernel_.getAs<CalcGluedForceKernel>().initialize(system, owner_);
 Each integrator step calls two hooks on all `ForceImpl` objects:
 
 - **`updateContextState()`** — called *once* at the top of each step (before
-  integration).  This is where bias deposition must happen.
+  integration).  This is where bias history is committed: deposits, running
+  statistics, auxiliary coordinates.  It sets OpenMM's `forcesInvalid` flag
+  when the bias potential changed so integrators that cache forces
+  (`CustomIntegrator`) recompute them.
 - **`calcForcesAndEnergy()`** — called potentially multiple times per step (during
-  minimization, constraint iteration, force-group recalculation).  This is where
-  CV evaluation and force scatter happen.
+  minimization, constraint iteration, force-group recalculation, `getState()`).
+  This is where CV evaluation and force scatter happen.  It never modifies
+  bias history, so energy queries and rejected trial moves are side-effect free.
 
 The `lastStepIndex_` guard in `GluedForceImpl::updateContextState()` ensures
-deposition fires exactly once per step count.
+history is committed exactly once per step count.  See §7 for the resulting
+execution contract.
 
 ---
 
@@ -107,19 +112,22 @@ Using the wrong scale produces forces off by 2^32 — silent in some float regim
 `CommonKernels.cpp` `CommonCalcRMSDForceKernel` for the canonical pattern.
 
 OpenMM reorders atoms internally for memory-access efficiency.  GPU atom index `g`
-corresponds to user atom index `atomIndexArray[g]`.  The reverse map (user→GPU)
-can be derived by iterating the array, or by using the per-atom sorted permutation.
+holds user atom `atomIndexArray[g]`; the array maps *GPU slot → user atom*, so the
+lookup a CV kernel needs (user atom → GPU slot) is its inverse.
 
-CV kernels receive user-visible atom indices from `cvAtoms[]`.  Before writing to
-the force buffer they must look up the GPU index:
+GLUED keeps that inverse on the device.  When OpenMM signals a reorder
+(`getAtomsWereReordered()`), `rebuildGpuAtomIndices()` downloads the index array,
+inverts it on the host and re-uploads the per-CV GPU atom lists that the CV and
+scatter kernels index directly:
 
 ```cuda
-int gpuAtom = atomIndexArray[userAtom];
+int gpuAtom = cvGpuAtoms[i];          // already translated on reorder
 atomicAdd(&forceBuffer[gpuAtom], ...);
 ```
 
 Symmetric CVs (e.g. distance) give the same *value* regardless of reordering, but
-*forces* go to the wrong atoms if the lookup is omitted.  Every scatter must do it.
+*forces* go to the wrong atoms if the translation is stale.  Reorders are rare
+(OpenMM sorts every few hundred steps), so the download is cheap in practice.
 
 ---
 
@@ -141,9 +149,10 @@ The source string can include `#define` blocks built via `cc.getExpressionUtilit
 which translates Lepton expressions to CUDA source.  NVRTC can see all of OpenMM's
 utility headers via include paths embedded in the `ComputeContext`.
 
-For GLUED: CV kernel source is a `.cu` file in `platforms/common/src/kernels/`
-that is read at initialization time, potentially with per-system `#define` injections
-(e.g. `#define NUM_DISTANCE_CVS 3`), then compiled via NVRTC on first `execute()`.
+For GLUED: every kernel source is an embedded raw string in
+`platforms/common/src/CommonGluedKernels.cpp` (CV kernels, bias kernels, scatter),
+compiled with `cc.compileProgram()` during `initialize()`.  Per-bias constants that
+change the generated code (e.g. the OPES periodic-CV mask) are passed as defines.
 
 ---
 
@@ -169,10 +178,16 @@ For a 100k-atom system at fp64 this is 100k × 3 × 8 bytes = 2.4 MB per directi
 per step.  At 1000 steps/second that is ~4.8 GB/s sustained PCIe bandwidth —
 saturating a PCIe 4.0 ×16 link by itself.
 
-GLUED avoids this by inheriting `ForceImpl` directly and placing all
+GLUED avoids this by inheriting `ForceImpl` directly and placing the per-step
 computation — CV kernels, bias kernels, chain-rule scatter — inside OpenMM's GPU
-kernel pipeline.  The only CPU↔GPU traffic is optional: periodic CV value logging
-(a few bytes every N steps) and bias state checkpointing (once per simulation).
+kernel pipeline.  Positions and forces never leave the device.  The remaining host
+traffic is small and mostly infrequent:
+
+- the energy CV (`CV_ENERGY`) reduces the inner Context's energy on the host and
+  uploads one scalar per evaluation, as OpenMM's own `CustomCVForce` does;
+- an OPES deposit reads one integer back to detect a full kernel table;
+- an atom reorder downloads the index array (§4);
+- CV logging, OPES diagnostics and checkpoints download on request.
 
 **Corollary:** GLUED's `GluedForceImpl::calcForcesAndEnergy` calls
 `kernel_.getAs<CalcGluedForceKernel>().execute(context, ...)` which dispatches
@@ -180,5 +195,44 @@ directly to GPU kernels compiled via NVRTC, with no position download.
 
 ---
 
-*This document was produced as the Stage 0 / Section 0 deliverable before Stage 1.1
-begins.  Human review required at this boundary per the design plan.*
+## 7 — Execution, checkpoint and multi-walker contracts
+
+**Evaluation vs. history.** `calcForcesAndEnergy()` evaluates CVs and biases and
+never commits history.  `updateContextState()` re-evaluates CVs and biases at the
+current coordinates on the steps where something is committed (a deposit is due,
+or a bias such as ABMD, EDS, extended-Lagrangian or adaptive OPES accumulates
+every step) and then commits.  Consequences:
+
+- Extra `getState()` calls, minimization and rejected trial configurations leave
+  adaptive biases untouched.
+- Deposits use the coordinates of the step they are attributed to.
+- `CustomIntegrator` users must call `addUpdateContextState()` once per step.
+- Rewinding a trajectory does not rewind bias history; restore a bias checkpoint
+  alongside the OpenMM checkpoint.
+- Device counters (deposits, adaptive samples) are 32-bit; a run stops with an
+  error before they can wrap (about 2.1 billion steps).
+
+**Checkpoints.** `getBiasState()` produces a version-2 blob: a hash of the
+force configuration, the last committed step, and every mutable field of every
+bias, including the OPES normalization, weight sums, deposit count and learned
+bandwidths needed to continue exactly.  `setBiasState()` requires the same
+version, an identical configuration (the OPES kernel capacity may be raised),
+and exactly the expected number of bytes; a rejected blob leaves the previous
+state in place.  Pass the Context explicitly when several Contexts share a
+System.  Version-1 blobs cannot be restored: they lack the continuation fields.
+
+**Multiple walkers.** Walkers on one device do not share device arrays.
+`MultiWalkerPool` moves the selected bias between Contexts through checkpoints:
+MetaD/PBMetaD grids merge their increments every `sync_interval` steps (hills
+are additive), while OPES-family biases hand one state from walker to walker one
+step at a time, because a compressed kernel table cannot be merged after the
+fact.  Unselected biases stay private to each walker.
+
+**Replica exchange.** Both drivers evaluate all four cross energies with each
+replica's own Hamiltonian, so every bias is part of the criterion and nothing
+needs isolating in a force group.  An isotropic `MonteCarloBarostat` adds the
+pressure–volume term; other barostats are rejected.
+
+**Precision and platforms.** Bias tables and checkpoints are double; several
+geometric Jacobians and parameter tables are float even in a double Context.
+Only CUDA and OpenCL run CVs; the Reference plugin accepts empty forces only.

@@ -38,6 +38,9 @@ execute_process(
         "import sysconfig; print(sysconfig.get_paths()['purelib'])"
     OUTPUT_VARIABLE PYTHON_SITE_PACKAGES
     OUTPUT_STRIP_TRAILING_WHITESPACE)
+set(GLUED_PYTHON_INSTALL_DIR "${PYTHON_SITE_PACKAGES}" CACHE PATH
+    "Python install directory (override for an isolated local package)")
+set(PYTHON_SITE_PACKAGES "${GLUED_PYTHON_INSTALL_DIR}")
 
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/gluedplugin.py"
     DESTINATION "${PYTHON_SITE_PACKAGES}")

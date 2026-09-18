@@ -850,6 +850,13 @@ def multithermal_log_weights(potential_energy, bias, temp0, temp_target,
     import numpy as np
     U = np.asarray(potential_energy, dtype=float)
     V = np.asarray(bias, dtype=float)
+    if U.ndim != 1 or U.size == 0 or V.shape != U.shape:
+        raise ValueError("energy and bias must be nonempty one-dimensional arrays "
+                         "of the same length")
+    if not (np.isfinite(U).all() and np.isfinite(V).all()):
+        raise ValueError("energy and bias must be finite")
+    if any(not np.isfinite(t) or t <= 0 for t in (temp0, temp_target, kB)):
+        raise ValueError("temperatures and kB must be finite and positive")
     beta0 = 1.0 / (kB * float(temp0))
     betap = 1.0 / (kB * float(temp_target))
     return beta0 * V - (betap - beta0) * U
@@ -863,6 +870,8 @@ def kish_ess(log_weights):
     """
     import numpy as np
     lw = np.asarray(log_weights, dtype=float)
+    if lw.ndim != 1 or lw.size == 0 or not np.isfinite(lw).all():
+        raise ValueError("log weights must be a nonempty finite one-dimensional array")
     lw = lw - np.max(lw)
     w = np.exp(lw)
     return float(w.sum() ** 2 / np.sum(w * w))
@@ -898,4 +907,6 @@ def reweight_to_temperature(potential_energy, bias, temp0, temp_target,
     if observable is None:
         return w, ess
     obs = np.asarray(observable, dtype=float)
+    if obs.shape != w.shape or not np.isfinite(obs).all():
+        raise ValueError("observable must be finite and match the sample shape")
     return float(np.sum(w * obs)), ess
